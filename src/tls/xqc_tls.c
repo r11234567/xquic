@@ -1266,7 +1266,7 @@ xqc_tls_set_read_secret(SSL *ssl, enum ssl_encryption_level_t level,
     xqc_crypto_t *crypto = tls->crypto[level];
     ret = xqc_crypto_derive_keys(crypto, secret, secret_len, XQC_KEY_TYPE_RX_READ);
     if (ret != XQC_OK) {
-        xqc_log(tls->log, XQC_LOG_ERROR, "|install write key error|level:%d|ret:%d",
+        xqc_log(tls->log, XQC_LOG_ERROR, "|install read key error|level:%d|ret:%d",
                 level, ret);
         return XQC_SSL_FAIL;
     }
