@@ -284,6 +284,7 @@ uint64_t g_last_sock_op_time;
  * 704 for active_connection_id_limit validation
  * 8XX for MASQUE e2e testcases
  * 709/710 for active_connection_id_limit minimum validation
+ * 711/712 for PMTUD peer-option omission validation
  * 902/903 for AEAD confidentiality-limit validation
  * 1000-1014 for HTTP/3 protocol validation
  */
@@ -5360,6 +5361,13 @@ int main(int argc, char *argv[]) {
 
     if (g_pmtud_on) {
         conn_settings.enable_pmtud = 3;
+    }
+
+    if (g_test_case == 711) {
+        conn_settings.enable_pmtud = XQC_PMTUD_FORCE_ENABLE;
+
+    } else if (g_test_case == 712) {
+        conn_settings.enable_pmtud = XQC_PMTUD_ENABLE_CLIENT;
     }
 
     if (g_test_case == 450) {
