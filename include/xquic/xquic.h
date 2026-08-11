@@ -1435,7 +1435,7 @@ typedef struct xqc_conn_settings_s {
     int32_t spurious_loss_detect_on;
     /** limit of anti-amplification, default 5 */
     uint32_t anti_amplification_limit;
-    /** packet limit of a single 1-rtt key, 0 for unlimited */
+    /** optional early packet limit for a single 1-RTT key; 0 disables it */
     uint64_t keyupdate_pkt_threshold;
     size_t max_pkt_out_size;
     size_t probing_pkt_out_size;

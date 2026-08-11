@@ -19,8 +19,11 @@
 #include <xquic/xqc_http3.h>
 #include "src/http3/xqc_h3_conn.h"
 #include "src/http3/xqc_h3_request.h"
+#include "src/transport/xqc_conn.h"
 #include "src/transport/xqc_packet_out.h"
 #include "src/transport/xqc_frame_parser.h"
+#include "src/tls/xqc_crypto.h"
+#include "src/tls/xqc_tls.h"
 #include "platform.h"
 #ifndef XQC_SYS_WINDOWS
 #include <unistd.h>
@@ -84,6 +87,8 @@ printf_null(const char *format, ...)
 #define XQC_TEST_CASE_H3_FIELD_SECTION_OVER_LIMIT 1012
 #define XQC_TEST_CASE_H3_LOWERCASE_RESPONSE 1013
 #define XQC_TEST_CASE_H3_UPPERCASE_RESPONSE 1014
+#define XQC_TEST_CASE_AEAD_CONFIDENTIALITY_BELOW_LIMIT 902
+#define XQC_TEST_CASE_AEAD_CONFIDENTIALITY_AT_LIMIT 903
 
 typedef struct user_conn_s user_conn_t;
 
@@ -266,7 +271,7 @@ int g_spec_url;
 int g_is_get;
 uint64_t g_last_sock_op_time;
 /*
- * currently, the maximum used test case id is 710
+ * currently, the maximum used test case id is 1014
  * please keep this comment updated if you are adding more test cases. :-D
  * 55 for RFC 9114 Section 4.2 forbidden header e2e validation
  * 99 for pure fin
@@ -279,6 +284,8 @@ uint64_t g_last_sock_op_time;
  * 704 for active_connection_id_limit validation
  * 8XX for MASQUE e2e testcases
  * 709/710 for active_connection_id_limit minimum validation
+ * 902/903 for AEAD confidentiality-limit validation
+ * 1000-1014 for HTTP/3 protocol validation
  */
 int g_test_case;
 int g_ipv6;
@@ -2141,6 +2148,8 @@ xqc_client_masque_start_tunnel(user_conn_t *user_conn)
            g_masque_stream_id, g_masque_stream_id / 4);
 
     return 0;
+}
+
 /*
  * issues #565 / #566 / #567: emit a frame that names a stream this endpoint
  * does not own, so the peer must close the connection with STREAM_STATE_ERROR
@@ -2241,6 +2250,24 @@ xqc_client_h3_conn_handshake_finished(xqc_h3_conn_t *h3_conn, void *user_data)
     printf("====>SCID:%s\n", xqc_scid_str(p_ctx->engine, &user_conn->cid));
 
     hsk_completed = 1;
+
+    if (g_test_case == XQC_TEST_CASE_AEAD_CONFIDENTIALITY_BELOW_LIMIT
+        || g_test_case == XQC_TEST_CASE_AEAD_CONFIDENTIALITY_AT_LIMIT)
+    {
+        xqc_connection_t *conn = xqc_h3_conn_get_xqc_conn(h3_conn);
+        uint32_t cipher_id = xqc_tls_get_1rtt_cipher_id(conn->tls);
+        uint64_t limit = xqc_aead_confidentiality_limit(cipher_id);
+
+        conn->key_update_ctx.enc_pkt_cnt =
+            g_test_case == XQC_TEST_CASE_AEAD_CONFIDENTIALITY_BELOW_LIMIT
+            ? limit - 1 : limit;
+        conn->key_update_ctx.aead_confidentiality_limit = limit;
+        printf("[aead-confidentiality-test]|case:%d|cipher_id:%u|"
+               "encrypted:%"PRIu64"|limit:%"PRIu64"|\n",
+               g_test_case, cipher_id,
+               conn->key_update_ctx.enc_pkt_cnt, limit);
+        fflush(stdout);
+    }
 
     user_conn->dgram_mss = xqc_h3_ext_datagram_get_mss(h3_conn);
     if (user_conn->dgram_mss == 0) {

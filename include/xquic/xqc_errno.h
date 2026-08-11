@@ -38,7 +38,7 @@ typedef enum {
     TRA_APPLICATION_ERROR           =  0xC,
     TRA_CRYPTO_BUFFER_EXCEEDED      =  0xD,
     TRA_KEY_UPDATE_ERROR            =  0xE,   /**< RFC 9001 Section 6.7 */
-    TRA_AEAD_LIMIT_REACHED          =  0x1e,  /**< RFC 9001 §6.6: AEAD integrity limit reached */
+    TRA_AEAD_LIMIT_REACHED          =  0xF,   /**< RFC 9000 Section 20.1 */
     TRA_NO_VIABLE_PATH              =  0x10,  /**< RFC 9000 Section 8.2.4 */
     /*
      * RFC 9000 Section 6.2 does not assign a CONNECTION_CLOSE code for
@@ -177,7 +177,7 @@ typedef enum {
      * other by a caller comparing error codes. Numbered here at the end of the
      * block instead of renumbering the codes above it, which are upstream
      * values that applications compare against. */
-    XQC_EAEAD_LIMIT                     = 644,      /**< AEAD integrity limit reached per RFC 9001 §6.6 */
+    XQC_EAEAD_LIMIT = 644, /**< AEAD confidentiality or integrity limit */
 
     XQC_EMP_NOT_SUPPORT_MP = 650,   /**< Multipath - don't support multipath */
     XQC_EMP_NO_AVAIL_PATH_ID = 651, /**< Multipath - no available path id */
