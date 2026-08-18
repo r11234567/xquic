@@ -302,6 +302,8 @@ main(int argc, char *argv[])
         || !CU_add_test(pSuite, "xqc_test_prefixed_str", xqc_test_prefixed_str)
         || !CU_add_test(pSuite, "xqc_test_id_hash", xqc_test_id_hash)
         || !CU_add_test(pSuite, "xqc_test_retry", xqc_test_retry)
+        || !CU_add_test(pSuite, "xqc_test_retry_same_length_dcid",
+                        xqc_test_retry_same_length_dcid)
         || !CU_add_test(pSuite, "xqc_test_receive_invalid_dgram", xqc_test_receive_invalid_dgram)
         || !CU_add_test(pSuite, "xqc_test_h3_ext_frame", xqc_test_h3_ext_frame)
         /* --- from mqvpn-main PR#52: multipath validation-stall fix tests --- */
