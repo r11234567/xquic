@@ -79,12 +79,14 @@ xqc_log_CON_CONNECTION_CLOSED_callback(xqc_log_t *log, const char *func,
         }
         xqc_qlog_implement(
             log, CON_CONNECTION_CLOSED, func,
-            "|err_code:%d|mtu_updatad_count:%d|pkt_dropped:%d|recent_congestion:%s|",
+            "|err_code:%uL|mtu_updatad_count:%uD|"
+            "pkt_dropped:%uL|recent_congestion:%s|",
             XQC_CONN_ERR_CODE(conn->conn_err), conn->MTU_updated_count,
             conn->packet_dropped_count, log_buf);
     } else {
         xqc_qlog_implement(log, CON_CONNECTION_CLOSED, func,
-                           "|err_code:%d|mtu_updatad_count:%d|pkt_dropped:%d|",
+                           "|err_code:%uL|mtu_updatad_count:%uD|"
+                           "pkt_dropped:%uL|",
                            XQC_CONN_ERR_CODE(conn->conn_err),
                            conn->MTU_updated_count,
                            conn->packet_dropped_count);
