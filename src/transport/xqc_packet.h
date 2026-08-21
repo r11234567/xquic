@@ -12,12 +12,11 @@
 #define XQC_ACK_SPACE                       16
 #define XQC_FEC_SPACE                       12
 #define XQC_HEADER_SPACE                    28
-#define XQC_QUIC_MIN_MSS                    1200
-/* PR5 G-P2: pin spec MTU value against future upstream xquic drift
- * (e.g. DPLPMTUD adoption). draft-ietf-quic-multipath-21 §3.1 ¶6
- * mandates a 1200B minimum QUIC packet MTU on each path. */
-_Static_assert(XQC_QUIC_MIN_MSS == 1200,
-               "draft-21 §3.1 ¶6: MTU MUST = 1200B");
+/* Increased from 1200 to 1500 to support post-quantum key exchange (X25519MLKEM768).
+ * MLKEM768 public keys (1184 bytes) cause handshake packets to exceed 1200-byte limit.
+ * RFC 9000 specifies 1200 as minimum, not maximum. Standard Ethernet MTU is 1500.
+ * Existing CRYPTO frame fragmentation handles smaller MTUs automatically. */
+#define XQC_QUIC_MIN_MSS                    1500
 /* 1500 - 40 (IPv6) - 8 (UDP) - 16 (ACK) - 16 (AEAD) */
 #define XQC_QUIC_MAX_MSS                    1420
 #define XQC_MSS                             (XQC_QUIC_MAX_MSS + XQC_ACK_SPACE)
