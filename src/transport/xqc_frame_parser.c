@@ -422,8 +422,8 @@ xqc_gen_crypto_frame(xqc_packet_out_t *packet_out, uint64_t offset,
     unsigned char *begin = dst_buf;
 
     /* DEBUG: Log CRYPTO frame generation */
-    printf("[DEBUG_CRYPTO_FRAME] po_buf_size:%zu po_used_size:%u po_reserved_size:%u dst_buf_len(remained):%zu payload_size:%lu\n",
-           packet_out->po_buf_size, packet_out->po_used_size, packet_out->po_reserved_size, dst_buf_len, payload_size);
+    printf("[DEBUG_CRYPTO_FRAME] po_buf_size:%zu po_used_size:%u po_reserved_size:%zu dst_buf_len(remained):%zu payload_size:%lu\n",
+           packet_out->po_buf_size, packet_out->po_used_size, (size_t)packet_out->po_reserved_size, dst_buf_len, (unsigned long)payload_size);
 
     *dst_buf++ = 0x06;
 

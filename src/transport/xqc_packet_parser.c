@@ -630,8 +630,8 @@ xqc_packet_encrypt_buf(xqc_connection_t *conn, xqc_packet_out_t *packet_out,
     uint32_t nonce_path_id = (conn->enable_multipath) ? (uint32_t)path->path_id : 0;
 
     /* DEBUG: Log encryption parameters */
-    printf("[DEBUG_PKT_ENCRYPT] pkt_type:%d pkt_num:%u po_used_size:%u header_len:%zu payload_len:%zu enc_pkt_cap:%zu dst_cap(enc_pkt_cap-header_len):%zu\n",
-           packet_out->po_pkt.pkt_type, packet_out->po_pkt.pkt_num, packet_out->po_used_size,
+    printf("[DEBUG_PKT_ENCRYPT] pkt_type:%d pkt_num:%lu po_used_size:%u header_len:%zu payload_len:%zu enc_pkt_cap:%zu dst_cap(enc_pkt_cap-header_len):%zu\n",
+           packet_out->po_pkt.pkt_type, (unsigned long)packet_out->po_pkt.pkt_num, packet_out->po_used_size,
            header_len, payload_len, enc_pkt_cap, enc_pkt_cap - header_len);
 
     xqc_log(conn->log, XQC_LOG_DEBUG, "|encryption nonce|path_id:%ui|pn:%ui|",
