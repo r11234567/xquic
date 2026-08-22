@@ -12,13 +12,11 @@
 #define XQC_ACK_SPACE                       16
 #define XQC_FEC_SPACE                       12
 #define XQC_HEADER_SPACE                    28
-/* Increased from 1200 to 1500 to support post-quantum key exchange (X25519MLKEM768).
- * MLKEM768 public keys (1184 bytes) cause handshake packets to exceed 1200-byte limit.
- * RFC 9000 specifies 1200 as minimum, not maximum. Standard Ethernet MTU is 1500.
- * Existing CRYPTO frame fragmentation handles smaller MTUs automatically. */
-#define XQC_QUIC_MIN_MSS                    1500
-/* 1500 - 40 (IPv6) - 8 (UDP) - 16 (overhead) = 1436 */
-#define XQC_QUIC_MAX_MSS                    1500
+/* Minimum and maximum MSS values aligned with mp0rta's configuration.
+ * PMTUD (Path MTU Discovery) is enabled to dynamically discover the optimal MTU.
+ * This allows the stack to adapt to network conditions while maintaining compatibility. */
+#define XQC_QUIC_MIN_MSS                    1200
+#define XQC_QUIC_MAX_MSS                    1420
 #define XQC_MSS                             (XQC_QUIC_MAX_MSS + XQC_ACK_SPACE)
 
 /* max 0rtt packet count sent by client */

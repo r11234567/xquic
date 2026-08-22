@@ -74,7 +74,7 @@ xqc_conn_settings_t internal_default_conn_settings = {
 
     .standby_path_probe_timeout = 0,
     .fec_conn_queue_rpr_timeout = 0,
-    .enable_pmtud = 0,
+    .enable_pmtud = 1,
     .pmtud_probing_interval = 500000,
     .marking_reinjection = 0,
 
