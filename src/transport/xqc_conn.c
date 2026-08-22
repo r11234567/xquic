@@ -5983,6 +5983,27 @@ xqc_conn_reassemble_packet(xqc_connection_t *conn, xqc_packet_out_t *ori_po)
         ori_payload_len = ori_po->po_used_size - (ori_po->po_payload - ori_po->po_buf);
     }
 
+    /*
+     * The new header can be longer than the one this payload was written
+     * under, so the copy has to be checked against the buffer first - AEAD
+     * tag included, because encryption writes header + payload + tag into a
+     * destination of the same capacity. XQC_PACKET_OUT_HDR_GROWTH sizes
+     * po_buf so a conforming peer never reaches this branch; failing here
+     * keeps an oversized header from surfacing later as an opaque
+     * XQC_TLS_ENCRYPT_DATA_ERROR at encryption time.
+     */
+    if (new_po->po_used_size + ori_payload_len + XQC_TLS_AEAD_OVERHEAD_MAX_LEN
+        > new_po->po_buf_cap)
+    {
+        xqc_log(conn->log, XQC_LOG_ERROR,
+                "|reassembled packet exceeds buffer|hdr:%ud|payload:%ud|cap:%uz|"
+                "pkt_type:%d|",
+                new_po->po_used_size, ori_payload_len, new_po->po_buf_cap,
+                ori_po->po_pkt.pkt_type);
+        xqc_maybe_recycle_packet_out(new_po, conn);
+        return -XQC_ENOBUF;
+    }
+
     new_po->po_payload = new_po->po_buf + new_po->po_used_size;
     memcpy(new_po->po_payload, ori_po->po_payload, ori_payload_len);
     new_po->po_used_size += ori_payload_len;

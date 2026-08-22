@@ -2,6 +2,35 @@
 
 This is the **mp0rta/xquic** fork of [alibaba/xquic](https://github.com/alibaba/xquic), adding [draft-ietf-quic-multipath-21](https://datatracker.ietf.org/doc/draft-ietf-quic-multipath/21/) wire compliance and CONNECT-IP ([RFC 9484](https://www.rfc-editor.org/rfc/rfc9484.html)) support for the [mqvpn](https://github.com/mp0rta/mqvpn) project. Per-PR audit findings against the draft live under [`docs/audit-notes/`](docs/audit-notes/). Upstream alibaba/xquic README follows.
 
+## Known issues
+
+### TODO: re-fragment CRYPTO data when a Retry lengthens the Initial header
+
+`xqc_conn_reassemble_packet()` (`src/transport/xqc_conn.c`) rebuilds an Initial packet
+with a new, longer header once a Retry arrives — it gains the Retry token and possibly a
+longer DCID — and then copies the original payload in verbatim. The payload was sized
+against the *old*, shorter header, so the packet ends up larger than the
+`max_pkt_out_size` it was built for. With a post-quantum key share such as
+X25519MLKEM768 (1184-byte key share) the first Initial is already full, which made this
+routine rather than a corner case: the re-sent packet overflowed the AEAD output buffer
+and encryption failed with `XQC_TLS_ENCRYPT_DATA_ERROR` (-736), so the connection closed
+locally and the handshake never completed.
+
+Currently mitigated, not fixed:
+
+- `XQC_PACKET_OUT_HDR_GROWTH` (`src/transport/xqc_packet_out.h`) reserves the provable
+  worst-case header growth (`XQC_MAX_TOKEN_LEN + 1 + XQC_MAX_CID_LEN` = 277 bytes), so
+  the rebuilt packet fits the buffer. This is capacity only — it does not change what is
+  put on the wire.
+- The payload copy is now bounds-checked, so any future overflow fails at the copy with
+  `XQC_ENOBUF` and a log line instead of surfacing as an opaque encryption error.
+
+**Still to fix:** the re-sent Initial can exceed the locally configured
+`max_pkt_out_size`, so it may be dropped on a path whose real MTU is that small. The
+proper fix is to re-fragment the CRYPTO data across packets under the new header, which
+is the refactor the `TODO` in `xqc_conn_resend_packets()` already calls for (generate the
+header before writing frames, so reassembly is unnecessary).
+
 ---
 
 # XQUIC

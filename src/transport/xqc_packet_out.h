@@ -6,6 +6,7 @@
 #define _XQC_PACKET_OUT_H_INCLUDED_
 
 #include <xquic/xquic_typedef.h>
+#include "src/transport/xqc_defs.h"
 #include "src/transport/xqc_packet.h"
 #include "src/transport/xqc_frame.h"
 #include "src/tls/xqc_tls_defs.h"
@@ -19,7 +20,21 @@
 #define XQC_MAX_PACKET_OUT_SIZE  XQC_QUIC_MAX_MSS
 #define XQC_PACKET_OUT_SIZE      XQC_QUIC_MIN_MSS
 #define XQC_PACKET_OUT_EXT_SPACE (XQC_TLS_AEAD_OVERHEAD_MAX_LEN + XQC_ACK_SPACE)
-#define XQC_PACKET_OUT_BUF_CAP   (XQC_MAX_PACKET_OUT_SIZE + XQC_PACKET_OUT_EXT_SPACE)
+/*
+ * Reserve for a long header that grows after its payload was already
+ * written. xqc_conn_reassemble_packet() rebuilds an Initial/0-RTT packet
+ * with a new header when a Retry arrives, then copies the original payload
+ * in verbatim; that header can gain a Retry token (bounded by
+ * XQC_MAX_TOKEN_LEN in xqc_packet_parse_retry), the extra length-varint byte
+ * a token above 63 bytes needs, and a longer DCID (XQC_MAX_CID_LEN). Without
+ * the reserve, a full Initial - routine once a post-quantum key share such
+ * as X25519MLKEM768 fills it - overflows the AEAD output buffer and fails
+ * with XQC_TLS_ENCRYPT_DATA_ERROR instead of completing the handshake.
+ * Buffer capacity only: po_buf_size still bounds what goes on the wire.
+ */
+#define XQC_PACKET_OUT_HDR_GROWTH (XQC_MAX_TOKEN_LEN + 1 + XQC_MAX_CID_LEN)
+#define XQC_PACKET_OUT_BUF_CAP   (XQC_MAX_PACKET_OUT_SIZE + XQC_PACKET_OUT_EXT_SPACE \
+                                  + XQC_PACKET_OUT_HDR_GROWTH)
 
 #define XQC_MAX_STREAM_FRAME_IN_PO  3
 
