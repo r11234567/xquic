@@ -420,6 +420,10 @@ xqc_gen_crypto_frame(xqc_packet_out_t *packet_out, uint64_t offset,
     unsigned offset_vlen, length_vlen;
     unsigned char *begin = dst_buf;
 
+    /* DEBUG: Log CRYPTO frame generation */
+    printf("[DEBUG_CRYPTO_FRAME] po_buf_size:%zu po_used_size:%u po_reserved_size:%u dst_buf_len(remained):%zu payload_size:%lu\n",
+           packet_out->po_buf_size, packet_out->po_used_size, packet_out->po_reserved_size, dst_buf_len, payload_size);
+
     *dst_buf++ = 0x06;
 
     offset_bits = xqc_vint_get_2bit(offset);
@@ -438,6 +442,7 @@ xqc_gen_crypto_frame(xqc_packet_out_t *packet_out, uint64_t offset,
     *written_size = payload_size;
     if (1 + offset_vlen + length_vlen + payload_size > dst_buf_len) {
         *written_size = dst_buf_len - (1 + offset_vlen + length_vlen);
+        printf("[DEBUG_CRYPTO_FRAME] FRAGMENTED! requested:%lu actual_written:%zu\n", payload_size, *written_size);
     }
 
     xqc_vint_write(dst_buf, *written_size, length_bits, length_vlen);
@@ -447,7 +452,11 @@ xqc_gen_crypto_frame(xqc_packet_out_t *packet_out, uint64_t offset,
     dst_buf += *written_size;
 
     packet_out->po_frame_types |= XQC_FRAME_BIT_CRYPTO;
-    return dst_buf - begin;
+
+    ssize_t frame_size = dst_buf - begin;
+    printf("[DEBUG_CRYPTO_FRAME] frame_size:%zd new_po_used_size:%u\n", frame_size, packet_out->po_used_size + (unsigned)frame_size);
+
+    return frame_size;
 }
 
 xqc_int_t

@@ -349,6 +349,10 @@ xqc_crypto_encrypt_payload(xqc_crypto_t *crypto, uint64_t pktno, xqc_uint_t key_
     xqc_int_t ret;
     uint8_t nonce[XQC_NONCE_LEN];
 
+    /* DEBUG: Log encryption attempt */
+    printf("[DEBUG_ENCRYPT] pktno:%lu header_len:%zu payload_len:%zu dst_cap:%zu total_packet_size:%zu\n",
+           pktno, header_len, payload_len, dst_cap, header_len + payload_len);
+
     /* aead function and tx key */
     xqc_pkt_protect_aead_t *pp_aead = &crypto->pp_aead;
     xqc_crypto_km_t *ckm = &crypto->keys.tx_ckm[key_phase];
@@ -372,9 +376,12 @@ xqc_crypto_encrypt_payload(xqc_crypto_t *crypto, uint64_t pktno, xqc_uint_t key_
         *dst_len != (payload_len + xqc_aead_overhead(pp_aead, payload_len))) {
         xqc_log(crypto->log, XQC_LOG_ERROR, "|encrypt packet error|ret:%d|nwrite:%z|",
                 ret, *dst_len);
+        printf("[DEBUG_ENCRYPT] FAILED! ret:%d dst_len:%zu expected:%zu\n",
+               ret, *dst_len, payload_len + xqc_aead_overhead(pp_aead, payload_len));
         return -XQC_TLS_ENCRYPT_DATA_ERROR;
     }
 
+    printf("[DEBUG_ENCRYPT] SUCCESS! encrypted_len:%zu\n", *dst_len);
     return XQC_OK;
 }
 

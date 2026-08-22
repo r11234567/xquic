@@ -222,6 +222,13 @@ return_po:
         reserved_size += XQC_FEC_SPACE;
     }
     packet_out->po_reserved_size = reserved_size;
+
+    /* DEBUG: Log packet_out creation details */
+    xqc_log(send_queue->sndq_conn->log, XQC_LOG_DEBUG,
+            "|DEBUG_PKT_CREATE|po_buf_size:%z|po_buf_cap:%z|conn->pkt_out_size:%z|conn->max_pkt_out_size:%z|",
+            packet_out->po_buf_size, packet_out->po_buf_cap,
+            send_queue->sndq_conn->pkt_out_size, send_queue->sndq_conn->max_pkt_out_size);
+
     return packet_out;
 }
 
