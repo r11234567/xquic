@@ -2,6 +2,7 @@
  * @copyright Copyright (c) 2022, Alibaba Group Holding Limited
  */
 
+#include <stdio.h>
 #include <string.h>
 #ifdef XQC_SYS_WINDOWS
 #  include <openssl/x509.h>

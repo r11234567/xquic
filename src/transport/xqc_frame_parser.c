@@ -3,6 +3,7 @@
  * @copyright Copyright (c) 2026, mp0rta
  */
 
+#include <stdio.h>
 #include <string.h>
 #include <sys/types.h>
 #include "src/transport/xqc_frame_parser.h"
