@@ -5983,4 +5983,39 @@ wrong_direction_stream_case 708 "stream_frame_on_local_uncreated_stream" \
 
 killall test_server 2> /dev/null
 
+# QUIC transport stream-reassembly cap. IDs 727/728 avoid the existing
+# 705/706 wrong-direction stream allocations.
+killall test_server 2> /dev/null
+${SERVER_BIN} -l d -e > /dev/null &
+sleep 1
+clear_log
+echo -e "stream reassembly cap happy path ...\c"
+result=`${CLIENT_BIN} -s 2048000 -l d -t 5 -E -d 300 -x 727|grep ">>>>>>>> pass:1"`
+cap_hit=`grep "stream frame buffered count exceed" slog`
+if [ -n "$result" ] && [ -z "$cap_hit" ]; then
+    echo ">>>>>>>> pass:1"
+    case_print_result "stream_reassembly_cap_happy" "pass"
+else
+    echo ">>>>>>>> pass:0"
+    case_print_result "stream_reassembly_cap_happy" "fail"
+fi
+
+killall test_server 2> /dev/null
+${SERVER_BIN} -l d -e -x 728 > /dev/null &
+sleep 1
+clear_log
+echo -e "stream reassembly cap pressure recovery ...\c"
+result=`${CLIENT_BIN} -s 65536 -l d -t 12 -E -d 150 -x 728|grep ">>>>>>>> pass:1"`
+cap_hit=`grep "stream frame buffered count exceed" slog`
+fatal=`grep "fail to process packets" slog`
+if [ -n "$result" ] && [ -n "$cap_hit" ] && [ -z "$fatal" ]; then
+    echo ">>>>>>>> pass:1"
+    case_print_result "stream_reassembly_cap_pressure_recovery" "pass"
+else
+    echo ">>>>>>>> pass:0"
+    case_print_result "stream_reassembly_cap_pressure_recovery" "fail"
+fi
+
+killall test_server 2> /dev/null
+
 cd -
