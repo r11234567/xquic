@@ -130,7 +130,7 @@ xqc_var_buf_reduce(xqc_var_buf_t *buf)
     }
 
     if (buf->data != NULL && buf->buf_len > 0) {
-        if (buf->data_len - buf->consumed_len > 0) {
+        if (buf->data_len > buf->consumed_len) {
             memcpy(new_data, buf->data + buf->consumed_len, buf->data_len - buf->consumed_len);
         }
         xqc_free(buf->data);

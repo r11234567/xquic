@@ -78,7 +78,7 @@ xqc_submatrix(int row_min, int row_max,
     int col_max_sub, int col_max_matrix,
     unsigned char *submatrix, unsigned char *matrix)
 {
-    xqc_memset(submatrix, 0, col_max_sub * row_max);
+    xqc_memset(submatrix, 0, (size_t)col_max_sub * row_max);
     for (int row_i = row_min; row_i < row_max; row_i++) {
         for (int col_i = col_min; col_i < col_max; col_i++) {
             *(submatrix + (row_i - row_min) * col_max_sub + col_i - col_min) = *(matrix + row_i * col_max_matrix + col_i);
