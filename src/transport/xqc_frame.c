@@ -1854,12 +1854,11 @@ xqc_process_datagram_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_in)
 
     xqc_int_t ret = xqc_parse_datagram_frame(packet_in, conn, &data_buffer, &data_len);
     if (ret == -XQC_EPROTO) {
-        xqc_log(
-            conn->log, XQC_LOG_ERROR,
-            "|the endpoint receives a DATAGRAM frame larger than max_datagram_frame_size|"
-            "max_datagram_frame_size:%ud|frame_size:%ud|",
-            conn->local_settings.max_datagram_frame_size,
-            data_len + XQC_DATAGRAM_HEADER_BYTES);
+        xqc_log(conn->log, XQC_LOG_ERROR,
+                "|the endpoint receives a DATAGRAM frame larger than max_datagram_frame_size|"
+                "max_datagram_frame_size:%ui|frame_size:%uz|",
+                conn->local_settings.max_datagram_frame_size,
+                data_len + XQC_DATAGRAM_HEADER_BYTES);
         XQC_CONN_ERR(conn, TRA_PROTOCOL_VIOLATION);
         return ret;
     }
