@@ -93,11 +93,29 @@ xqc_crypto_frame_header_size(uint64_t offset, size_t length)
     return 1 + xqc_vint_len_by_val(offset) + xqc_vint_len_by_val(length);
 }
 
+/*
+ * The node cap must not sit below what the advertised receive window lets a
+ * conforming peer buffer, or bulk transfer over a reordering path is rejected
+ * for staying inside its flow-control budget. 1 KiB is the smallest frame
+ * payload we assume a bulk sender uses; see the cap's own comment in
+ * xqc_defs.h. This assert is what keeps the two constants from drifting when
+ * either is tuned.
+ */
+_Static_assert((uint64_t)XQC_MAX_STREAM_FRAME_BUFFERED_COUNT * 1024 >=
+                   (uint64_t)XQC_MAX_RECV_WINDOW,
+               "buffered-frame cap is below the advertised receive window: a "
+               "conforming peer could be rejected for obeying flow control");
+
 xqc_int_t
 xqc_insert_stream_frame(xqc_connection_t *conn, xqc_stream_t *stream,
                         xqc_stream_frame_t *new_frame)
 {
-    /* CWE-770 mitigation: reject if buffered frame count exceeds cap (RFC 9000 §21.7) */
+    /*
+     * CWE-770 mitigation: reject if buffered frame count exceeds cap
+     * (RFC 9000 §21.7). -XQC_ELIMIT is a tolerant error, so the caller drops
+     * the packet WITHOUT acknowledging it and the peer retransmits when there
+     * is room again — backpressure, not data loss, and not a connection close.
+     */
     if (stream->stream_data_in.buffered_frame_count >= XQC_MAX_STREAM_FRAME_BUFFERED_COUNT) {
         xqc_log(conn->log, XQC_LOG_WARN,
                 "|stream frame buffered count exceed|stream_id:%ui|count:%ui|limit:%d|",

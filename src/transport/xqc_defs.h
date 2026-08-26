@@ -50,8 +50,24 @@
  * CWE-770 mitigation: limit buffered out-of-order STREAM frame nodes.
  * Prevents sparse 1-byte fragment attacks that exploit per-node metadata overhead
  * to achieve ~56x memory amplification within flow control budget (RFC 9000 §21.7).
+ *
+ * The value must stay consistent with the receive window we advertise, or a
+ * CONFORMING peer trips it. A stream may hold XQC_MAX_RECV_WINDOW bytes of
+ * unread data, and a reorder hole keeps every frame after it buffered, so the
+ * node count a legitimate bulk sender reaches is window / frame_payload. At
+ * 16 MiB and ~1400-byte packets that is ~12k nodes: the previous 8192 was
+ * BELOW it, so a peer obeying flow control could be rejected for exceeding a
+ * limit it was never told about. Sized at window/1KB instead, which covers any
+ * sender whose frames carry >=1KB, and enforced against the window by a
+ * _Static_assert in xqc_frame.c so the two cannot drift apart.
+ *
+ * Sparse-fragment attacks are still bounded: the cap is on nodes, so the worst
+ * case is COUNT * sizeof(xqc_stream_frame_t) (~56 B) of metadata, under 1 MiB
+ * per stream. Reaching it is also no longer fatal — xqc_conn_tolerant_error()
+ * treats -XQC_ELIMIT as a drop-without-ack, which throttles the sender by
+ * withholding acknowledgement rather than by killing the connection.
  */
-#define XQC_MAX_STREAM_FRAME_BUFFERED_COUNT     8192    /* max buffered frame nodes per stream */
+#define XQC_MAX_STREAM_FRAME_BUFFERED_COUNT     16384   /* max buffered frame nodes per stream */
 
 
 /* xquic will not send stateless reset to packets which are smaller than

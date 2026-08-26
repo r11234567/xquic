@@ -5367,6 +5367,25 @@ xqc_conn_tolerant_error(xqc_int_t ret)
         return XQC_TRUE;
     }
 
+    /*
+     * -XQC_ELIMIT means a receive buffer is full, not that the peer misbehaved,
+     * so it must not close the connection. Being tolerant here drops the packet
+     * WITHOUT acknowledging it (the caller skips xqc_conn_on_pkt_processed),
+     * which makes the peer retransmit once the backlog drains: real
+     * backpressure, and lossless, because a QUIC frame is idempotent on
+     * replay.
+     *
+     * Previously this reached the generic error path and was reported as
+     * FRAME_ENCODING_ERROR — a protocol violation — which killed connections
+     * mid-transfer whenever a reorder hole grew the buffered-frame count past
+     * its cap. That is the normal state of a multipath connection whose paths
+     * have different one-way delays, i.e. precisely the case this stack exists
+     * to serve.
+     */
+    if (-XQC_ELIMIT == ret) {
+        return XQC_TRUE;
+    }
+
     return XQC_FALSE;
 }
 
