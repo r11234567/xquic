@@ -116,7 +116,12 @@ xqc_var_buf_realloc(xqc_var_buf_t *buf, size_t cap)
 xqc_int_t
 xqc_var_buf_reduce(xqc_var_buf_t *buf)
 {
-    uint64_t capacity = xqc_pow2_upper(buf->data_len - buf->consumed_len);
+    if (buf->consumed_len > buf->data_len) {
+        return -XQC_EPARAM;
+    }
+
+    size_t remaining = buf->data_len - buf->consumed_len;
+    uint64_t capacity = xqc_pow2_upper(remaining);
     if (capacity == XQC_POW2_UPPER_ERROR) {
         return -XQC_EPARAM;
     }
@@ -130,15 +135,15 @@ xqc_var_buf_reduce(xqc_var_buf_t *buf)
     }
 
     if (buf->data != NULL && buf->buf_len > 0) {
-        if (buf->data_len > buf->consumed_len) {
-            memcpy(new_data, buf->data + buf->consumed_len, buf->data_len - buf->consumed_len);
+        if (remaining > 0) {
+            memcpy(new_data, buf->data + buf->consumed_len, remaining);
         }
         xqc_free(buf->data);
     }
 
     buf->data = new_data;
     buf->buf_len = capacity;
-    buf->data_len -= buf->consumed_len;
+    buf->data_len = remaining;
     buf->consumed_len = 0;
 
     return XQC_OK;
