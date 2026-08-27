@@ -371,6 +371,12 @@ main(int argc, char *argv[])
         || !CU_add_test(pSuite, "xqc_test_retry_same_length_dcid",
                         xqc_test_retry_same_length_dcid)
         || !CU_add_test(pSuite, "xqc_test_receive_invalid_dgram", xqc_test_receive_invalid_dgram)
+        || !CU_add_test(pSuite,
+                        "xqc_test_receive_dgram_at_valid_encryption_level",
+                        xqc_test_receive_dgram_at_valid_encryption_level)
+        || !CU_add_test(pSuite,
+                        "xqc_test_reject_dgram_at_invalid_encryption_level",
+                        xqc_test_reject_dgram_at_invalid_encryption_level)
         || !CU_add_test(pSuite, "xqc_test_h3_ext_frame", xqc_test_h3_ext_frame)
         /* --- from mqvpn-main PR#52: multipath validation-stall fix tests --- */
         || !CU_add_test(pSuite, "test_next_wakeup_includes_validating_path_timer",
