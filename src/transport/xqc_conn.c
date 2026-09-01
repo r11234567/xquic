@@ -5796,7 +5796,10 @@ xqc_conn_ptmud_probing(xqc_connection_t *conn)
     xqc_int_t ret = XQC_OK;
     xqc_usec_t probing_interval = conn->conn_settings.pmtud_probing_interval;
     uint32_t min_probing_cnt = XQC_MAX_UINT32_VALUE;
+    uint32_t backoff = 0;
     int probing_paths = 0;
+    int active_paths = 0;
+    int unconverged_paths = 0;
     xqc_bool_t newly_bounded = XQC_FALSE;
 
     /* The search runs per path. A connection-wide cursor converges on neither
@@ -5813,6 +5816,7 @@ xqc_conn_ptmud_probing(xqc_connection_t *conn)
         if (path->path_state != XQC_PATH_STATE_ACTIVE) {
             continue;
         }
+        active_paths++;
 
         if (path->path_probing_cnt >= 3) {
             /* the current probing size went unacked three times: exclude it
@@ -5850,6 +5854,11 @@ xqc_conn_ptmud_probing(xqc_connection_t *conn)
             continue;
         }
 
+        /* Past the convergence check, so this path still has range to cover.
+         * Counted before the write is attempted: a write that fails leaves the
+         * search outstanding, and must not be mistaken for a finished one. */
+        unconverged_paths++;
+
         ret = xqc_write_pmtud_ping_to_packet(path, path->path_probing_pkt_out_size,
                                              pkt_type);
         if (ret < 0) {
@@ -5867,21 +5876,31 @@ xqc_conn_ptmud_probing(xqc_connection_t *conn)
         xqc_conn_try_to_update_mss(conn);
     }
 
-    if (probing_paths == 0) {
-        /* every active path has converged */
+    /* Done only when there is something to be done with: every active path has
+     * converged. "No probe went out this round" is not the same thing -- every
+     * write can fail transiently, and the timer can fire while all paths are
+     * still validating after a failover. Treating either as convergence would
+     * leave the connection with no armed timer and PMTUD off for the rest of
+     * its life, which is precisely the case this search exists to handle. */
+    if (active_paths > 0 && unconverged_paths == 0) {
         xqc_log_event(conn->log, CON_MTU_UPDATED, conn, 1);
         conn->conn_flag &= ~XQC_CONN_FLAG_PMTUD_PROBING;
         return;
     }
 
-    xqc_log_event(conn->log, CON_MTU_UPDATED, conn, 0);
-    conn->MTU_updated_count++;
+    if (probing_paths > 0) {
+        xqc_log_event(conn->log, CON_MTU_UPDATED, conn, 0);
+        conn->MTU_updated_count++;
+    }
 
     /* set timer: default 500ms, 1000ms, or 2000ms according to how many
-     * attempts the least advanced path has made at its current size */
+     * attempts the least advanced path has made at its current size. When
+     * nothing went out, retry at the base interval rather than backing off:
+     * the cause is transient and the search has made no progress to pace. */
+    backoff = (min_probing_cnt == XQC_MAX_UINT32_VALUE)
+                  ? 0 : xqc_min(min_probing_cnt, 2);
     xqc_timer_set(&conn->conn_timer_manager, XQC_TIMER_PMTUD_PROBING,
-                  xqc_monotonic_timestamp(),
-                  probing_interval * (1u << xqc_min(min_probing_cnt, 3)));
+                  xqc_monotonic_timestamp(), probing_interval * (1u << backoff));
 
     conn->conn_flag &= ~XQC_CONN_FLAG_PMTUD_PROBING;
 }

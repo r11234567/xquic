@@ -227,6 +227,41 @@ xqc_test_pmtud_probe_ceiling_is_max_over_paths(void)
     xqc_test_helper_conn_destroy(conn);
 }
 
+/* A round in which no probe went out is not a converged search.
+ *
+ * The timer must stay armed when every active path is still validating -- the
+ * state a connection is in immediately after a failover -- or when the probe
+ * writes fail transiently. Reading "no probe sent" as "search finished" leaves
+ * the connection with no armed timer and PMTUD off for the rest of its life,
+ * which would disable the discovery exactly when it is most needed. */
+void
+xqc_test_pmtud_probing_stays_armed_when_nothing_probed(void)
+{
+    xqc_connection_t *conn = pmtud_test_conn();
+    CU_ASSERT_PTR_NOT_NULL_FATAL(conn);
+
+    /* Reach the probe loop: without this the function returns before it. */
+    conn->conn_flag |= XQC_CONN_FLAG_CAN_SEND_1RTT;
+
+    /* Validating, not active: no probe is written, so the fixture needs no
+     * send queue. */
+    xqc_path_ctx_t *path = xqc_test_helper_path_synthesize(
+        conn, 0, XQC_PATH_STATE_VALIDATING);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(path);
+    path->curr_pkt_out_size = XQC_PACKET_OUT_SIZE;
+    path->path_max_pkt_out_size = XQC_TEST_PMTU_CEILING;
+    path->path_probing_pkt_out_size = XQC_TEST_PMTU_CEILING;
+
+    conn->conn_timer_manager.timer[XQC_TIMER_PMTUD_PROBING].timer_is_set = 0;
+
+    xqc_conn_ptmud_probing(conn);
+
+    CU_ASSERT(conn->conn_timer_manager.timer[XQC_TIMER_PMTUD_PROBING].timer_is_set != 0);
+
+    xqc_test_helper_path_destroy(path);
+    xqc_test_helper_conn_destroy(conn);
+}
+
 /* RFC 8899 5.2: persistent loss of everything in flight is how a PMTU black
  * hole announces itself. The path drops back to the guaranteed size and the
  * search reopens above it, so an MTU that shrinks mid-connection recovers
