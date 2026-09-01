@@ -76,6 +76,40 @@ review; no throughput measurement backs them yet. Read a weekly netsim run
 before treating the aggregation numbers in mqvpn's
 `docs/network_emulation_matrix.md` as changed.
 
+## WLB: the PTO guard could exclude the last path
+
+Separate defect, found while tracing the same two-path report as above.
+
+WLB avoids scheduling onto a path whose consecutive-PTO count suggests it is
+blackholed — a link that is down while `sendto()` still succeeds. That is a
+*preference between paths*, and it was applied as an absolute exclusion:
+`wlb_find_path_ctx()`, the `n_paths == 1` fast path, and the MinRTT fallback
+that carries control and ACK traffic all refused such a path outright.
+
+When the path over the threshold was the *only* path, every branch returned
+`NULL`, so nothing was sent. `ctl_pto_count` is cleared only by an incoming ACK
+(`xqc_send_ctl.c`, on-ack-received), and no ACK can arrive on a path nothing is
+sent on — so the exclusion sustained itself. Not a failover but a deadlock,
+lasting until some *other* path appeared with a fresh `send_ctl`.
+
+That is the second half of the report: after the WiFi path was pulled, the
+tunnel was dead for three minutes with the tethered path `ACTIVE` the whole
+time, and recovered within seconds of WiFi being reconnected — which read as
+"availability follows WiFi" and is really "the survivor was locked out".
+
+The guard is now conditional on a healthier path actually existing
+(`wlb_any_path_pto_healthy()`), decided once per scheduling decision so every
+branch agrees. With an alternative available the behaviour is unchanged; with
+none, the apparently-blackholed path is used rather than nothing. Flow-table
+eviction still honours the guard unconditionally, since unpinning a flow only
+changes where it is re-pinned and cannot stall a send.
+
+Also fixed there: the flow-hit branch dereferenced `path->path_send_ctl`
+without the NULL check its own helper applies.
+
+Covered by `xqc_test_wlb_last_path_over_pto_still_schedules` and
+`xqc_test_wlb_prefers_healthy_path_over_pto_blocked`.
+
 ## Known issues
 
 ### The PMTU search never reopens after it converges

@@ -390,6 +390,8 @@ main(int argc, char *argv[])
         || !CU_add_test(pSuite, "xqc_test_wlb_single_path_does_not_pin", xqc_test_wlb_single_path_does_not_pin)
         || !CU_add_test(pSuite, "xqc_test_wlb_new_path_detected_without_expire_throttle", xqc_test_wlb_new_path_detected_without_expire_throttle)
         || !CU_add_test(pSuite, "xqc_test_wlb_reinject_bypasses_pin", xqc_test_wlb_reinject_bypasses_pin)
+        || !CU_add_test(pSuite, "xqc_test_wlb_last_path_over_pto_still_schedules", xqc_test_wlb_last_path_over_pto_still_schedules)
+        || !CU_add_test(pSuite, "xqc_test_wlb_prefers_healthy_path_over_pto_blocked", xqc_test_wlb_prefers_healthy_path_over_pto_blocked)
         /* ADD TESTS HERE */)
     {
         CU_cleanup_registry();

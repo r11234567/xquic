@@ -116,7 +116,46 @@ typedef struct {
 } xqc_wlb_scheduler_t;
 
 /* Forward declaration — used by wlb_flow_expire() for loss-triggered eviction */
-static xqc_path_ctx_t *wlb_find_path_ctx(xqc_connection_t *conn, uint64_t path_id);
+static xqc_path_ctx_t *wlb_find_path_ctx(xqc_connection_t *conn, uint64_t path_id,
+                                         xqc_bool_t honor_pto);
+
+/**
+ * Is there any active path still under the PTO threshold?
+ *
+ * The PTO guard steers traffic off a path that looks blackholed, which only
+ * means anything while somewhere better exists. When every path is over the
+ * threshold the guard has to be dropped, because refusing them all returns no
+ * path at all -- and ctl_pto_count is cleared only by an incoming ACK, so a
+ * connection that has stopped sending can never earn one. The result is not a
+ * failover but a deadlock: the last path is excluded for being unresponsive,
+ * and excluding it is what keeps it unresponsive.
+ *
+ * Observed as a tunnel going dead for three minutes after its second path was
+ * removed, and coming back only when a replacement path arrived carrying a
+ * fresh send_ctl with pto_count == 0.
+ */
+static xqc_bool_t
+wlb_any_path_pto_healthy(xqc_connection_t *conn)
+{
+    xqc_list_head_t *pos, *next;
+    xqc_path_ctx_t  *path;
+
+    xqc_list_for_each_safe(pos, next, &conn->conn_paths_list) {
+        path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
+        if (path->path_state != XQC_PATH_STATE_ACTIVE
+            || path->app_path_status == XQC_APP_PATH_STATUS_FROZEN
+            || (path->path_flag & XQC_PATH_FLAG_SOCKET_ERROR))
+        {
+            continue;
+        }
+        if (path->path_send_ctl == NULL
+            || path->path_send_ctl->ctl_pto_count < WLB_PTO_EVICT_THRESH)
+        {
+            return XQC_TRUE;
+        }
+    }
+    return XQC_FALSE;
+}
 
 /* ================================================================
  *  Flow table helpers
@@ -341,8 +380,10 @@ wlb_flow_expire(xqc_wlb_scheduler_t *s, uint64_t now_us, xqc_connection_t *conn)
             continue;
         }
 
-        /* Check pinned path status */
-        xqc_path_ctx_t *path = wlb_find_path_ctx(conn, e->path_id);
+        /* Check pinned path status. Eviction always honours the PTO guard: it
+         * only unpins the flow so it can be re-pinned, and never decides
+         * whether a packet can go out, so it cannot deadlock the connection. */
+        xqc_path_ctx_t *path = wlb_find_path_ctx(conn, e->path_id, XQC_TRUE);
         if (!path) {
             /* Path removed or frozen → evict immediately */
             e->hash = WLB_FLOW_TOMBSTONE;
@@ -366,7 +407,7 @@ wlb_flow_expire(xqc_wlb_scheduler_t *s, uint64_t now_us, xqc_connection_t *conn)
  * causes WLB to keep selecting it and stall throughput after link-down.
  */
 static xqc_path_ctx_t *
-wlb_find_path_ctx(xqc_connection_t *conn, uint64_t path_id)
+wlb_find_path_ctx(xqc_connection_t *conn, uint64_t path_id, xqc_bool_t honor_pto)
 {
     xqc_list_head_t *pos, *next;
     xqc_path_ctx_t  *path;
@@ -376,7 +417,8 @@ wlb_find_path_ctx(xqc_connection_t *conn, uint64_t path_id)
             && path->path_state == XQC_PATH_STATE_ACTIVE
             && path->app_path_status != XQC_APP_PATH_STATUS_FROZEN
             && !(path->path_flag & XQC_PATH_FLAG_SOCKET_ERROR)
-            && !(path->path_send_ctl
+            && !(honor_pto
+                 && path->path_send_ctl
                  && path->path_send_ctl->ctl_pto_count >= WLB_PTO_EVICT_THRESH))
         {
             return path;
@@ -734,7 +776,8 @@ wlb_start_round(xqc_wlb_scheduler_t *s)
  * packet that's about to be sent; the pin assignment is metadata only.
  */
 static uint64_t
-wlb_pick_pin_path(xqc_wlb_scheduler_t *s, xqc_connection_t *conn)
+wlb_pick_pin_path(xqc_wlb_scheduler_t *s, xqc_connection_t *conn,
+                  xqc_bool_t honor_pto)
 {
     /* Pick the path with the highest deficit (≈ highest LATE weight) for
      * pin assignment, even if it is currently cwnd-blocked. wrr_select
@@ -751,7 +794,7 @@ wlb_pick_pin_path(xqc_wlb_scheduler_t *s, xqc_connection_t *conn)
     int best = -1;
     int64_t best_deficit = INT64_MIN;
     for (int i = 0; i < s->n_paths; i++) {
-        xqc_path_ctx_t *path = wlb_find_path_ctx(conn, s->paths[i].path_id);
+        xqc_path_ctx_t *path = wlb_find_path_ctx(conn, s->paths[i].path_id, honor_pto);
         if (path == NULL) {
             continue;
         }
@@ -768,13 +811,14 @@ wlb_pick_pin_path(xqc_wlb_scheduler_t *s, xqc_connection_t *conn)
  */
 static uint64_t
 wlb_wrr_select(xqc_wlb_scheduler_t *s, xqc_connection_t *conn,
-                xqc_packet_out_t *packet_out, int check_cwnd)
+                xqc_packet_out_t *packet_out, int check_cwnd,
+                xqc_bool_t honor_pto)
 {
     int best = -1;
     int64_t best_deficit = INT64_MIN;
 
     for (int i = 0; i < s->n_paths; i++) {
-        xqc_path_ctx_t *path = wlb_find_path_ctx(conn, s->paths[i].path_id);
+        xqc_path_ctx_t *path = wlb_find_path_ctx(conn, s->paths[i].path_id, honor_pto);
         if (path == NULL) {
             continue;
         }
@@ -811,6 +855,11 @@ wlb_minrtt_fallback(xqc_connection_t *conn, xqc_packet_out_t *packet_out,
     xqc_bool_t reached_cwnd_check = XQC_FALSE;
     xqc_list_head_t *pos, *next;
     xqc_path_ctx_t *path;
+    /* Only avoid the apparently-blackholed paths while a healthier one exists.
+     * This fallback carries control and ACK traffic, so it is the route by
+     * which a stalled connection would recover -- excluding every path here is
+     * what makes the PTO deadlock permanent rather than transient. */
+    xqc_bool_t honor_pto = wlb_any_path_pto_healthy(conn);
 
     if (cc_blocked) {
         *cc_blocked = XQC_FALSE;
@@ -830,7 +879,8 @@ wlb_minrtt_fallback(xqc_connection_t *conn, xqc_packet_out_t *packet_out,
         /* Keep control/ACK traffic off blackholed paths as well.  WLB routes
          * po_flow_hash==0 packets via this MinRTT fallback, so omitting the
          * PTO guard can stall failover even if app datagrams are re-pinned. */
-        if (path->path_send_ctl
+        if (honor_pto
+            && path->path_send_ctl
             && path->path_send_ctl->ctl_pto_count >= WLB_PTO_EVICT_THRESH)
         {
             continue;
@@ -916,6 +966,11 @@ xqc_wlb_scheduler_get_path(void *scheduler,
     /* TCP flows are pinned to paths; UDP/QUIC use per-packet WRR */
     xqc_bool_t pin_flow = (packet_out->po_flow_hash != WLB_FLOW_HASH_UNPINNED);
 
+    /* Avoiding apparently-blackholed paths is worth doing only while a
+     * healthier path exists to carry the traffic instead. Decided once for this
+     * scheduling decision so every branch below agrees. */
+    xqc_bool_t honor_pto = wlb_any_path_pto_healthy(conn);
+
     uint64_t now_us = xqc_monotonic_timestamp();
 
     /* After path recovery, allow a brief per-packet WRR phase so existing TCP
@@ -938,7 +993,7 @@ xqc_wlb_scheduler_get_path(void *scheduler,
 
         wlb_flow_entry_t *entry = wlb_flow_lookup(s, packet_out->po_flow_hash);
         if (entry) {
-            xqc_path_ctx_t *path = wlb_find_path_ctx(conn, entry->path_id);
+            xqc_path_ctx_t *path = wlb_find_path_ctx(conn, entry->path_id, honor_pto);
 
             /* PTO-based eviction: if the pinned path has been unresponsive
              * for several consecutive PTOs, the path is likely dead (e.g.
@@ -946,6 +1001,8 @@ xqc_wlb_scheduler_get_path(void *scheduler,
              * dropped).  Evict the flow so it gets re-pinned to a live path
              * via WRR below. */
             if (path
+                && honor_pto
+                && path->path_send_ctl
                 && path->path_send_ctl->ctl_pto_count >= WLB_PTO_EVICT_THRESH)
             {
                 xqc_log(conn->log, XQC_LOG_INFO,
@@ -982,7 +1039,7 @@ xqc_wlb_scheduler_get_path(void *scheduler,
      * surviving-path flow migrate back instead of immediately re-pinning to the
      * already-hot path. */
     if (pin_flow && in_recovery_grace && s->recovery_prefer_path_id != WLB_NO_PATH_ID) {
-        xqc_path_ctx_t *rpath = wlb_find_path_ctx(conn, s->recovery_prefer_path_id);
+        xqc_path_ctx_t *rpath = wlb_find_path_ctx(conn, s->recovery_prefer_path_id, honor_pto);
         if (rpath && xqc_scheduler_check_path_can_send(rpath, packet_out, check_cwnd)) {
             wlb_flow_insert(s, packet_out->po_flow_hash, rpath->path_id, now_us);
             xqc_log(conn->log, XQC_LOG_INFO,
@@ -1034,7 +1091,7 @@ xqc_wlb_scheduler_get_path(void *scheduler,
 
     /* Single active path — skip WRR overhead */
     if (s->n_paths == 1) {
-        xqc_path_ctx_t *path = wlb_find_path_ctx(conn, s->paths[0].path_id);
+        xqc_path_ctx_t *path = wlb_find_path_ctx(conn, s->paths[0].path_id, honor_pto);
         if (path && xqc_scheduler_check_path_can_send(path, packet_out, check_cwnd)) {
             /* Single-path period: do NOT pin. Once the secondary path appears
              * in s->paths, the next packet of this flow misses the flow-table
@@ -1051,7 +1108,7 @@ xqc_wlb_scheduler_get_path(void *scheduler,
     }
 
     /* WRR assignment — pin flow to selected path only for TCP */
-    uint64_t sel_path_id = wlb_wrr_select(s, conn, packet_out, check_cwnd);
+    uint64_t sel_path_id = wlb_wrr_select(s, conn, packet_out, check_cwnd, honor_pto);
     if (sel_path_id == UINT64_MAX) {
         /*
          * If no path could be selected, force a fresh round once.
@@ -1060,7 +1117,7 @@ xqc_wlb_scheduler_get_path(void *scheduler,
          */
         wlb_refresh_paths(s, conn);
         wlb_start_round(s);
-        sel_path_id = wlb_wrr_select(s, conn, packet_out, check_cwnd);
+        sel_path_id = wlb_wrr_select(s, conn, packet_out, check_cwnd, honor_pto);
     }
 
     if (sel_path_id != UINT64_MAX) {
@@ -1070,7 +1127,7 @@ xqc_wlb_scheduler_get_path(void *scheduler,
              * a sendable path for this exact packet (sel_path_id); the pin is
              * what subsequent packets of this flow will key off, and it must
              * reflect the long-term best path, not transient cwnd state. */
-            uint64_t pin_path_id = wlb_pick_pin_path(s, conn);
+            uint64_t pin_path_id = wlb_pick_pin_path(s, conn, honor_pto);
             if (pin_path_id == WLB_NO_PATH_ID) {
                 pin_path_id = sel_path_id;
             }
@@ -1079,7 +1136,7 @@ xqc_wlb_scheduler_get_path(void *scheduler,
                     "|wlb|flow_pin|flow:%ui|pin:%ui|send:%ui|",
                     packet_out->po_flow_hash, pin_path_id, sel_path_id);
         }
-        xqc_path_ctx_t *path = wlb_find_path_ctx(conn, sel_path_id);
+        xqc_path_ctx_t *path = wlb_find_path_ctx(conn, sel_path_id, honor_pto);
         xqc_log(conn->log, XQC_LOG_INFO,
                  "|wlb|select|path_id:%ui|n_paths:%d|pinned:%d|",
                  sel_path_id, s->n_paths, (int)pin_flow);

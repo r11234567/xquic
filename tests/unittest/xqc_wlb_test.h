@@ -58,4 +58,14 @@ void xqc_test_wlb_new_path_detected_without_expire_throttle(void);
  * flow whose replica's po_path_id equals the pinned path. */
 void xqc_test_wlb_reinject_bypasses_pin(void);
 
+/* The consecutive-PTO guard is a preference between paths, not an absolute
+ * exclusion: it must never refuse the last usable path. ctl_pto_count is
+ * cleared only by an incoming ACK, so a path nothing is sent on can never
+ * clear it, and excluding the sole survivor deadlocks the connection. */
+void xqc_test_wlb_last_path_over_pto_still_schedules(void);
+
+/* ...while still steering away from an apparently-blackholed path whenever a
+ * healthy one is available. */
+void xqc_test_wlb_prefers_healthy_path_over_pto_blocked(void);
+
 #endif /* XQC_WLB_TEST_H_INCLUDED */

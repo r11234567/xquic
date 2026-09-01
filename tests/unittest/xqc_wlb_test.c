@@ -573,3 +573,76 @@ xqc_test_wlb_reinject_bypasses_pin(void)
 
     wlb_test_teardown(&f);
 }
+
+/* The PTO guard must never exclude the last usable path.
+ *
+ * WLB avoids a path whose consecutive-PTO count says it is probably
+ * blackholed. That is a preference between paths, and it was applied as an
+ * absolute exclusion -- including in the n_paths==1 fast path and in the
+ * MinRTT fallback that carries control and ACK traffic. When the surviving
+ * path was the one over the threshold, every branch returned NULL, so nothing
+ * was sent; ctl_pto_count is cleared only by an incoming ACK, and no ACK can
+ * arrive on a path nothing is sent on. The exclusion was self-sustaining.
+ *
+ * Reported as a tunnel dead for three minutes after its WiFi path was pulled,
+ * with the tethered path ACTIVE throughout, recovering only when a
+ * replacement path arrived with a fresh send_ctl. */
+void
+xqc_test_wlb_last_path_over_pto_still_schedules(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    xqc_path_ctx_t *survivor = wlb_test_add_path(&f, 0, 10000, 64 * 1024, 0);
+    xqc_path_ctx_t *lost     = wlb_test_add_path(&f, 1, 30000, 64 * 1024, 0);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(survivor);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(lost);
+
+    uint32_t flow = 0xB1AC4801;
+    (void)wlb_test_invoke(&f, flow);
+
+    /* The second path goes away, and the survivor looks blackholed: the loss
+     * burst that accompanies a link disappearing is exactly what drives the
+     * remaining path's PTO count up. */
+    wlb_test_detach_path(lost);
+    survivor->path_send_ctl->ctl_pto_count = 8;
+    wlb_test_clock_advance(2000000);   /* let the 1/sec expire throttle open */
+
+    /* Application data must still go somewhere. */
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, flow), 0);
+
+    /* So must control and ACK traffic (flow_hash 0 → MinRTT fallback), which
+     * is the route by which the connection would recover. */
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, 0), 0);
+
+    /* And an unpinned datagram flow, which takes the per-packet WRR route. */
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, 0xFFFFFFFFU), 0);
+
+    wlb_test_teardown(&f);
+}
+
+/* The guard still has to do its job while somewhere better exists: with one
+ * healthy path available, the apparently-blackholed one is avoided. Without
+ * this the fix above would have traded a deadlock for no failover at all. */
+void
+xqc_test_wlb_prefers_healthy_path_over_pto_blocked(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    /* The stalled path is also the faster one, so only the PTO count can be
+     * what steers traffic away from it. */
+    xqc_path_ctx_t *stalled = wlb_test_add_path(&f, 0, 10000, 64 * 1024, 0);
+    xqc_path_ctx_t *healthy = wlb_test_add_path(&f, 1, 30000, 64 * 1024, 0);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(stalled);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(healthy);
+
+    stalled->path_send_ctl->ctl_pto_count = 8;
+    wlb_test_clock_advance(2000000);
+
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, 0xC0FFEE01), 1);
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, 0), 1);
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, 0xFFFFFFFFU), 1);
+
+    wlb_test_teardown(&f);
+}
