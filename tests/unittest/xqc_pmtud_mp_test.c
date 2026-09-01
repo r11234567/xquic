@@ -46,6 +46,7 @@ pmtud_test_conn(void)
 
     conn->enable_pmtud = 1;
     conn->conn_settings.enable_pmtud = 1;
+    conn->conn_settings.pmtud_probing_interval = 500000;
     conn->conn_settings.probing_pkt_out_size = XQC_TEST_PMTU_CEILING;
     conn->conn_settings.max_pkt_out_size = XQC_TEST_PMTU_LIMIT;
     conn->pkt_out_size_limit = XQC_TEST_PMTU_LIMIT;

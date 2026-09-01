@@ -5774,9 +5774,11 @@ xqc_conn_ptmud_probing(xqc_connection_t *conn)
     /* probing can only be sent in 0RTT/1RTT packets */
 
     xqc_pkt_type_t pkt_type = XQC_PTYPE_SHORT_HEADER;
-    int support_0rtt = xqc_conn_is_ready_to_send_early_data(conn);
-
     if (!(conn->conn_flag & XQC_CONN_FLAG_CAN_SEND_1RTT)) {
+        /* Consulted only here. It used to be computed before this branch, so
+         * every probing round on an established connection made a TLS call
+         * whose answer it then discarded. */
+        int support_0rtt = xqc_conn_is_ready_to_send_early_data(conn);
         if ((conn->conn_type == XQC_CONN_TYPE_CLIENT) &&
             (conn->conn_state == XQC_CONN_STATE_CLIENT_INITIAL_SENT) && support_0rtt) {
             pkt_type = XQC_PTYPE_0RTT;
