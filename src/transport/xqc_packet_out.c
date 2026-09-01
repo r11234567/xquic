@@ -761,7 +761,10 @@ xqc_write_pmtud_ping_to_packet(xqc_path_ctx_t *path,
     packet_out->po_path_id = path->path_id;
     packet_out->po_path_flag |= XQC_PATH_SPECIFIED_BY_PTMUD;
     packet_out->po_flag |= XQC_POF_PMTUD_PROBING;
-    packet_out->po_max_pkt_out_size = conn->max_pkt_out_size;
+    /* The probe belongs to one path, so record that path's search ceiling.
+     * conn->max_pkt_out_size is the maximum over all paths and would overstate
+     * the bound for any path whose search has already narrowed. */
+    packet_out->po_max_pkt_out_size = path->path_max_pkt_out_size;
 
     xqc_send_queue_move_to_high_pri(&packet_out->po_list, conn->conn_send_queue);
     return XQC_OK;

@@ -1592,6 +1592,14 @@ xqc_send_ctl_detect_lost(xqc_send_ctl_t *send_ctl, xqc_send_queue_t *send_queue,
 
             /* we reset BBR's cwnd here */
             send_ctl->ctl_cong_callback->xqc_cong_ctl_reset_cwnd(send_ctl->ctl_cong);
+
+            /* RFC 8899 5.2: persistent loss of everything in flight is the
+             * signal a PMTU black hole gives. Drop this path back to the size
+             * QUIC guarantees and let the search climb again, so a mid-connection
+             * MTU reduction -- a route change, or failing over onto a link that
+             * was never the one the size was validated on -- recovers instead of
+             * discarding every packet that exceeds the new limit. */
+            xqc_send_ctl_on_pmtu_blackhole(send_ctl);
         }
 
         if (send_ctl->ctl_info.last_lost_time + send_ctl->ctl_info.record_interval <= now) {
@@ -1708,22 +1716,73 @@ xqc_send_ctl_cc_on_ack(xqc_send_ctl_t *send_ctl, xqc_packet_out_t *acked_packet,
 }
 
 void
-xqc_send_ctl_on_pmtud_ping_acked(xqc_send_ctl_t *send_ctl, 
+xqc_send_ctl_on_pmtu_blackhole(xqc_send_ctl_t *send_ctl)
+{
+    xqc_connection_t *conn = send_ctl->ctl_conn;
+    xqc_path_ctx_t *path = send_ctl->ctl_path;
+
+    if (!conn->enable_pmtud
+        || path == NULL
+        || path->path_state >= XQC_PATH_STATE_CLOSING)
+    {
+        return;
+    }
+
+    if (path->curr_pkt_out_size <= XQC_PACKET_OUT_SIZE
+        && conn->pkt_out_size <= XQC_PACKET_OUT_SIZE)
+    {
+        /* Already at the base size, so packet size is not what is failing. */
+        return;
+    }
+
+    xqc_log(conn->log, XQC_LOG_WARN,
+            "|PMTU|path:%ui|blackhole suspected, reset to base"
+            "|curr:%uz|conn:%uz|base:%uz|",
+            path->path_id, path->curr_pkt_out_size, conn->pkt_out_size,
+            (size_t)XQC_PACKET_OUT_SIZE);
+
+    path->curr_pkt_out_size = XQC_PACKET_OUT_SIZE;
+    path->path_max_pkt_out_size = conn->conn_settings.probing_pkt_out_size;
+    path->path_probing_pkt_out_size = path->path_max_pkt_out_size;
+    path->path_probing_cnt = 0;
+    /* Bounded, not unknown: the connection must come down to the base now, and
+     * the search re-opened above will raise it again as sizes are reconfirmed. */
+    path->path_pmtu_bounded = XQC_TRUE;
+
+    conn->conn_flag |= XQC_CONN_FLAG_PMTUD_PROBING;
+    xqc_timer_unset(&conn->conn_timer_manager, XQC_TIMER_PMTUD_PROBING);
+
+    xqc_conn_try_to_update_mss(conn);
+}
+
+void
+xqc_send_ctl_on_pmtud_ping_acked(xqc_send_ctl_t *send_ctl,
     xqc_packet_out_t *po)
 {
     xqc_connection_t *conn = send_ctl->ctl_conn;
     xqc_path_ctx_t *path = xqc_conn_find_path_by_path_id(conn, po->po_path_id);
 
     if (path == NULL || path->path_state >= XQC_PATH_STATE_CLOSING) {
-        xqc_log(conn->log, XQC_LOG_WARN, 
-                "|PMTUD probe acked on invalid path|path:%ui|", 
+        xqc_log(conn->log, XQC_LOG_WARN,
+                "|PMTUD probe acked on invalid path|path:%ui|",
                 po->po_path_id);
+        /* The check below dereferences path. Without this return a probe acked
+         * after its path was closed -- which the ack of an in-flight probe
+         * makes ordinary, not exotic -- reads through NULL. */
+        return;
     }
-    
+
     if (po->po_buf_size > path->curr_pkt_out_size) {
-        /* update path MTU */
+        /* update path MTU: this size is now confirmed on this path, so the
+         * search moves above it. path_max_pkt_out_size is the path's own upper
+         * bound, maintained by the search in xqc_conn_ptmud_probing; it is
+         * deliberately not taken from the packet, whose copy is connection-wide
+         * and would undo any narrowing the search has already achieved. */
         path->curr_pkt_out_size = po->po_buf_size;
-        path->path_max_pkt_out_size = po->po_max_pkt_out_size;
+        path->path_probing_cnt = 0;
+        path->path_probing_pkt_out_size =
+            xqc_max(path->curr_pkt_out_size,
+                    (path->path_max_pkt_out_size + path->curr_pkt_out_size) >> 1);
         xqc_conn_try_to_update_mss(conn);
     }
 }

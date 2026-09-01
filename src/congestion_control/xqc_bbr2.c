@@ -1112,9 +1112,15 @@ xqc_bbr2_compensate_cwnd_for_rttvar(xqc_bbr2_t *bbr2, xqc_sample_t *sampler)
                                        xqc_bbr2_rtt_compensation_cwnd_factor;
 
         } else {
-            xqc_log(sampler->send_ctl->ctl_conn->log, XQC_LOG_WARN, 
-                    "|cwnd compensation: weird things happened|"
-                    "|srtt %ui <= min_rtt %ui|", 
+            /* Not anomalous: RFC 9002 5.3 subtracts the peer's ack_delay when
+             * smoothing srtt, while 5.2 tracks min_rtt from the unadjusted
+             * latest_rtt. The two are therefore on different scales and
+             * srtt < min_rtt is a routine outcome whenever ack_delay is
+             * significant. There is no rttvar to compensate for in that case,
+             * which the zero return already handles. */
+            xqc_log(sampler->send_ctl->ctl_conn->log, XQC_LOG_DEBUG,
+                    "|cwnd compensation skipped|"
+                    "|srtt %ui <= min_rtt %ui|",
                     srtt, bbr2->min_rtt);
         }
     }

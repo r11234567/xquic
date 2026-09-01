@@ -45,6 +45,7 @@
 #include "xqc_mp21_compliance_test.h"
 #include "xqc_test_helpers.h"
 #include "xqc_test_path_hard_cap.h"
+#include "xqc_pmtud_mp_test.h"
 #include "xqc_test_next_wakeup.h"
 #include "xqc_set_conn_settings_test.h"
 #include "xqc_crypto_frame_test.h"
@@ -363,6 +364,13 @@ main(int argc, char *argv[])
         || !CU_add_test(pSuite, "xqc_test_mp21_gen_paths_blocked_frame", xqc_test_mp21_gen_paths_blocked_frame)
         || !CU_add_test(pSuite, "test_path_create_no_heavy_state_on_validation_fail", test_path_create_no_heavy_state_on_validation_fail)
         || !CU_add_test(pSuite, "test_path_create_hard_cap_stress", test_path_create_hard_cap_stress)
+        || !CU_add_test(pSuite, "xqc_test_pmtud_unprobed_path_does_not_lower_conn", xqc_test_pmtud_unprobed_path_does_not_lower_conn)
+        || !CU_add_test(pSuite, "xqc_test_pmtud_bounded_path_lowers_conn", xqc_test_pmtud_bounded_path_lowers_conn)
+        || !CU_add_test(pSuite, "xqc_test_pmtud_conn_takes_min_of_bounded_paths", xqc_test_pmtud_conn_takes_min_of_bounded_paths)
+        || !CU_add_test(pSuite, "xqc_test_pmtud_closing_path_releases_conn", xqc_test_pmtud_closing_path_releases_conn)
+        || !CU_add_test(pSuite, "xqc_test_pmtud_conn_size_clamped_to_floor_and_limit", xqc_test_pmtud_conn_size_clamped_to_floor_and_limit)
+        || !CU_add_test(pSuite, "xqc_test_pmtud_probe_ceiling_is_max_over_paths", xqc_test_pmtud_probe_ceiling_is_max_over_paths)
+        || !CU_add_test(pSuite, "xqc_test_pmtud_blackhole_resets_path_to_base", xqc_test_pmtud_blackhole_resets_path_to_base)
         || !CU_add_test(pSuite, "test_conn_stats_dynamic_paths_info", test_conn_stats_dynamic_paths_info)
         || !CU_add_test(pSuite, "test_dos_peer_init_max_path_id_max_valid", test_dos_peer_init_max_path_id_max_valid)
         || !CU_add_test(pSuite, "xqc_test_server_set_conn_settings_propagation", xqc_test_server_set_conn_settings_propagation)

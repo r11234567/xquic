@@ -154,9 +154,28 @@ struct xqc_path_ctx_s {
     uint32_t            standby_probe_count;
     uint32_t            app_path_status_changed_count;
 
-    /* PTMUD */
+    /* PTMUD
+     *
+     * The search is per path: two paths of one connection routinely have
+     * different PMTUs (e.g. WiFi at 1500 against a tethered cellular link at
+     * 1400), and a single connection-wide cursor cannot converge on both.
+     *
+     * curr_pkt_out_size is the largest size *confirmed* on this path, so it
+     * starts at the QUIC-safe base (RFC 9000 14.1 guarantees 1200 on any
+     * usable path) and only rises on an acked probe. path_probing_pkt_out_size
+     * is the size currently being probed and may be reduced by the search.
+     *
+     * path_pmtu_bounded separates "this path is known not to carry more than
+     * curr_pkt_out_size" from "this path has not probed yet". Only the former
+     * may lower the connection: without the distinction a path that has merely
+     * not been probed — including every path when the peer does not negotiate
+     * PMTUD — would pin the connection to the base size forever.
+     */
     size_t              curr_pkt_out_size;
     size_t              path_max_pkt_out_size;
+    size_t              path_probing_pkt_out_size;
+    uint32_t            path_probing_cnt;
+    xqc_bool_t          path_pmtu_bounded;
 
     /* 
      * Record pkt receive timestamp info. Null if local 

@@ -1139,9 +1139,10 @@ xqc_conn_create(xqc_engine_t *engine, xqc_cid_t *dcid, xqc_cid_t *scid,
     xc->max_stream_id_bidi_remote = -1;
     xc->max_stream_id_uni_remote = -1;
     xc->last_dgram = NULL;
-    xc->pkt_out_size =
+    xc->pkt_out_size_limit =
         xqc_min(xc->conn_settings.max_pkt_out_size,
                 xc->conn_settings.max_udp_payload_size - XQC_PACKET_OUT_EXT_SPACE);
+    xc->pkt_out_size = xc->pkt_out_size_limit;
     xc->max_pkt_out_size = xc->conn_settings.probing_pkt_out_size;
     xc->probing_pkt_out_size = xc->conn_settings.probing_pkt_out_size;
     xc->probing_cnt = 0;
@@ -2084,10 +2085,16 @@ xqc_conn_try_to_update_mss(xqc_connection_t *conn)
 {
     xqc_path_ctx_t *path;
     xqc_list_head_t *pos, *next;
-    size_t min_pkt_out_size = 0;
+    size_t bounded_pkt_out_size = 0;
     size_t max_pkt_out_size = 0;
+    size_t new_pkt_out_size;
 
-    /* try to update conn MTU */
+    /* One size is used to build every packet, and any packet may be scheduled
+     * onto any path, so that size must be one that every live path carries:
+     * the minimum over the paths whose limit is known. A path that has not
+     * finished probing does not contribute -- it has no evidence to offer, and
+     * treating "not measured yet" as "cannot carry more than the base" would
+     * pin the connection to 1200 forever whenever the peer declines PMTUD. */
     xqc_list_for_each_safe(pos, next, &conn->conn_paths_list)
     {
         path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
@@ -2096,24 +2103,56 @@ xqc_conn_try_to_update_mss(xqc_connection_t *conn)
             continue;
         }
 
-        if (min_pkt_out_size == 0 || path->curr_pkt_out_size < min_pkt_out_size) {
-            min_pkt_out_size = path->curr_pkt_out_size;
+        /* The probing ceiling is the largest size any live path might still
+         * reach, so it is a maximum over paths. It used to be captured inside
+         * the branch that tracked the minimum, which took it from whichever
+         * path held the *smallest* packet size and so stalled the search on
+         * every other path. */
+        if (path->path_max_pkt_out_size > max_pkt_out_size) {
             max_pkt_out_size = path->path_max_pkt_out_size;
+        }
+
+        if (!path->path_pmtu_bounded) {
+            continue;
+        }
+
+        if (bounded_pkt_out_size == 0
+            || path->curr_pkt_out_size < bounded_pkt_out_size)
+        {
+            bounded_pkt_out_size = path->curr_pkt_out_size;
         }
     }
 
-    if (min_pkt_out_size > conn->pkt_out_size) {
-        conn->pkt_out_size = min_pkt_out_size;
-        /* try to update PMTUD probing info */
-        conn->max_pkt_out_size = max_pkt_out_size;
-        conn->probing_pkt_out_size = max_pkt_out_size;
-        conn->probing_cnt = 0;
-        /* launch new probing immediately */
-        conn->conn_flag |= XQC_CONN_FLAG_PMTUD_PROBING;
-        xqc_timer_unset(&conn->conn_timer_manager, XQC_TIMER_PMTUD_PROBING);
-        /* update datagram mss */
-        xqc_datagram_record_mss(conn);
+    new_pkt_out_size = (bounded_pkt_out_size == 0) ? conn->pkt_out_size_limit
+                                                  : bounded_pkt_out_size;
+
+    /* Never above what configuration and the peer allow, never below the size
+     * QUIC requires every path to carry. */
+    new_pkt_out_size = xqc_min(new_pkt_out_size, conn->pkt_out_size_limit);
+    new_pkt_out_size = xqc_max(new_pkt_out_size, XQC_PACKET_OUT_SIZE);
+
+    if (max_pkt_out_size < new_pkt_out_size) {
+        max_pkt_out_size = new_pkt_out_size;
     }
+
+    if (new_pkt_out_size == conn->pkt_out_size) {
+        return;
+    }
+
+    xqc_log(conn->log, XQC_LOG_INFO,
+            "|PMTU|conn pkt_out_size:%uz->%uz|probing_ceiling:%uz|",
+            conn->pkt_out_size, new_pkt_out_size, max_pkt_out_size);
+
+    conn->pkt_out_size = new_pkt_out_size;
+    /* try to update PMTUD probing info */
+    conn->max_pkt_out_size = max_pkt_out_size;
+    conn->probing_pkt_out_size = max_pkt_out_size;
+    conn->probing_cnt = 0;
+    /* launch new probing immediately */
+    conn->conn_flag |= XQC_CONN_FLAG_PMTUD_PROBING;
+    xqc_timer_unset(&conn->conn_timer_manager, XQC_TIMER_PMTUD_PROBING);
+    /* update datagram mss */
+    xqc_datagram_record_mss(conn);
 }
 
 
@@ -5752,53 +5791,98 @@ xqc_conn_ptmud_probing(xqc_connection_t *conn)
         return;
     }
 
-    /* generate PING packets */
-    if (conn->probing_cnt >= 3) {
-        /* if the current MSS has been already probed for 3 times
-         * while the MSS is not updated, we need to shrink the probing size
-         */
-        conn->max_pkt_out_size =
-            xqc_max(conn->probing_pkt_out_size - 1, conn->pkt_out_size);
-        conn->probing_pkt_out_size = xqc_max(
-            conn->pkt_out_size, (conn->max_pkt_out_size + conn->pkt_out_size) >> 1);
-        conn->probing_cnt = 0;
-    }
-
-    /* stop probing if the range is less than 10B */
-    if ((conn->max_pkt_out_size - conn->pkt_out_size) < 10) {
-        xqc_log_event(conn->log, CON_MTU_UPDATED, conn, 1);
-        conn->conn_flag &= ~XQC_CONN_FLAG_PMTUD_PROBING;
-        return;
-    }
-    xqc_log_event(conn->log, CON_MTU_UPDATED, conn, 0);
-    conn->MTU_updated_count++;
-
-
-    size_t probing_size = conn->probing_pkt_out_size;
     xqc_list_head_t *pos, *next;
     xqc_path_ctx_t *path;
     xqc_int_t ret = XQC_OK;
     xqc_usec_t probing_interval = conn->conn_settings.pmtud_probing_interval;
+    uint32_t min_probing_cnt = XQC_MAX_UINT32_VALUE;
+    int probing_paths = 0;
+    xqc_bool_t newly_bounded = XQC_FALSE;
 
-    /* only probing on active paths */
+    /* The search runs per path. A connection-wide cursor converges on neither
+     * path when the two differ -- a probe acked on the wide path reset the
+     * range for the narrow one, and a probe lost on the narrow path shrank the
+     * range for the wide one -- which is why a 1500-MTU link paired with a
+     * 1400-MTU link never discovered either size.
+     *
+     * Only active paths are probed; a path still validating has no send
+     * capacity to spend on probes. */
     xqc_list_for_each_safe(pos, next, &conn->conn_paths_list)
     {
         path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
         if (path->path_state != XQC_PATH_STATE_ACTIVE) {
             continue;
         }
-        ret = xqc_write_pmtud_ping_to_packet(path, probing_size, pkt_type);
+
+        if (path->path_probing_cnt >= 3) {
+            /* the current probing size went unacked three times: exclude it
+             * and everything above, then bisect what is left */
+            path->path_max_pkt_out_size = xqc_max(path->path_probing_pkt_out_size - 1,
+                                                  path->curr_pkt_out_size);
+            path->path_probing_pkt_out_size =
+                xqc_max(path->curr_pkt_out_size,
+                        (path->path_max_pkt_out_size + path->curr_pkt_out_size) >> 1);
+            path->path_probing_cnt = 0;
+        }
+
+        /* Once the search has excluded the size the connection is currently
+         * building packets at, this path is proven unable to carry it. Bound it
+         * now instead of waiting for convergence: the connection stops feeding
+         * the path packets it will drop after one probe cycle rather than
+         * several, at the cost of a temporary dip while the search climbs back
+         * to whatever the path does support. */
+        if (!path->path_pmtu_bounded
+            && path->path_max_pkt_out_size < conn->pkt_out_size)
+        {
+            path->path_pmtu_bounded = XQC_TRUE;
+            newly_bounded = XQC_TRUE;
+        }
+
+        /* stop probing this path once the remaining range is under 10B */
+        if ((path->path_max_pkt_out_size - path->curr_pkt_out_size) < 10) {
+            if (!path->path_pmtu_bounded) {
+                /* The search has now excluded every size above
+                 * curr_pkt_out_size, so this path has a limit the connection
+                 * has to respect. */
+                path->path_pmtu_bounded = XQC_TRUE;
+                newly_bounded = XQC_TRUE;
+            }
+            continue;
+        }
+
+        ret = xqc_write_pmtud_ping_to_packet(path, path->path_probing_pkt_out_size,
+                                             pkt_type);
         if (ret < 0) {
             xqc_log(conn->log, XQC_LOG_ERROR, "|genrate PMTUD ping packet error|ret:%d|",
                     ret);
+            continue;
         }
+
+        min_probing_cnt = xqc_min(min_probing_cnt, path->path_probing_cnt);
+        path->path_probing_cnt++;
+        probing_paths++;
     }
 
-    /* set timer: default 500ms, 1000ms, or 2000ms according to probing_cnt */
-    xqc_timer_set(&conn->conn_timer_manager, XQC_TIMER_PMTUD_PROBING,
-                  xqc_monotonic_timestamp(), probing_interval * (1 << conn->probing_cnt));
+    if (newly_bounded) {
+        xqc_conn_try_to_update_mss(conn);
+    }
 
-    conn->probing_cnt++;
+    if (probing_paths == 0) {
+        /* every active path has converged */
+        xqc_log_event(conn->log, CON_MTU_UPDATED, conn, 1);
+        conn->conn_flag &= ~XQC_CONN_FLAG_PMTUD_PROBING;
+        return;
+    }
+
+    xqc_log_event(conn->log, CON_MTU_UPDATED, conn, 0);
+    conn->MTU_updated_count++;
+
+    /* set timer: default 500ms, 1000ms, or 2000ms according to how many
+     * attempts the least advanced path has made at its current size */
+    xqc_timer_set(&conn->conn_timer_manager, XQC_TIMER_PMTUD_PROBING,
+                  xqc_monotonic_timestamp(),
+                  probing_interval * (1u << xqc_min(min_probing_cnt, 3)));
+
     conn->conn_flag &= ~XQC_CONN_FLAG_PMTUD_PROBING;
 }
 
@@ -6232,8 +6316,13 @@ xqc_conn_set_remote_transport_params(xqc_connection_t *conn,
 
     if (conn->conn_type == XQC_CONN_TYPE_SERVER &&
         settings->max_udp_payload_size >= XQC_PACKET_OUT_SIZE) {
-        conn->pkt_out_size = xqc_min(conn->pkt_out_size, settings->max_udp_payload_size -
-                                                             XQC_PACKET_OUT_EXT_SPACE);
+        /* The peer's limit binds the ceiling, not just the current size:
+         * otherwise a later PMTU recomputation could raise pkt_out_size back
+         * above what the peer said it can receive. */
+        conn->pkt_out_size_limit =
+            xqc_min(conn->pkt_out_size_limit,
+                    settings->max_udp_payload_size - XQC_PACKET_OUT_EXT_SPACE);
+        conn->pkt_out_size = xqc_min(conn->pkt_out_size, conn->pkt_out_size_limit);
     }
 
     return XQC_OK;

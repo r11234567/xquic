@@ -2,7 +2,94 @@
 
 This is the **mp0rta/xquic** fork of [alibaba/xquic](https://github.com/alibaba/xquic), adding [draft-ietf-quic-multipath-21](https://datatracker.ietf.org/doc/draft-ietf-quic-multipath/21/) wire compliance and CONNECT-IP ([RFC 9484](https://www.rfc-editor.org/rfc/rfc9484.html)) support for the [mqvpn](https://github.com/mp0rta/mqvpn) project. Per-PR audit findings against the draft live under [`docs/audit-notes/`](docs/audit-notes/). Upstream alibaba/xquic README follows.
 
+## Per-path PMTU discovery
+
+Upstream discovers one PMTU per *connection*. On a multipath connection whose
+paths have different MTUs — an ordinary laptop with WiFi at 1500 and a tethered
+handset at 1400 — that single value cannot be right for both, and the way it was
+maintained meant it converged on neither.
+
+Three properties combined into a packet black hole:
+
+- `xqc_conn_try_to_update_mss()` computed the minimum `curr_pkt_out_size` across
+  live paths and then applied it only `if (min_pkt_out_size > conn->pkt_out_size)`.
+  The connection's packet size could therefore only ever **rise**. A path with a
+  smaller usable MTU could never lower it.
+- A new path was seeded from `conn->pkt_out_size` rather than from the size QUIC
+  guarantees every path carries, so it was immediately counted as supporting a
+  size no probe had confirmed on it — and since the connection size is the
+  minimum over paths, that assumption could not be falsified.
+- The downward half of the binary search floored at `conn->pkt_out_size`, so the
+  search could narrow the range above the current size but never discover that
+  the current size was itself too large.
+
+With nothing able to reduce it, a connection configured for 1400-byte payloads
+(1428 bytes on the wire once IPv4 and UDP headers are on) sent packets no
+1400-MTU link could forward, indefinitely, and fed every drop to congestion
+control as congestion.
+
+What changed:
+
+- **The search is per path.** `xqc_path_ctx_t` carries its own
+  `path_probing_pkt_out_size` and `path_probing_cnt`, and
+  `xqc_conn_ptmud_probing()` advances each path's cursor independently. A probe
+  acked on the wide path no longer resets the range for the narrow one.
+- **A new path starts at `XQC_PACKET_OUT_SIZE`** (1200, the size RFC 9000 §14.1
+  requires any usable path to carry) and probes up. The first probe aims at the
+  configured ceiling, so a path that does support it converges in one round trip
+  rather than a binary descent.
+- **`conn->pkt_out_size` is recomputed in both directions** as the minimum over
+  paths whose limit is actually known, clamped to `[XQC_PACKET_OUT_SIZE,
+  pkt_out_size_limit]`. Removing the constraining path — a failover — gives the
+  size back.
+- **`path_pmtu_bounded` separates "measured smaller" from "not measured yet".**
+  Only a path whose search has excluded larger sizes constrains the connection.
+  Without this distinction a connection would drop to 1200 and stay there
+  whenever the peer does not negotiate PMTUD, since no path would ever be
+  probed.
+- **Black-hole detection.** Persistent congestion on a path resets it to the base
+  size and reopens the search (RFC 8899 §5.2), so an MTU that shrinks
+  mid-connection recovers instead of discarding every oversized packet.
+- **`xqc_send_ctl_on_pmtud_ping_acked()` no longer dereferences NULL** when a
+  probe is acked after its path closed — the `path == NULL` branch logged a
+  warning and then fell through into `path->curr_pkt_out_size`.
+- The probe ceiling is now a maximum over paths. It was captured inside the
+  branch tracking the minimum, so it came from whichever path held the
+  *smallest* packet size.
+
+Regression coverage is in `tests/unittest/xqc_pmtud_mp_test.c`.
+
+**Cost of the fix.** Adding a path briefly lowers the connection to whatever the
+new path has confirmed, since one buffer size serves every path. That is a
+transient throughput dip on path addition, in exchange for not black-holing.
+Sizing packets per path at send time would avoid it, but packets are allocated
+before the scheduler picks a path, so that is a larger change.
+
+**Not measured here.** These are static changes validated by unit tests and
+review; no throughput measurement backs them yet. Read a weekly netsim run
+before treating the aggregation numbers in mqvpn's
+`docs/network_emulation_matrix.md` as changed.
+
 ## Known issues
+
+### Datagram MSS is connection-wide
+
+`xqc_datagram_record_mss()` derives the datagram MSS from `conn->pkt_out_size`.
+A DATAGRAM frame cannot be fragmented across packets, so its size must fit the
+*smallest* path it might be scheduled onto — which is what the connection-wide
+minimum now gives, at the cost of holding every path to the narrowest one. A
+scheduler that knew the frame size could route large datagrams away from narrow
+paths instead; nothing does that today.
+
+### `min_rtt` and `srtt` are on different scales
+
+RFC 9002 §5.3 subtracts the peer's `ack_delay` when smoothing `srtt`, while §5.2
+tracks `min_rtt` from the unadjusted `latest_rtt`. `srtt < min_rtt` is therefore
+a routine outcome, not an anomaly, and consumers that assume otherwise get
+nothing useful. `xqc_bbr2_compensate_cwnd_for_rttvar()` already returns zero
+compensation in that case; its log line was downgraded from `WARN` to `DEBUG`
+rather than the comparison being changed, since correcting the scales touches
+congestion control and is not something to do without measurement.
 
 ### TODO: re-fragment CRYPTO data when a Retry lengthens the Initial header
 

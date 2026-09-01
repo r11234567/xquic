@@ -306,8 +306,19 @@ xqc_path_create(xqc_connection_t *conn, xqc_cid_t *scid, xqc_cid_t *dcid, uint64
     xqc_cid_set_update_state(&conn->scid_set, path_id, XQC_CID_SET_USED);
 
     path->path_create_time = xqc_monotonic_timestamp();
-    path->curr_pkt_out_size = conn->pkt_out_size;
-    path->path_max_pkt_out_size = conn->max_pkt_out_size;
+    /* A new path has validated nothing, so it starts at the size every QUIC
+     * path is required to carry and probes up from there. Seeding it from
+     * conn->pkt_out_size instead imported a size this path may not support,
+     * and made that import unfalsifiable: conn->pkt_out_size is the minimum
+     * over paths, so the path was immediately counted as supporting a size no
+     * probe had ever confirmed on it. */
+    path->curr_pkt_out_size = XQC_PACKET_OUT_SIZE;
+    path->path_max_pkt_out_size = conn->conn_settings.probing_pkt_out_size;
+    /* Probe the ceiling first: on a path that does support it the search costs
+     * one round trip instead of a binary descent. */
+    path->path_probing_pkt_out_size = path->path_max_pkt_out_size;
+    path->path_probing_cnt = 0;
+    path->path_pmtu_bounded = XQC_FALSE;
 
     /* insert path to conn_paths_list */
     xqc_list_add_tail(&path->path_list, &conn->conn_paths_list);
@@ -1464,9 +1475,16 @@ xqc_path_validate(xqc_path_ctx_t *path)
             xqc_set_application_path_status(path, path->next_app_path_state, XQC_FALSE);
         }
 
-        /* PMTUD: launch probing immediately */
+        /* PMTUD: launch probing immediately.
+         *
+         * The search state reset here is the newly validated path's own, not
+         * the connection's: this path has just become eligible to carry data
+         * and has confirmed nothing beyond the guaranteed base, so it starts
+         * its search at the ceiling. Clearing a connection-wide counter
+         * instead used to restart the search for every other path as well. */
         if (conn->enable_pmtud) {
-            conn->probing_cnt = 0;
+            path->path_probing_pkt_out_size = path->path_max_pkt_out_size;
+            path->path_probing_cnt = 0;
             conn->conn_flag |= XQC_CONN_FLAG_PMTUD_PROBING;
             xqc_timer_unset(&conn->conn_timer_manager, XQC_TIMER_PMTUD_PROBING);
         }

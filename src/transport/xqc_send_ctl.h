@@ -239,6 +239,12 @@ void xqc_send_ctl_on_dgram_received(xqc_send_ctl_t *send_ctl, size_t dgram_size)
 
 void xqc_send_ctl_update_rtt(xqc_send_ctl_t *send_ctl, xqc_usec_t *latest_rtt, xqc_usec_t ack_delay);
 
+/**
+ * Handle a suspected PMTU black hole on this send_ctl's path: reset the path to
+ * the packet size QUIC guarantees and restart the PMTU search from there.
+ */
+void xqc_send_ctl_on_pmtu_blackhole(xqc_send_ctl_t *send_ctl);
+
 void xqc_send_ctl_on_spurious_loss_detected(xqc_send_ctl_t *send_ctl,
     xqc_pkt_num_space_t pns, xqc_usec_t ack_recv_time,
     xqc_packet_number_t largest_ack, xqc_packet_number_t spurious_loss_pktnum,
