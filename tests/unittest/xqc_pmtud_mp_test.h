@@ -9,6 +9,7 @@
 
 void xqc_test_pmtud_unprobed_path_does_not_lower_conn(void);
 void xqc_test_pmtud_bounded_path_lowers_conn(void);
+void xqc_test_pmtud_confirmed_paths_raise_conn(void);
 void xqc_test_pmtud_conn_takes_min_of_bounded_paths(void);
 void xqc_test_pmtud_closing_path_releases_conn(void);
 void xqc_test_pmtud_conn_size_clamped_to_floor_and_limit(void);

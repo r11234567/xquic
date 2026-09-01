@@ -313,7 +313,7 @@ xqc_path_create(xqc_connection_t *conn, xqc_cid_t *scid, xqc_cid_t *dcid, uint64
      * over paths, so the path was immediately counted as supporting a size no
      * probe had ever confirmed on it. */
     path->curr_pkt_out_size = XQC_PACKET_OUT_SIZE;
-    path->path_max_pkt_out_size = conn->conn_settings.probing_pkt_out_size;
+    path->path_max_pkt_out_size = conn->pkt_out_size_limit;
     /* Probe the ceiling first: on a path that does support it the search costs
      * one round trip instead of a binary descent. */
     path->path_probing_pkt_out_size = path->path_max_pkt_out_size;

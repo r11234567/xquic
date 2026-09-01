@@ -28,8 +28,14 @@
 #include "xqc_test_helpers.h"
 #include "xqc_pmtud_mp_test.h"
 
-#define XQC_TEST_PMTU_LIMIT     1400    /* what the application configured */
-#define XQC_TEST_PMTU_CEILING   1420    /* XQC_MAX_PACKET_OUT_SIZE          */
+/* conn_settings.max_pkt_out_size is where the search *starts* -- the size the
+ * application asserts its paths carry -- and probing_pkt_out_size is the
+ * ceiling PMTUD may climb to. Naming them apart here because reading the former
+ * as a ceiling inverts the whole model: it makes the connection unable to rise,
+ * which is the upward half of discovery that these tests exist to hold down
+ * alongside the downward half. */
+#define XQC_TEST_PMTU_BASE      1400    /* conn_settings.max_pkt_out_size    */
+#define XQC_TEST_PMTU_CEILING   1420    /* conn_settings.probing_pkt_out_size */
 
 /* Build the fixture connection used by every case below.
  *
@@ -48,9 +54,10 @@ pmtud_test_conn(void)
     conn->conn_settings.enable_pmtud = 1;
     conn->conn_settings.pmtud_probing_interval = 500000;
     conn->conn_settings.probing_pkt_out_size = XQC_TEST_PMTU_CEILING;
-    conn->conn_settings.max_pkt_out_size = XQC_TEST_PMTU_LIMIT;
-    conn->pkt_out_size_limit = XQC_TEST_PMTU_LIMIT;
-    conn->pkt_out_size = XQC_TEST_PMTU_LIMIT;
+    conn->conn_settings.max_pkt_out_size = XQC_TEST_PMTU_BASE;
+    conn->pkt_out_size_base = XQC_TEST_PMTU_BASE;
+    conn->pkt_out_size_limit = XQC_TEST_PMTU_CEILING;
+    conn->pkt_out_size = XQC_TEST_PMTU_BASE;
     conn->max_pkt_out_size = XQC_TEST_PMTU_CEILING;
     conn->probing_pkt_out_size = XQC_TEST_PMTU_CEILING;
     conn->conn_timer_manager.log = conn->log;
@@ -96,7 +103,7 @@ xqc_test_pmtud_unprobed_path_does_not_lower_conn(void)
     CU_ASSERT_PTR_NOT_NULL_FATAL(path);
 
     xqc_conn_try_to_update_mss(conn);
-    CU_ASSERT(conn->pkt_out_size == XQC_TEST_PMTU_LIMIT);
+    CU_ASSERT(conn->pkt_out_size == XQC_TEST_PMTU_BASE);
 
     xqc_test_helper_path_destroy(path);
     xqc_test_helper_conn_destroy(conn);
@@ -124,6 +131,44 @@ xqc_test_pmtud_bounded_path_lowers_conn(void)
     xqc_test_helper_conn_destroy(conn);
 }
 
+/* The upward half of discovery, which is what PMTUD is normally for: once every
+ * path has had a larger size acked, the connection uses it.
+ *
+ * The absence of this test is what let a regression through -- an earlier
+ * revision clamped the connection to conn_settings.max_pkt_out_size, reading
+ * that setting as a ceiling when it is the starting size. Every downward test
+ * here still passed; the end-to-end PMTUD cases caught it, single-path ones
+ * included, because the datagram MSS never grew. */
+void
+xqc_test_pmtud_confirmed_paths_raise_conn(void)
+{
+    xqc_connection_t *conn = pmtud_test_conn();
+    CU_ASSERT_PTR_NOT_NULL_FATAL(conn);
+
+    xqc_path_ctx_t *first = pmtud_test_path(conn, 0, XQC_TEST_PMTU_CEILING,
+                                            XQC_TEST_PMTU_CEILING, 0);
+    xqc_path_ctx_t *second = pmtud_test_path(conn, 1, XQC_PACKET_OUT_SIZE,
+                                             XQC_TEST_PMTU_CEILING, 0);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(first);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(second);
+
+    /* One path has confirmed the ceiling, the other has confirmed nothing. The
+     * connection cannot use the ceiling yet -- a packet built at that size may
+     * be scheduled onto either path -- so it stays at what the application
+     * asserted. */
+    xqc_conn_try_to_update_mss(conn);
+    CU_ASSERT(conn->pkt_out_size == XQC_TEST_PMTU_BASE);
+
+    /* Both confirmed: now it may rise, and above the configured start size. */
+    second->curr_pkt_out_size = XQC_TEST_PMTU_CEILING;
+    xqc_conn_try_to_update_mss(conn);
+    CU_ASSERT(conn->pkt_out_size == XQC_TEST_PMTU_CEILING);
+
+    xqc_test_helper_path_destroy(first);
+    xqc_test_helper_path_destroy(second);
+    xqc_test_helper_conn_destroy(conn);
+}
+
 /* With two bounded paths the connection has to fit the smaller: one buffer
  * size is used to build a packet that may be scheduled onto either. */
 void
@@ -132,7 +177,7 @@ xqc_test_pmtud_conn_takes_min_of_bounded_paths(void)
     xqc_connection_t *conn = pmtud_test_conn();
     CU_ASSERT_PTR_NOT_NULL_FATAL(conn);
 
-    xqc_path_ctx_t *wide = pmtud_test_path(conn, 0, XQC_TEST_PMTU_LIMIT,
+    xqc_path_ctx_t *wide = pmtud_test_path(conn, 0, XQC_TEST_PMTU_BASE,
                                            XQC_TEST_PMTU_CEILING, 1);
     xqc_path_ctx_t *narrow = pmtud_test_path(conn, 1, 1272, 1280, 1);
     CU_ASSERT_PTR_NOT_NULL_FATAL(wide);
@@ -155,7 +200,7 @@ xqc_test_pmtud_closing_path_releases_conn(void)
     xqc_connection_t *conn = pmtud_test_conn();
     CU_ASSERT_PTR_NOT_NULL_FATAL(conn);
 
-    xqc_path_ctx_t *wide = pmtud_test_path(conn, 0, XQC_TEST_PMTU_LIMIT,
+    xqc_path_ctx_t *wide = pmtud_test_path(conn, 0, XQC_TEST_PMTU_BASE,
                                            XQC_TEST_PMTU_CEILING, 1);
     xqc_path_ctx_t *narrow = pmtud_test_path(conn, 1, 1272, 1280, 1);
     CU_ASSERT_PTR_NOT_NULL_FATAL(wide);
@@ -166,7 +211,7 @@ xqc_test_pmtud_closing_path_releases_conn(void)
 
     narrow->path_state = XQC_PATH_STATE_CLOSING;
     xqc_conn_try_to_update_mss(conn);
-    CU_ASSERT(conn->pkt_out_size == XQC_TEST_PMTU_LIMIT);
+    CU_ASSERT(conn->pkt_out_size == XQC_TEST_PMTU_BASE);
 
     xqc_test_helper_path_destroy(wide);
     xqc_test_helper_path_destroy(narrow);
@@ -190,12 +235,13 @@ xqc_test_pmtud_conn_size_clamped_to_floor_and_limit(void)
     xqc_conn_try_to_update_mss(conn);
     CU_ASSERT(conn->pkt_out_size == XQC_PACKET_OUT_SIZE);
 
-    /* A path bounded above the configured limit must not raise the
-     * connection past it. */
-    tiny->curr_pkt_out_size = XQC_TEST_PMTU_CEILING;
-    tiny->path_max_pkt_out_size = XQC_TEST_PMTU_CEILING;
+    /* A path that somehow reports carrying more than the ceiling -- which the
+     * peer's max_udp_payload_size and the packet buffer both set -- must not
+     * raise the connection past it. */
+    tiny->curr_pkt_out_size = XQC_TEST_PMTU_CEILING + 100;
+    tiny->path_max_pkt_out_size = XQC_TEST_PMTU_CEILING + 100;
     xqc_conn_try_to_update_mss(conn);
-    CU_ASSERT(conn->pkt_out_size == XQC_TEST_PMTU_LIMIT);
+    CU_ASSERT(conn->pkt_out_size == XQC_TEST_PMTU_CEILING);
 
     xqc_test_helper_path_destroy(tiny);
     xqc_test_helper_conn_destroy(conn);
@@ -273,12 +319,12 @@ xqc_test_pmtud_blackhole_resets_path_to_base(void)
     xqc_connection_t *conn = pmtud_test_conn();
     CU_ASSERT_PTR_NOT_NULL_FATAL(conn);
 
-    xqc_path_ctx_t *path = pmtud_test_path(conn, 0, XQC_TEST_PMTU_LIMIT,
+    xqc_path_ctx_t *path = pmtud_test_path(conn, 0, XQC_TEST_PMTU_BASE,
                                            XQC_TEST_PMTU_CEILING, 1);
     CU_ASSERT_PTR_NOT_NULL_FATAL(path);
 
     xqc_conn_try_to_update_mss(conn);
-    CU_ASSERT(conn->pkt_out_size == XQC_TEST_PMTU_LIMIT);
+    CU_ASSERT(conn->pkt_out_size == XQC_TEST_PMTU_BASE);
 
     /* xqc_send_ctl_on_pmtu_blackhole only reads ctl_conn and ctl_path, so a
      * stack send_ctl is enough and keeps the engine-less fixture usable. */

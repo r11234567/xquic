@@ -495,11 +495,16 @@ struct xqc_connection_s {
 
     /* min pkt_out_size across all paths */
     size_t pkt_out_size;
-    /* Ceiling for pkt_out_size from local configuration and the peer's
-     * max_udp_payload_size. Held separately so that pkt_out_size can be
-     * recomputed in both directions -- lowered when a path turns out not to
-     * carry it, raised again when that path goes away -- without having to
-     * re-derive the configured limit from settings each time. */
+    /* The size the application asserted its paths can carry
+     * (conn_settings.max_pkt_out_size). pkt_out_size sits here absent evidence
+     * either way: PMTUD raises above it as probes are confirmed, and a path
+     * proven unable to carry it brings the connection below it. Held so that
+     * both movements are recomputable from the path list -- in particular so
+     * that losing the path which forced a reduction restores this size --
+     * rather than depending on the order updates arrived in. */
+    size_t pkt_out_size_base;
+    /* Ceiling pkt_out_size may reach: the configured probing size, bounded by
+     * the buffer capacity and by the peer's max_udp_payload_size. */
     size_t pkt_out_size_limit;
     size_t max_pkt_out_size;
     size_t probing_pkt_out_size;

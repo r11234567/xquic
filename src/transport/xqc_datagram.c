@@ -100,17 +100,26 @@ xqc_datagram_record_mss(xqc_connection_t *conn)
     
     conn->dgram_mss = xqc_min(xqc_min(dgram_frame_limit, udp_payload_limit), mtu_limit);
 end:
-    if (conn->dgram_mss > old_mss) {
+    if (conn->dgram_mss != old_mss) {
+        /* Any change, not only growth. An application sizing its writes to the
+         * MSS has to be told when the MSS *shrinks*, or it keeps submitting
+         * datagrams that no longer fit and every one of them is rejected --
+         * with the application's own view of the tunnel MTU left stale, which
+         * is worse than the send failing. Notifying only on growth was very
+         * nearly complete while the packet size could only rise; now that a
+         * path can lower the connection, it is not. */
         conn->conn_flag |= XQC_CONN_FLAG_DGRAM_MSS_NOTIFY;
 
-    } else {
-        if ((conn->conn_flag & XQC_CONN_FLAG_CAN_SEND_1RTT)
-            && (conn->dgram_mss == 0)
-            && ~(conn->conn_flag & XQC_CONN_FLAG_NO_DGRAM_NOTIFIED)) 
-        {
-            conn->conn_flag |= XQC_CONN_FLAG_DGRAM_MSS_NOTIFY;
-            conn->conn_flag |= XQC_CONN_FLAG_NO_DGRAM_NOTIFIED;
-        }
+    } else if ((conn->conn_flag & XQC_CONN_FLAG_CAN_SEND_1RTT)
+               && (conn->dgram_mss == 0)
+               && !(conn->conn_flag & XQC_CONN_FLAG_NO_DGRAM_NOTIFIED))
+    {
+        /* Tell the application once that datagrams are unusable. The test was
+         * `~flag`, which is non-zero for every flag value that does not have
+         * all bits set, so NO_DGRAM_NOTIFIED never actually suppressed the
+         * repeat it exists for. */
+        conn->conn_flag |= XQC_CONN_FLAG_DGRAM_MSS_NOTIFY;
+        conn->conn_flag |= XQC_CONN_FLAG_NO_DGRAM_NOTIFIED;
     }
 
     if ((conn->conn_flag & XQC_CONN_FLAG_DGRAM_MSS_NOTIFY) 

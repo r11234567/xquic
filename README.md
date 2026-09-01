@@ -53,6 +53,12 @@ What changed:
 - **`xqc_send_ctl_on_pmtud_ping_acked()` no longer dereferences NULL** when a
   probe is acked after its path closed — the `path == NULL` branch logged a
   warning and then fell through into `path->curr_pkt_out_size`.
+- **The datagram MSS callback fires on a decrease, not only an increase.**
+  `xqc_datagram_record_mss()` raised `XQC_CONN_FLAG_DGRAM_MSS_NOTIFY` only when
+  the MSS grew, which was very nearly complete while the packet size could only
+  rise. An application that sizes its writes to the MSS — a tunnel setting its
+  interface MTU, say — would otherwise keep a stale, too-large value and have
+  every oversized datagram rejected.
 - The probe ceiling is now a maximum over paths. It was captured inside the
   branch tracking the minimum, so it came from whichever path held the
   *smallest* packet size.
@@ -71,6 +77,21 @@ before treating the aggregation numbers in mqvpn's
 `docs/network_emulation_matrix.md` as changed.
 
 ## Known issues
+
+### The PMTU search never reopens after it converges
+
+Once a path's search converges, `path_pmtu_bounded` stays set and nothing probes
+that path again. A PMTU that *increases* mid-connection — roaming onto a better
+link, or a middlebox that stops clamping — is therefore never discovered, and a
+long-lived connection keeps whatever size it settled on. RFC 8899 §5.3 handles
+this with a PMTU_RAISE_TIMER (600 s by default) that drops the path back into
+search; that timer is not implemented here.
+
+This is a narrowing of an old behaviour rather than a new failure: before, the
+size could only rise, so an increase was "handled" by raising it without ever
+validating that anything could carry it — which is the black hole this change
+exists to close. Converging low is the safe direction to be wrong in, but it is
+still wrong.
 
 ### Datagram MSS is connection-wide
 

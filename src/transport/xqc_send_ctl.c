@@ -1742,7 +1742,7 @@ xqc_send_ctl_on_pmtu_blackhole(xqc_send_ctl_t *send_ctl)
             (size_t)XQC_PACKET_OUT_SIZE);
 
     path->curr_pkt_out_size = XQC_PACKET_OUT_SIZE;
-    path->path_max_pkt_out_size = conn->conn_settings.probing_pkt_out_size;
+    path->path_max_pkt_out_size = conn->pkt_out_size_limit;
     path->path_probing_pkt_out_size = path->path_max_pkt_out_size;
     path->path_probing_cnt = 0;
     /* Bounded, not unknown: the connection must come down to the base now, and

@@ -1139,10 +1139,22 @@ xqc_conn_create(xqc_engine_t *engine, xqc_cid_t *dcid, xqc_cid_t *scid,
     xc->max_stream_id_bidi_remote = -1;
     xc->max_stream_id_uni_remote = -1;
     xc->last_dgram = NULL;
-    xc->pkt_out_size_limit =
+    xc->pkt_out_size_base =
         xqc_min(xc->conn_settings.max_pkt_out_size,
                 xc->conn_settings.max_udp_payload_size - XQC_PACKET_OUT_EXT_SPACE);
-    xc->pkt_out_size = xc->pkt_out_size_limit;
+    /* conn_settings.max_pkt_out_size is where the search starts, not where it
+     * may end: PMTUD climbs from it toward probing_pkt_out_size. The ceiling is
+     * therefore the probing size, bounded by what a packet buffer holds. */
+    xc->pkt_out_size_limit =
+        xqc_min(xc->conn_settings.probing_pkt_out_size, XQC_MAX_PACKET_OUT_SIZE);
+    xc->pkt_out_size_limit =
+        xqc_min(xc->pkt_out_size_limit,
+                xc->conn_settings.max_udp_payload_size - XQC_PACKET_OUT_EXT_SPACE);
+    /* A probing size configured below the starting size would otherwise put the
+     * ceiling under the floor and make the application's own setting
+     * unreachable. */
+    xc->pkt_out_size_limit = xqc_max(xc->pkt_out_size_limit, xc->pkt_out_size_base);
+    xc->pkt_out_size = xc->pkt_out_size_base;
     xc->max_pkt_out_size = xc->conn_settings.probing_pkt_out_size;
     xc->probing_pkt_out_size = xc->conn_settings.probing_pkt_out_size;
     xc->probing_cnt = 0;
@@ -2085,16 +2097,27 @@ xqc_conn_try_to_update_mss(xqc_connection_t *conn)
 {
     xqc_path_ctx_t *path;
     xqc_list_head_t *pos, *next;
+    size_t confirmed_pkt_out_size = 0;
     size_t bounded_pkt_out_size = 0;
     size_t max_pkt_out_size = 0;
     size_t new_pkt_out_size;
 
     /* One size is used to build every packet, and any packet may be scheduled
-     * onto any path, so that size must be one that every live path carries:
-     * the minimum over the paths whose limit is known. A path that has not
-     * finished probing does not contribute -- it has no evidence to offer, and
-     * treating "not measured yet" as "cannot carry more than the base" would
-     * pin the connection to 1200 forever whenever the peer declines PMTUD. */
+     * onto any path, so that size has to be one every live path carries. Two
+     * separate minima say what the paths know:
+     *
+     *   confirmed -- the least any path has had *acked*. This is what lets the
+     *     size rise: once every path has confirmed a larger size, the
+     *     connection can use it. It cannot lower the connection on its own,
+     *     because a path that has not probed yet has confirmed only the base
+     *     and that is an absence of evidence, not a limit.
+     *
+     *   bounded -- the least among paths whose search has *excluded* larger
+     *     sizes. This is evidence, so it does lower the connection.
+     *
+     * Absent either, the size stays at what the application asked for, which
+     * is also the whole behaviour when the peer does not negotiate PMTUD.
+     */
     xqc_list_for_each_safe(pos, next, &conn->conn_paths_list)
     {
         path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
@@ -2112,21 +2135,31 @@ xqc_conn_try_to_update_mss(xqc_connection_t *conn)
             max_pkt_out_size = path->path_max_pkt_out_size;
         }
 
-        if (!path->path_pmtu_bounded) {
-            continue;
+        if (confirmed_pkt_out_size == 0
+            || path->curr_pkt_out_size < confirmed_pkt_out_size)
+        {
+            confirmed_pkt_out_size = path->curr_pkt_out_size;
         }
 
-        if (bounded_pkt_out_size == 0
-            || path->curr_pkt_out_size < bounded_pkt_out_size)
+        if (path->path_pmtu_bounded
+            && (bounded_pkt_out_size == 0
+                || path->curr_pkt_out_size < bounded_pkt_out_size))
         {
             bounded_pkt_out_size = path->curr_pkt_out_size;
         }
     }
 
-    new_pkt_out_size = (bounded_pkt_out_size == 0) ? conn->pkt_out_size_limit
-                                                  : bounded_pkt_out_size;
+    new_pkt_out_size = conn->pkt_out_size_base;
 
-    /* Never above what configuration and the peer allow, never below the size
+    if (confirmed_pkt_out_size > new_pkt_out_size) {
+        new_pkt_out_size = confirmed_pkt_out_size;
+    }
+
+    if (bounded_pkt_out_size != 0 && bounded_pkt_out_size < new_pkt_out_size) {
+        new_pkt_out_size = bounded_pkt_out_size;
+    }
+
+    /* Never above what the peer and the buffer allow, never below the size
      * QUIC requires every path to carry. */
     new_pkt_out_size = xqc_min(new_pkt_out_size, conn->pkt_out_size_limit);
     new_pkt_out_size = xqc_max(new_pkt_out_size, XQC_PACKET_OUT_SIZE);
@@ -6337,12 +6370,14 @@ xqc_conn_set_remote_transport_params(xqc_connection_t *conn,
 
     if (conn->conn_type == XQC_CONN_TYPE_SERVER &&
         settings->max_udp_payload_size >= XQC_PACKET_OUT_SIZE) {
-        /* The peer's limit binds the ceiling, not just the current size:
-         * otherwise a later PMTU recomputation could raise pkt_out_size back
-         * above what the peer said it can receive. */
-        conn->pkt_out_size_limit =
-            xqc_min(conn->pkt_out_size_limit,
-                    settings->max_udp_payload_size - XQC_PACKET_OUT_EXT_SPACE);
+        /* The peer's limit binds the ceiling and the base, not just the current
+         * size: both feed the recomputation, so leaving either above what the
+         * peer said it can receive would let a later update raise the size back
+         * over that limit. */
+        size_t peer_limit =
+            settings->max_udp_payload_size - XQC_PACKET_OUT_EXT_SPACE;
+        conn->pkt_out_size_limit = xqc_min(conn->pkt_out_size_limit, peer_limit);
+        conn->pkt_out_size_base = xqc_min(conn->pkt_out_size_base, peer_limit);
         conn->pkt_out_size = xqc_min(conn->pkt_out_size, conn->pkt_out_size_limit);
     }
 
