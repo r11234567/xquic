@@ -27,6 +27,7 @@ void xqc_test_wlb_soft_pin_no_repin_on_block(void);
 /* I2 Symmetric multi-flow: flows distribute across paths (no convergence
  *    to paths[0]). */
 void xqc_test_wlb_sym_multiflow_distributes(void);
+void xqc_test_wlb_asym_pin_follows_weight_ratio(void);
 
 /* Recovery-prefer must NOT fire when the secondary path simply appears for
  * the first time (initial 2nd-path setup is not a recovery event). */

@@ -97,6 +97,9 @@ typedef struct {
      * asking of this scheduler -- where flows get pinned, and whether rounds
      * keep turning over -- are about aggregates over a run, and logging them
      * per packet at INFO would cost more throughput than it measures. */
+    int         pinned_now;     /* flows currently pinned here; the quantity
+                                 * wlb_pick_pin_path balances against weight,
+                                 * refreshed from the flow table at most 10x/s */
     uint64_t    instr_pins;     /* flows pinned here */
     uint64_t    instr_sched;    /* packets chosen for this path by WRR or by a
                                  * flow hit. Excludes the MinRTT fallback, which
@@ -123,6 +126,7 @@ typedef struct {
      * re-pins all TCP flows to the just-added — possibly narrow — path. */
     xqc_bool_t           ever_lost_path;
     xqc_log_t           *log;
+    uint64_t             pin_counts_ts;      /* last pinned_now refresh (us) */
     uint64_t             instr_rounds;       /* WRR rounds started */
     uint64_t             instr_last_log_us;  /* throttle the summary to 1/sec */
 } xqc_wlb_scheduler_t;
@@ -778,11 +782,13 @@ wlb_refresh_paths(xqc_wlb_scheduler_t *s, xqc_connection_t *conn)
 
         /* Preserve deficit and instrumentation for existing paths */
         s->paths[n].deficit = 0;
+        s->paths[n].pinned_now = 0;
         s->paths[n].instr_pins = 0;
         s->paths[n].instr_sched = 0;
         for (int j = 0; j < old_n; j++) {
             if (old[j].path_id == path->path_id) {
                 s->paths[n].deficit = old[j].deficit;
+                s->paths[n].pinned_now = old[j].pinned_now;
                 s->paths[n].instr_pins = old[j].instr_pins;
                 s->paths[n].instr_sched = old[j].instr_sched;
                 break;
@@ -858,33 +864,98 @@ wlb_start_round(xqc_wlb_scheduler_t *s)
  */
 static uint64_t
 wlb_pick_pin_path(xqc_wlb_scheduler_t *s, xqc_connection_t *conn,
-                  xqc_bool_t honor_pto)
+                  xqc_bool_t honor_pto, uint64_t now_us)
 {
-    /* Pick the path with the highest deficit (≈ highest LATE weight) for
-     * pin assignment, even if it is currently cwnd-blocked. wrr_select
-     * (just before) already chose a sendable path for the current packet;
-     * the pin is what subsequent packets of this flow will key off, and
-     * it must reflect the long-term best path, not transient cwnd state.
+    /* Assign the flow to whichever eligible path is furthest below the share
+     * of pinned flows its weight entitles it to.
      *
-     * Under sym fabric (equal weights → equal quanta), wrr_select
-     * decrements one path's deficit by 1 → pick_pin sees the OTHER path
-     * as max → flows alternate naturally. Under asym (3:1+ quantum), the
-     * wide path stays max-deficit through several decrements before
-     * narrow gets its turn, giving weighted alternation.
+     * This used to pick the highest deficit, on the reasoning that wrr_select
+     * decrements one path's deficit so pick_pin would see the other as max and
+     * flows would alternate. Instrumented runs say they do not: on two
+     * identical unshaped legs the pins came out 2:13, 12:3 and 8:43 -- a
+     * minority share of 0.13-0.21 where 0.5 was intended, in every tier row of
+     * run 33621937964, at both 4 and 16 inner streams.
+     *
+     * The alternation argument had two holes. Deficit is consumed per packet,
+     * not per pin, so hundreds of packets pass between two pins and the
+     * deficits at pin time reflect packet scheduling rather than flow
+     * assignment. And a pinned flow's packets take the flow-hit fast path,
+     * which never touches deficit at all -- so the deficits only ever describe
+     * the traffic that is NOT pinned, which is the traffic this decision is not
+     * about.
+     *
+     * Worse, deficit derives from the LATE weight, which derives from cwnd,
+     * which is a function of the traffic this scheduler already sent that path.
+     * Pinning to it closes a loop: more flows -> more traffic -> larger cwnd ->
+     * larger weight -> more flows. Measured weight ratios between two legs the
+     * scenario made identical ran 2.4x to 10.4x. Counting flows breaks the
+     * loop, because the count is what this function itself controls.
+     *
+     * Weight still decides the target ratio, so a genuinely wider path is still
+     * given proportionally more flows; only the feedback term is gone.
      */
     int best = -1;
-    int64_t best_deficit = INT64_MIN;
+    double best_gap = 0.0;
+    uint64_t total_weight = 0;
+    int total_pinned = 0;
+
+    /* Refresh the per-path pinned-flow counts at most ten times a second. The
+     * scan is over the whole flow table, and pins can arrive in bursts (every
+     * flow of a new connection misses at once); a flow lives 60 s, so counts
+     * 100 ms stale cost nothing. */
+    if (s->pin_counts_ts == 0 || now_us - s->pin_counts_ts > 100000) {
+        s->pin_counts_ts = now_us;
+        for (int i = 0; i < s->n_paths; i++) {
+            s->paths[i].pinned_now = 0;
+        }
+        for (int e = 0; e < WLB_FLOW_TABLE_SIZE; e++) {
+            uint32_t h = s->flows[e].hash;
+            if (h == 0 || h == WLB_FLOW_TOMBSTONE) {
+                continue;
+            }
+            for (int i = 0; i < s->n_paths; i++) {
+                if (s->paths[i].path_id == s->flows[e].path_id) {
+                    s->paths[i].pinned_now++;
+                    break;
+                }
+            }
+        }
+    }
+
+    for (int i = 0; i < s->n_paths; i++) {
+        total_weight += s->paths[i].weight;
+        total_pinned += s->paths[i].pinned_now;
+    }
+    if (total_weight == 0) {
+        total_weight = 1;
+    }
+
     for (int i = 0; i < s->n_paths; i++) {
         xqc_path_ctx_t *path = wlb_find_path_ctx(conn, s->paths[i].path_id, honor_pto);
         if (path == NULL) {
             continue;
         }
-        if (s->paths[i].deficit > best_deficit) {
-            best_deficit = s->paths[i].deficit;
+        /* Entitled share minus actual share. The flow being assigned is counted
+         * into the denominator so the very first pin of a connection, where
+         * every path holds zero, still resolves by weight instead of by
+         * whichever path the loop happens to reach first. */
+        double want = (double)s->paths[i].weight / (double)total_weight;
+        double have = (double)s->paths[i].pinned_now / (double)(total_pinned + 1);
+        double gap = want - have;
+        if (best < 0 || gap > best_gap) {
+            best_gap = gap;
             best = i;
         }
     }
-    return (best >= 0) ? s->paths[best].path_id : WLB_NO_PATH_ID;
+
+    if (best >= 0) {
+        /* Counted immediately: a burst of misses is all served before the
+         * refresh above runs again, and without this they would all be told
+         * the same path is starved. */
+        s->paths[best].pinned_now++;
+        return s->paths[best].path_id;
+    }
+    return WLB_NO_PATH_ID;
 }
 
 /**
@@ -1227,7 +1298,7 @@ xqc_wlb_scheduler_get_path(void *scheduler,
              * a sendable path for this exact packet (sel_path_id); the pin is
              * what subsequent packets of this flow will key off, and it must
              * reflect the long-term best path, not transient cwnd state. */
-            uint64_t pin_path_id = wlb_pick_pin_path(s, conn, honor_pto);
+            uint64_t pin_path_id = wlb_pick_pin_path(s, conn, honor_pto, now_us);
             if (pin_path_id == WLB_NO_PATH_ID) {
                 pin_path_id = sel_path_id;
             }

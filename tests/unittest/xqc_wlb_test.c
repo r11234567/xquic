@@ -339,11 +339,52 @@ xqc_test_wlb_sym_multiflow_distributes(void)
         else if (pinned == 1) on_path1++;
     }
 
-    /* Both paths must have picked up at least one flow. Asserting balance
-     * exactly would over-constrain tie-break behaviour; the regression we
-     * care about is "all 8 collapse onto paths[0]". */
-    CU_ASSERT_TRUE(on_path0 > 0);
-    CU_ASSERT_TRUE(on_path1 > 0);
+    /* Even, not merely non-zero. This used to assert only that neither path
+     * was empty, on the grounds that exact balance over-constrained the
+     * tie-break -- and that looseness is what let the real behaviour drift out
+     * of sight. Instrumented run 33621937964 measured the split on two
+     * identical unshaped legs at 2:13, 12:3 and 8:43, a minority share of
+     * 0.13-0.21 against the 0.5 intended, in every tier row at both 4 and 16
+     * inner streams.
+     *
+     * wlb_pick_pin_path now assigns to whichever path is furthest below the
+     * share of flows its weight entitles it to, which on equal weights is
+     * exactly even, so the contract is worth stating. */
+    CU_ASSERT_EQUAL(on_path0, 4);
+    CU_ASSERT_EQUAL(on_path1, 4);
+
+    wlb_test_teardown(&f);
+}
+
+/* Weight still sets the ratio: the fix removes the feedback term, not the
+ * weighting. Three times the weight should take three times the flows, so a
+ * genuinely wider path is not levelled down to an even split. */
+void
+xqc_test_wlb_asym_pin_follows_weight_ratio(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    /* Same RTT, 3:1 in congestion window, so the LATE weights come out 3:1. */
+    wlb_test_add_path(&f, 0, 10000, 192 * 1024, 0);
+    wlb_test_add_path(&f, 1, 10000, 64 * 1024, 0);
+
+    int on_path0 = 0, on_path1 = 0;
+    for (int i = 0; i < 16; i++) {
+        uint32_t flow = 0x20000000u + (uint32_t)i;
+        (void)wlb_test_invoke(&f, flow);
+        uint64_t pinned = wlb_test_invoke(&f, flow);
+        if (pinned == 0)      on_path0++;
+        else if (pinned == 1) on_path1++;
+    }
+
+    /* Both carry flows, the wide one carries more, and the narrow one is not
+     * starved -- the three things the old max-deficit pick got wrong. Ranges
+     * rather than exact counts: the weights come from a cwnd model, so the
+     * ratio is 3:1 only to within its own rounding. */
+    CU_ASSERT_EQUAL(on_path0 + on_path1, 16);
+    CU_ASSERT_TRUE(on_path1 >= 2);
+    CU_ASSERT_TRUE(on_path0 > on_path1);
 
     wlb_test_teardown(&f);
 }
