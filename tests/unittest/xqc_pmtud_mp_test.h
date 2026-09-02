@@ -16,5 +16,8 @@ void xqc_test_pmtud_conn_size_clamped_to_floor_and_limit(void);
 void xqc_test_pmtud_probe_ceiling_is_max_over_paths(void);
 void xqc_test_pmtud_probing_stays_armed_when_nothing_probed(void);
 void xqc_test_pmtud_blackhole_resets_path_to_base(void);
+void xqc_test_pmtud_external_report_lowers_path(void);
+void xqc_test_pmtud_external_report_never_raises(void);
+void xqc_test_pmtud_external_report_clamped_and_validated(void);
 
 #endif /* XQC_PMTUD_MP_TEST_H */

@@ -65,6 +65,36 @@ What changed:
 
 Regression coverage is in `tests/unittest/xqc_pmtud_mp_test.c`.
 
+### Reporting a PMTU the application already knows
+
+```c
+xqc_int_t xqc_conn_set_path_pmtu(xqc_connection_t *conn, uint64_t path_id,
+                                 size_t udp_payload_size);
+```
+
+Probing finds a path's limit in a few probe intervals. The local network stack
+often knows it *now* — on Linux an `EMSGSIZE` from `sendmsg()` followed by
+`getsockopt(IP_MTU)` — and until the search catches up the connection is
+black-holing. This hands that number to the path's search, which applies it as
+though a probe above it had failed: sizes above the report are excluded, the
+report itself becomes the next size to confirm, and the connection is lowered
+immediately.
+
+It **only lowers**. Raising remains the exclusive result of an acked probe,
+because the route cache is authoritative about the first hop and merely hopeful
+about everything past it; a stale-but-generous `IP_MTU` must not be able to undo
+a limit that probing actually measured. Values are clamped into
+`[XQC_PACKET_OUT_SIZE, pkt_out_size_limit]`.
+
+The size reduction applies whether or not PMTUD was negotiated — it is a local
+observation, not a protocol exchange, and is most valuable precisely when the
+peer declined PMTUD and no probing is running. Only the re-arming of the search
+is conditional on `enable_pmtud`.
+
+Pass values from the local stack only. A received ICMP Packet Too Big is
+unauthenticated; RFC 8899 §4.6 permits it to *prompt* a probe, never to set a
+size, and this entry point is not the place for one.
+
 **Cost of the fix.** Adding a path briefly lowers the connection to whatever the
 new path has confirmed, since one buffer size serves every path. That is a
 transient throughput dip on path addition, in exchange for not black-holing.
@@ -126,6 +156,22 @@ size could only rise, so an increase was "handled" by raising it without ever
 validating that anything could carry it — which is the black hole this change
 exists to close. Converging low is the safe direction to be wrong in, but it is
 still wrong.
+
+Nothing structural blocks the timer. The per-path state it needs already exists
+and is already reset this way in two other places (`xqc_path_validate()` on a
+new path, and the black-hole reset). The one trap is that the obvious
+implementation is wrong: clearing `path_pmtu_bounded` to reopen the search
+immediately releases the connection back up to the base size and re-opens the
+black hole for as long as the search takes to reconverge. The bound has to stay
+set and only `path_max_pkt_out_size` be raised back to the ceiling, so probing
+resumes *above* the confirmed size while the connection keeps using the proven
+one; the bound then lifts on its own when a larger probe is acked, since
+`xqc_conn_try_to_update_mss()` reads a bounded path's `curr_pkt_out_size`.
+
+It is deprioritised rather than hard because the case it covers is narrow: a
+*new* path already searches from scratch, so roaming — which replaces the path —
+is covered. The timer only matters when the same path's MTU grows underneath a
+live connection.
 
 ### Datagram MSS is connection-wide
 

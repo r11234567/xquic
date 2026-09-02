@@ -351,3 +351,94 @@ xqc_test_pmtud_blackhole_resets_path_to_base(void)
     xqc_test_helper_path_destroy(path);
     xqc_test_helper_conn_destroy(conn);
 }
+
+/* The local stack knows the first hop's MTU immediately; probing would take
+ * several intervals to rediscover it, black-holing throughout. A report lowers
+ * the path at once and leaves the search pointed at the reported size so an
+ * acked probe can confirm it. */
+void
+xqc_test_pmtud_external_report_lowers_path(void)
+{
+    xqc_connection_t *conn = pmtud_test_conn();
+    CU_ASSERT_PTR_NOT_NULL_FATAL(conn);
+
+    xqc_path_ctx_t *path = pmtud_test_path(conn, 0, XQC_TEST_PMTU_BASE,
+                                           XQC_TEST_PMTU_CEILING, 0);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(path);
+
+    xqc_conn_try_to_update_mss(conn);
+    CU_ASSERT(conn->pkt_out_size == XQC_TEST_PMTU_BASE);
+
+    CU_ASSERT_EQUAL(xqc_conn_set_path_pmtu(conn, 0, 1300), XQC_OK);
+
+    CU_ASSERT(path->path_max_pkt_out_size == 1300);
+    CU_ASSERT(path->curr_pkt_out_size == 1300);
+    CU_ASSERT(path->path_probing_pkt_out_size == 1300);
+    CU_ASSERT(path->path_probing_cnt == 0);
+    CU_ASSERT(path->path_pmtu_bounded == XQC_TRUE);
+
+    /* The point of the whole exercise: the connection stops building packets
+     * the path cannot carry. */
+    CU_ASSERT(conn->pkt_out_size == 1300);
+    CU_ASSERT((conn->conn_flag & XQC_CONN_FLAG_PMTUD_PROBING) != 0);
+
+    xqc_test_helper_path_destroy(path);
+    xqc_test_helper_conn_destroy(conn);
+}
+
+/* The report comes from the local route cache, which is authoritative about
+ * the first hop and only hopeful about the rest. It may exclude sizes; it may
+ * not assert one works. Raising stays the exclusive job of an acked probe --
+ * otherwise a stale-but-generous IP_MTU would undo a limit that probing had
+ * actually measured, and reopen the black hole. */
+void
+xqc_test_pmtud_external_report_never_raises(void)
+{
+    xqc_connection_t *conn = pmtud_test_conn();
+    CU_ASSERT_PTR_NOT_NULL_FATAL(conn);
+
+    /* A path probing already narrowed to 1280. */
+    xqc_path_ctx_t *path = pmtud_test_path(conn, 0, 1280, 1280, 1);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(path);
+
+    xqc_conn_try_to_update_mss(conn);
+    CU_ASSERT(conn->pkt_out_size == 1280);
+
+    CU_ASSERT_EQUAL(xqc_conn_set_path_pmtu(conn, 0, XQC_TEST_PMTU_CEILING), XQC_OK);
+
+    CU_ASSERT(path->path_max_pkt_out_size == 1280);
+    CU_ASSERT(path->curr_pkt_out_size == 1280);
+    CU_ASSERT(conn->pkt_out_size == 1280);
+
+    xqc_test_helper_path_destroy(path);
+    xqc_test_helper_conn_destroy(conn);
+}
+
+/* Bounds and bad input. A first hop claiming less than QUIC's guaranteed 1200
+ * is not something the connection can honour by shrinking, and a report for a
+ * path that is gone must be rejected rather than followed into a NULL. */
+void
+xqc_test_pmtud_external_report_clamped_and_validated(void)
+{
+    xqc_connection_t *conn = pmtud_test_conn();
+    CU_ASSERT_PTR_NOT_NULL_FATAL(conn);
+
+    xqc_path_ctx_t *path = pmtud_test_path(conn, 0, XQC_TEST_PMTU_BASE,
+                                           XQC_TEST_PMTU_CEILING, 0);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(path);
+
+    CU_ASSERT_EQUAL(xqc_conn_set_path_pmtu(NULL, 0, 1300), -XQC_EPARAM);
+    CU_ASSERT_EQUAL(xqc_conn_set_path_pmtu(conn, 7, 1300), -XQC_EMP_PATH_NOT_FOUND);
+
+    CU_ASSERT_EQUAL(xqc_conn_set_path_pmtu(conn, 0, 576), XQC_OK);
+    CU_ASSERT(path->curr_pkt_out_size == XQC_PACKET_OUT_SIZE);
+    CU_ASSERT(path->path_max_pkt_out_size == XQC_PACKET_OUT_SIZE);
+    CU_ASSERT(conn->pkt_out_size == XQC_PACKET_OUT_SIZE);
+
+    path->path_state = XQC_PATH_STATE_CLOSING;
+    CU_ASSERT_EQUAL(xqc_conn_set_path_pmtu(conn, 0, 1250),
+                    -XQC_EMP_PATH_STATE_ERROR);
+
+    xqc_test_helper_path_destroy(path);
+    xqc_test_helper_conn_destroy(conn);
+}

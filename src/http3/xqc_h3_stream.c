@@ -1844,6 +1844,16 @@ xqc_h3_stream_process_blocked_data(xqc_stream_t *stream, xqc_h3_stream_t *h3s,
         if (rcvd == -XQC_EAGAIN) {
             break;
 
+        } else if (rcvd == -XQC_ESTREAM_RESET) {
+            /* Not a failure: xqc_process_reset_stream_frame woke this reader
+             * (xqc_stream_ready_to_read) precisely so it would observe the
+             * reset, and -XQC_ESTREAM_RESET is the answer to that wake-up. The
+             * write side already classifies it this way, see
+             * xqc_h3_stream_write_notify. */
+            xqc_log(h3s->log, XQC_LOG_DEBUG, "|stream reset by peer|stream_id:%ui|",
+                    h3s->stream_id);
+            return -XQC_H3_STREAM_RECV_ERROR;
+
         } else if (rcvd < 0) {
             xqc_log(h3s->log, XQC_LOG_ERROR, "|xqc_stream_recv error|%z|", rcvd);
             return -XQC_H3_STREAM_RECV_ERROR;
@@ -1889,6 +1899,15 @@ xqc_h3_stream_process_data(xqc_stream_t *stream, xqc_h3_stream_t *h3s, xqc_bool_
         read = xqc_stream_recv(h3s->stream, buff, buff_size, fin);
         if (read == -XQC_EAGAIN) {
             return XQC_OK;
+
+        } else if (read == -XQC_ESTREAM_RESET) {
+            /* See xqc_h3_stream_process_blocked_data: the reset is what this
+             * read was woken to discover. Cancelling a request makes the peer
+             * mirror RESET_STREAM back, so every cancelled request lands here
+             * once -- at ERROR level that was the loudest line in the log. */
+            xqc_log(h3c->log, XQC_LOG_DEBUG, "|stream reset by peer|stream_id:%ui|",
+                    h3s->stream_id);
+            return -XQC_H3_STREAM_RECV_ERROR;
 
         } else if (read < 0) {
             xqc_log(h3c->log, XQC_LOG_ERROR, "|xqc_stream_recv error|%z|", read);

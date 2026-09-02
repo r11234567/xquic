@@ -1383,9 +1383,12 @@ xqc_process_reset_stream_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_i
             }
 
         } else {
-            xqc_log(conn->log, XQC_LOG_WARN, "|cannot find stream|stream_id:%ui|",
+            /* Ordinary, not exceptional: cancelling a request makes the peer
+             * mirror RESET_STREAM back, and that echo routinely arrives after
+             * the local stream has already been retired. Also covers a plain
+             * retransmit after close. */
+            xqc_log(conn->log, XQC_LOG_DEBUG, "|cannot find stream|stream_id:%ui|",
                     stream_id);
-            /* Packet retransmitted after stream is closed */
             return XQC_OK;
         }
     }
@@ -1449,9 +1452,9 @@ xqc_process_stop_sending_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_i
             }
 
         } else {
-            xqc_log(conn->log, XQC_LOG_WARN, "|cannot find stream|stream_id:%ui|",
+            /* Same benign race as in xqc_process_reset_stream_frame. */
+            xqc_log(conn->log, XQC_LOG_DEBUG, "|cannot find stream|stream_id:%ui|",
                     stream_id);
-            /* Packet retransmitted after stream is closed */
             return XQC_OK;
         }
     }

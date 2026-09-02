@@ -1124,6 +1124,37 @@ XQC_EXPORT_PUBLIC_API XQC_EXTERN const xqc_scheduler_callback_t xqc_interop_sche
 XQC_EXPORT_PUBLIC_API
 void xqc_conn_set_dgram_flow_hash(xqc_connection_t *conn, uint32_t flow_hash);
 
+/**
+ * @brief Report a path MTU observed outside the library into that path's PMTU
+ * search.
+ *
+ * For callers that learn a path's limit from the local network stack sooner
+ * than probing can find it -- on Linux, an EMSGSIZE from sendmsg() followed by
+ * getsockopt(IP_MTU/IPV6_MTU). Without this the search rediscovers the same
+ * number over several probe intervals, black-holing meanwhile.
+ *
+ * @param conn              the connection owning the path
+ * @param path_id           path the report applies to
+ * @param udp_payload_size  largest UDP payload the path is reported to carry,
+ *                          i.e. the route MTU less the IP and UDP headers.
+ *                          Clamped into [1200, the connection's ceiling].
+ *
+ * Only ever lowers a path's size, and only excludes sizes above the reported
+ * one -- raising still requires an acked probe. That asymmetry is deliberate:
+ * the local route cache is authoritative about the first hop and merely
+ * hopeful about the rest.
+ *
+ * SECURITY: pass only values from the local stack. A received ICMP Packet Too
+ * Big is unauthenticated and MUST NOT be fed here; RFC 8899 §4.6 permits such
+ * a message to prompt a probe, never to set a size.
+ *
+ * @return XQC_OK, -XQC_EPARAM, -XQC_EMP_PATH_NOT_FOUND, or
+ *         -XQC_EMP_PATH_STATE_ERROR if the path is closing.
+ */
+XQC_EXPORT_PUBLIC_API
+xqc_int_t xqc_conn_set_path_pmtu(xqc_connection_t *conn, uint64_t path_id,
+    size_t udp_payload_size);
+
 typedef enum {
     XQC_REINJ_UNACK_AFTER_SCHED = 1 << 0,
     XQC_REINJ_UNACK_BEFORE_SCHED = 1 << 1,
