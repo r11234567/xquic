@@ -747,6 +747,15 @@ uint32_t xqc_conn_get_max_pto_backoff(xqc_connection_t *conn, uint8_t available_
 
 void xqc_conn_ptmud_probing(xqc_connection_t *conn);
 
+/* Raise every active path's search ceiling back to the connection's limit so
+ * probing resumes above each path's confirmed size (RFC 8899 §5.3). Called
+ * from the probing round when the raise timer fired. Not static so the unit
+ * tests can drive it the way they drive xqc_conn_try_to_update_mss(): both are
+ * pure functions of the path list, and reaching this one through
+ * xqc_conn_ptmud_probing() would require the engine-less fixture to carry a
+ * send queue for the probe write that follows. */
+void xqc_conn_pmtud_reopen_search(xqc_connection_t *conn);
+
 /* 用于流控 */
 xqc_usec_t xqc_conn_get_min_srtt(xqc_connection_t *conn, xqc_bool_t available_only);
 xqc_usec_t xqc_conn_get_max_srtt(xqc_connection_t *conn);

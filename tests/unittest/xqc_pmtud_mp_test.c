@@ -53,6 +53,9 @@ pmtud_test_conn(void)
     conn->enable_pmtud = 1;
     conn->conn_settings.enable_pmtud = 1;
     conn->conn_settings.pmtud_probing_interval = 500000;
+    /* Set explicitly: this fixture does not go through xqc_conn_create(), which
+     * is where an unset interval picks up the engine default. */
+    conn->conn_settings.pmtud_raise_interval = 600000000;
     conn->conn_settings.probing_pkt_out_size = XQC_TEST_PMTU_CEILING;
     conn->conn_settings.max_pkt_out_size = XQC_TEST_PMTU_BASE;
     conn->pkt_out_size_base = XQC_TEST_PMTU_BASE;
@@ -464,14 +467,16 @@ xqc_test_pmtud_convergence_arms_raise_timer(void)
     conn->conn_timer_manager.timer[XQC_TIMER_PMTUD_PROBING].timer_is_set = 0;
     conn->pmtu_search_converged = XQC_FALSE;
 
+    xqc_usec_t before = xqc_monotonic_timestamp();
     xqc_conn_ptmud_probing(conn);
 
     CU_ASSERT(conn->pmtu_search_converged == XQC_TRUE);
     CU_ASSERT(conn->conn_timer_manager.timer[XQC_TIMER_PMTUD_PROBING].timer_is_set != 0);
-    /* Armed at the raise interval, not the probe interval -- the whole point is
-     * that this is a long wait, not a busy retry. */
-    CU_ASSERT(conn->conn_settings.pmtud_raise_interval
-              > conn->conn_settings.pmtud_probing_interval);
+    /* Armed at the raise interval, not the probe interval -- the point is a long
+     * wait, not a busy retry. Compared against the probe interval rather than a
+     * literal so the default can change without touching this. */
+    CU_ASSERT(conn->conn_timer_manager.timer[XQC_TIMER_PMTUD_PROBING].expire_time
+              > before + conn->conn_settings.pmtud_probing_interval);
 
     xqc_test_helper_path_destroy(path);
     xqc_test_helper_conn_destroy(conn);
@@ -490,7 +495,6 @@ xqc_test_pmtud_raise_reopens_without_lowering_conn(void)
 {
     xqc_connection_t *conn = pmtud_test_conn();
     CU_ASSERT_PTR_NOT_NULL_FATAL(conn);
-    conn->conn_flag |= XQC_CONN_FLAG_CAN_SEND_1RTT;
 
     /* A path whose search proved 1300 and excluded everything above it. */
     xqc_path_ctx_t *path = pmtud_test_path(conn, 0, 1300, 1300, 1);
@@ -499,9 +503,11 @@ xqc_test_pmtud_raise_reopens_without_lowering_conn(void)
     xqc_conn_try_to_update_mss(conn);
     CU_ASSERT(conn->pkt_out_size == 1300);
 
-    /* The raise timer fires. */
-    conn->pmtu_search_converged = XQC_TRUE;
-    xqc_conn_ptmud_probing(conn);
+    /* What the raise timer does, driven directly. Going through
+     * xqc_conn_ptmud_probing() would reach the probe write, and this path has
+     * range to cover, so it would need a send queue the fixture has no engine
+     * to build. The reopen itself is what this test is about. */
+    xqc_conn_pmtud_reopen_search(conn);
 
     /* Search reopened above the confirmed size... */
     CU_ASSERT(path->path_max_pkt_out_size == XQC_TEST_PMTU_CEILING);

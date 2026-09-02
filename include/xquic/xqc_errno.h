@@ -142,7 +142,6 @@ typedef enum {
     XQC_ESTREAM_BLOCKED                 = 620,      /**< stream-level flow control */
     XQC_EENCRYPT                        = 621,      /**< encryption error */
     XQC_EDECRYPT                        = 622,      /**< decryption error */
-    XQC_EAEAD_LIMIT                     = 623,      /**< AEAD integrity limit reached per RFC 9001 §6.6 */
     XQC_ESTREAM_NFOUND                  = 623,      /**< fail to find the corresponding stream */
     XQC_EWRITE_PKT                      = 624,      /**< fail to create a package or write a package header */
     XQC_ECREATE_STREAM                  = 625,      /**< fail to create stream */
@@ -164,6 +163,12 @@ typedef enum {
     XQC_ESTATELESS_RESET                = 641,      /**< connection is reset by peer */
     XQC_EPACKET_FILETER_CALLBACK        = 642,      /**< error with packet filter callback function */
     XQC_EVERSION_NEGOTIATION            = 643,      /**< client received a Version Negotiation packet, RFC 9000 §6.2 mandates abandoning the connection attempt */
+    /* Was 623, which XQC_ESTREAM_NFOUND already had: an AEAD-limit close and a
+     * stream-not-found were the same value, so neither could be told from the
+     * other by a caller comparing error codes. Numbered here at the end of the
+     * block instead of renumbering the codes above it, which are upstream
+     * values that applications compare against. */
+    XQC_EAEAD_LIMIT                     = 644,      /**< AEAD integrity limit reached per RFC 9001 §6.6 */
 
     XQC_EMP_NOT_SUPPORT_MP = 650,   /**< Multipath - don't support multipath */
     XQC_EMP_NO_AVAIL_PATH_ID = 651, /**< Multipath - no available path id */
@@ -197,6 +202,13 @@ typedef enum {
 
 #define TRANS_ERR_START 600
 static const int TRANS_ERR_CNT = XQC_E_MAX - TRANS_ERR_START;
+
+/* These two shared the value 623 until the codes above were corrected. A
+ * duplicate in this enum is silent -- the compiler is happy, and it only shows
+ * up as one error being reported as the other -- so the pair that actually
+ * collided is pinned apart here. */
+_Static_assert(XQC_EAEAD_LIMIT != XQC_ESTREAM_NFOUND,
+               "transport error codes must be distinct");
 
 
 /**

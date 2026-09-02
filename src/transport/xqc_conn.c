@@ -5894,7 +5894,7 @@ xqc_conn_try_add_new_conn_id(xqc_connection_t *conn, uint64_t retire_prior_to)
  * keeps using the proven size throughout, and a search that finds nothing new
  * bisects straight back down to it.
  */
-static void
+void
 xqc_conn_pmtud_reopen_search(xqc_connection_t *conn)
 {
     xqc_list_head_t *pos, *next;
