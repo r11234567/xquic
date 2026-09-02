@@ -151,13 +151,28 @@ wlb_instr_count_sched(xqc_wlb_scheduler_t *s, uint64_t path_id)
 static void
 wlb_instr_log(xqc_wlb_scheduler_t *s, xqc_connection_t *conn, uint64_t now_us)
 {
+    /* Nothing to say about a connection with one path: the split this reports
+     * does not exist, and single-path connections are the common case. */
+    if (s->n_paths < 2) {
+        return;
+    }
+
     if (now_us - s->instr_last_log_us < 1000000ULL) {
         return;
     }
     s->instr_last_log_us = now_us;
 
     for (int i = 0; i < s->n_paths; i++) {
-        xqc_log(conn->log, XQC_LOG_INFO,
+        /* REPORT, not INFO. xquic's own filter drops anything above the
+         * configured level, and an embedder may well map its INFO to xquic
+         * WARN to keep the per-packet traffic out of its log -- mqvpn does
+         * exactly that, which is why the first attempt at this line produced
+         * an empty log. REPORT is xquic's statistics channel (grouped with
+         * STATS in xqc_log.c, carrying the per-connection summaries), it
+         * passes any level, and an embedder that routes it to its own INFO
+         * still gets to suppress it by its own level. A once-a-second
+         * aggregate is a statistics line, so this is the channel for it. */
+        xqc_log(conn->log, XQC_LOG_REPORT,
                 "|wlb_instr|path:%ui|weight:%ui|deficit:%lld|pins:%ui|sched:%ui"
                 "|rounds:%ui|n_paths:%d|",
                 s->paths[i].path_id, s->paths[i].weight,
