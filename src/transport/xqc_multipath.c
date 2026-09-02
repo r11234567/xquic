@@ -1486,6 +1486,9 @@ xqc_path_validate(xqc_path_ctx_t *path)
             path->path_probing_pkt_out_size = path->path_max_pkt_out_size;
             path->path_probing_cnt = 0;
             conn->conn_flag |= XQC_CONN_FLAG_PMTUD_PROBING;
+            /* This path's reopen, not a raise-timer one: the round must not
+             * lift the ceiling of every already-converged path as well. */
+            conn->pmtu_search_converged = XQC_FALSE;
             xqc_timer_unset(&conn->conn_timer_manager, XQC_TIMER_PMTUD_PROBING);
         }
     }

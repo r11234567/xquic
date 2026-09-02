@@ -19,5 +19,8 @@ void xqc_test_pmtud_blackhole_resets_path_to_base(void);
 void xqc_test_pmtud_external_report_lowers_path(void);
 void xqc_test_pmtud_external_report_never_raises(void);
 void xqc_test_pmtud_external_report_clamped_and_validated(void);
+void xqc_test_pmtud_convergence_arms_raise_timer(void);
+void xqc_test_pmtud_raise_reopens_without_lowering_conn(void);
+void xqc_test_pmtud_raise_skips_path_at_ceiling(void);
 
 #endif /* XQC_PMTUD_MP_TEST_H */

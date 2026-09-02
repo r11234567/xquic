@@ -1750,6 +1750,9 @@ xqc_send_ctl_on_pmtu_blackhole(xqc_send_ctl_t *send_ctl)
     path->path_pmtu_bounded = XQC_TRUE;
 
     conn->conn_flag |= XQC_CONN_FLAG_PMTUD_PROBING;
+    /* This path's reopen, driven by evidence of a black hole rather than by the
+     * raise timer. */
+    conn->pmtu_search_converged = XQC_FALSE;
     xqc_timer_unset(&conn->conn_timer_manager, XQC_TIMER_PMTUD_PROBING);
 
     xqc_conn_try_to_update_mss(conn);

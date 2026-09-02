@@ -1535,6 +1535,22 @@ typedef struct xqc_conn_settings_s {
     uint8_t enable_pmtud;
     /** probing interval (us), default: 500000 */
     uint64_t pmtud_probing_interval;
+    /**
+     * How long after a path's PMTU search converges before it is reopened to
+     * look for a LARGER size (us), default: 600000000 (600 s, the
+     * PMTU_RAISE_TIMER of RFC 8899 §5.3). 0 selects the default.
+     *
+     * Without this a converged search never runs again, so a PMTU that grows
+     * mid-connection -- a middlebox that stops clamping, a route change onto a
+     * wider link -- is never found and a long-lived connection keeps whatever
+     * size it first settled on.
+     *
+     * Reopening only raises the search's upper bound; the size the connection
+     * builds packets at stays where probing proved it until a LARGER probe is
+     * acked. So there is no throughput dip for the reopen, and a search that
+     * finds nothing new simply converges back to where it was.
+     */
+    uint64_t pmtud_raise_interval;
 
     /** enable marking reinjected packets with reserved bits */
     uint8_t marking_reinjection;

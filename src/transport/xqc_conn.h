@@ -510,6 +510,12 @@ struct xqc_connection_s {
     size_t probing_pkt_out_size;
     uint32_t probing_cnt;
     size_t max_acked_po_size;
+    /* Every active path's search has converged, so the armed PMTUD timer is
+     * now the RFC 8899 §5.3 raise timer rather than a probe interval. Read on
+     * the next probing round to tell "reopen the search" from "keep probing",
+     * which are otherwise indistinguishable: a converged path looks converged
+     * whether the timer that woke us was 500 ms or 600 s. */
+    xqc_bool_t pmtu_search_converged;
 
     /* pending ping notification */
     xqc_list_head_t ping_notification_list;

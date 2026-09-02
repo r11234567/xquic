@@ -76,6 +76,8 @@ xqc_conn_settings_t internal_default_conn_settings = {
     .fec_conn_queue_rpr_timeout = 0,
     .enable_pmtud = 1,
     .pmtud_probing_interval = 500000,
+    /* RFC 8899 §5.3 PMTU_RAISE_TIMER, recommended 600 s. */
+    .pmtud_raise_interval = 600000000,
     .marking_reinjection = 0,
 
     .recv_rate_bytes_per_sec = 0,
@@ -225,6 +227,11 @@ xqc_server_set_conn_settings(xqc_engine_t *engine, const xqc_conn_settings_t *se
     if (settings->pmtud_probing_interval) {
         engine->default_conn_settings.pmtud_probing_interval =
             settings->pmtud_probing_interval;
+    }
+
+    if (settings->pmtud_raise_interval) {
+        engine->default_conn_settings.pmtud_raise_interval =
+            settings->pmtud_raise_interval;
     }
 
     if (settings->max_ack_delay) {
@@ -936,6 +943,11 @@ xqc_conn_create(xqc_engine_t *engine, xqc_cid_t *dcid, xqc_cid_t *scid,
     if (xc->conn_settings.pmtud_probing_interval == 0) {
         xc->conn_settings.pmtud_probing_interval =
             engine->default_conn_settings.pmtud_probing_interval;
+    }
+
+    if (xc->conn_settings.pmtud_raise_interval == 0) {
+        xc->conn_settings.pmtud_raise_interval =
+            engine->default_conn_settings.pmtud_raise_interval;
     }
 
     if (xc->conn_settings.ack_frequency == 0) {
@@ -2183,6 +2195,9 @@ xqc_conn_try_to_update_mss(xqc_connection_t *conn)
     conn->probing_cnt = 0;
     /* launch new probing immediately */
     conn->conn_flag |= XQC_CONN_FLAG_PMTUD_PROBING;
+    /* An event-driven reopen, not the raise timer: the round this arms must not
+     * also lift every other path's ceiling. */
+    conn->pmtu_search_converged = XQC_FALSE;
     xqc_timer_unset(&conn->conn_timer_manager, XQC_TIMER_PMTUD_PROBING);
     /* update datagram mss */
     xqc_datagram_record_mss(conn);
@@ -5863,6 +5878,54 @@ xqc_conn_try_add_new_conn_id(xqc_connection_t *conn, uint64_t retire_prior_to)
     return XQC_OK;
 }
 
+/* Reopen a converged search to look for a larger size (RFC 8899 §5.3).
+ *
+ * Raises each path's search ceiling back to the connection's limit and aims the
+ * next probe between the confirmed size and that ceiling. What it deliberately
+ * does NOT do is clear path_pmtu_bounded: that flag is what holds the
+ * connection at the size probing proved, and clearing it to "reopen the search"
+ * would release the connection back up to the base size immediately -- exactly
+ * the black hole the per-path search exists to close, reintroduced every raise
+ * interval. The bound instead lifts on its own when a larger probe is acked,
+ * because xqc_conn_try_to_update_mss() reads a bounded path's
+ * curr_pkt_out_size, which is what an acked probe raises.
+ *
+ * So the reopen costs a few probe packets and no throughput: the connection
+ * keeps using the proven size throughout, and a search that finds nothing new
+ * bisects straight back down to it.
+ */
+static void
+xqc_conn_pmtud_reopen_search(xqc_connection_t *conn)
+{
+    xqc_list_head_t *pos, *next;
+    xqc_path_ctx_t *path;
+    size_t midpoint;
+
+    xqc_list_for_each_safe(pos, next, &conn->conn_paths_list)
+    {
+        path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
+        if (path->path_state != XQC_PATH_STATE_ACTIVE) {
+            continue;
+        }
+
+        /* Already as high as this connection can go: nothing above to find. */
+        if (path->curr_pkt_out_size >= conn->pkt_out_size_limit) {
+            continue;
+        }
+
+        path->path_max_pkt_out_size = conn->pkt_out_size_limit;
+        midpoint = (conn->pkt_out_size_limit + path->curr_pkt_out_size) >> 1;
+        path->path_probing_pkt_out_size =
+            xqc_max(midpoint, path->curr_pkt_out_size + 1);
+        path->path_probing_cnt = 0;
+
+        xqc_log(conn->log, XQC_LOG_DEBUG,
+                "|PMTU|raise timer reopened search|path:%ui|curr:%uz|probe:%uz|",
+                path->path_id, path->curr_pkt_out_size,
+                path->path_probing_pkt_out_size);
+    }
+}
+
 void
 xqc_conn_ptmud_probing(xqc_connection_t *conn)
 {
@@ -5901,6 +5964,14 @@ xqc_conn_ptmud_probing(xqc_connection_t *conn)
     int active_paths = 0;
     int unconverged_paths = 0;
     xqc_bool_t newly_bounded = XQC_FALSE;
+
+    /* The timer that woke us was the raise timer, not a probe interval: every
+     * path had converged when it was armed. Reopen before the sweep below, so
+     * the paths it walks have range to cover again. */
+    if (conn->pmtu_search_converged) {
+        conn->pmtu_search_converged = XQC_FALSE;
+        xqc_conn_pmtud_reopen_search(conn);
+    }
 
     /* The search runs per path. A connection-wide cursor converges on neither
      * path when the two differ -- a probe acked on the wide path reset the
@@ -5985,6 +6056,15 @@ xqc_conn_ptmud_probing(xqc_connection_t *conn)
     if (active_paths > 0 && unconverged_paths == 0) {
         xqc_log_event(conn->log, CON_MTU_UPDATED, conn, 1);
         conn->conn_flag &= ~XQC_CONN_FLAG_PMTUD_PROBING;
+        /* Converged, but not finished: rearm as the raise timer so a PMTU that
+         * GROWS later is still discovered (RFC 8899 §5.3). Leaving no timer
+         * armed here is what made the search a one-shot -- a connection that
+         * settled low stayed low for its whole life, and only a brand-new path
+         * or a black hole ever reopened anything. */
+        conn->pmtu_search_converged = XQC_TRUE;
+        xqc_timer_set(&conn->conn_timer_manager, XQC_TIMER_PMTUD_PROBING,
+                      xqc_monotonic_timestamp(),
+                      conn->conn_settings.pmtud_raise_interval);
         return;
     }
 

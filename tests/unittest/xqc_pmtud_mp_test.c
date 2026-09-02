@@ -442,3 +442,116 @@ xqc_test_pmtud_external_report_clamped_and_validated(void)
     xqc_test_helper_path_destroy(path);
     xqc_test_helper_conn_destroy(conn);
 }
+
+/* RFC 8899 §5.3: converging is not finishing. A converged search must leave the
+ * raise timer armed, or a connection that settled low stays low for its whole
+ * life -- which is what happened before, since nothing but a brand-new path or
+ * a black hole ever reopened anything. */
+void
+xqc_test_pmtud_convergence_arms_raise_timer(void)
+{
+    xqc_connection_t *conn = pmtud_test_conn();
+    CU_ASSERT_PTR_NOT_NULL_FATAL(conn);
+    conn->conn_flag |= XQC_CONN_FLAG_CAN_SEND_1RTT;
+
+    /* Converged: the remaining range is under the 10B search granularity. A
+     * VALIDATING path would be skipped entirely, so this one is active but has
+     * nothing left to probe, which needs no send queue either. */
+    xqc_path_ctx_t *path = pmtud_test_path(conn, 0, XQC_TEST_PMTU_CEILING - 2,
+                                           XQC_TEST_PMTU_CEILING, 1);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(path);
+
+    conn->conn_timer_manager.timer[XQC_TIMER_PMTUD_PROBING].timer_is_set = 0;
+    conn->pmtu_search_converged = XQC_FALSE;
+
+    xqc_conn_ptmud_probing(conn);
+
+    CU_ASSERT(conn->pmtu_search_converged == XQC_TRUE);
+    CU_ASSERT(conn->conn_timer_manager.timer[XQC_TIMER_PMTUD_PROBING].timer_is_set != 0);
+    /* Armed at the raise interval, not the probe interval -- the whole point is
+     * that this is a long wait, not a busy retry. */
+    CU_ASSERT(conn->conn_settings.pmtud_raise_interval
+              > conn->conn_settings.pmtud_probing_interval);
+
+    xqc_test_helper_path_destroy(path);
+    xqc_test_helper_conn_destroy(conn);
+}
+
+/* The trap in the obvious implementation. Reopening the search by clearing
+ * path_pmtu_bounded would release the connection straight back up to the base
+ * size, and every packet built at that size would be dropped by a path already
+ * proven unable to carry it -- the black hole the per-path search exists to
+ * close, reintroduced once per raise interval.
+ *
+ * So: the ceiling goes back up, the bound stays, and conn->pkt_out_size does
+ * not move. It rises only when a larger probe is actually acked. */
+void
+xqc_test_pmtud_raise_reopens_without_lowering_conn(void)
+{
+    xqc_connection_t *conn = pmtud_test_conn();
+    CU_ASSERT_PTR_NOT_NULL_FATAL(conn);
+    conn->conn_flag |= XQC_CONN_FLAG_CAN_SEND_1RTT;
+
+    /* A path whose search proved 1300 and excluded everything above it. */
+    xqc_path_ctx_t *path = pmtud_test_path(conn, 0, 1300, 1300, 1);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(path);
+
+    xqc_conn_try_to_update_mss(conn);
+    CU_ASSERT(conn->pkt_out_size == 1300);
+
+    /* The raise timer fires. */
+    conn->pmtu_search_converged = XQC_TRUE;
+    xqc_conn_ptmud_probing(conn);
+
+    /* Search reopened above the confirmed size... */
+    CU_ASSERT(path->path_max_pkt_out_size == XQC_TEST_PMTU_CEILING);
+    CU_ASSERT(path->path_probing_pkt_out_size > 1300);
+    CU_ASSERT(path->path_probing_pkt_out_size <= XQC_TEST_PMTU_CEILING);
+    CU_ASSERT(path->path_probing_cnt == 0);
+
+    /* ...but the connection is still sized for what the path actually proved,
+     * and the path is still bounded. This is the assertion that fails if
+     * path_pmtu_bounded is cleared to reopen. */
+    CU_ASSERT(path->path_pmtu_bounded == XQC_TRUE);
+    CU_ASSERT(path->curr_pkt_out_size == 1300);
+    xqc_conn_try_to_update_mss(conn);
+    CU_ASSERT(conn->pkt_out_size == 1300);
+
+    /* And the bound lifts on its own once a bigger size is confirmed, without
+     * anything having to clear the flag: the recompute reads curr_pkt_out_size
+     * even on a bounded path. */
+    path->curr_pkt_out_size = 1380;
+    xqc_conn_try_to_update_mss(conn);
+    CU_ASSERT(conn->pkt_out_size == 1380);
+
+    xqc_test_helper_path_destroy(path);
+    xqc_test_helper_conn_destroy(conn);
+}
+
+/* A path already at the connection's ceiling has nothing above it to find, so
+ * the reopen must leave it alone rather than spend a probe per raise interval
+ * rediscovering the ceiling. */
+void
+xqc_test_pmtud_raise_skips_path_at_ceiling(void)
+{
+    xqc_connection_t *conn = pmtud_test_conn();
+    CU_ASSERT_PTR_NOT_NULL_FATAL(conn);
+    conn->conn_flag |= XQC_CONN_FLAG_CAN_SEND_1RTT;
+
+    xqc_path_ctx_t *path = pmtud_test_path(conn, 0, XQC_TEST_PMTU_CEILING,
+                                           XQC_TEST_PMTU_CEILING, 1);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(path);
+
+    conn->pmtu_search_converged = XQC_TRUE;
+    xqc_conn_ptmud_probing(conn);
+
+    CU_ASSERT(path->path_probing_cnt == 0);
+    CU_ASSERT(path->curr_pkt_out_size == XQC_TEST_PMTU_CEILING);
+    /* Converged again with nothing to do, so the raise timer is simply rearmed
+     * -- it must not be left unarmed, which would end the search for good. */
+    CU_ASSERT(conn->pmtu_search_converged == XQC_TRUE);
+    CU_ASSERT(conn->conn_timer_manager.timer[XQC_TIMER_PMTUD_PROBING].timer_is_set != 0);
+
+    xqc_test_helper_path_destroy(path);
+    xqc_test_helper_conn_destroy(conn);
+}

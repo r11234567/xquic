@@ -65,6 +65,44 @@ What changed:
 
 Regression coverage is in `tests/unittest/xqc_pmtud_mp_test.c`.
 
+### Reopening a converged search (PMTU_RAISE_TIMER)
+
+Converging is not finishing. A search that has settled says the path could not
+carry anything larger *then*, and a PMTU can grow mid-connection — a middlebox
+that stops clamping, a route change onto a wider link. Previously nothing probed
+a converged path again, so a long-lived connection kept whatever size it first
+settled on, and only a brand-new path or a detected black hole reopened
+anything.
+
+Convergence now leaves the probing timer armed at
+`conn_settings.pmtud_raise_interval` (default 600 s, RFC 8899 §5.3) instead of
+leaving it unarmed. When it fires, each active path's search ceiling goes back
+up to the connection's limit and the next probe is aimed between the confirmed
+size and that ceiling; a path already at the ceiling is skipped.
+
+**The reopen does not cost throughput**, and getting that right is the whole
+subtlety. The obvious implementation — clear `path_pmtu_bounded`, the flag that
+marks the path as measured-smaller — would release the connection straight back
+up to the base size, and every packet built at that size would be dropped by a
+path already proven unable to carry it. That is the black hole the per-path
+search exists to close, reintroduced once per raise interval. So the bound stays
+set and only the *search's* upper bound moves: probing resumes above the
+confirmed size while the connection keeps using the proven one. The bound then
+lifts on its own when a larger probe is acked, because
+`xqc_conn_try_to_update_mss()` reads a bounded path's `curr_pkt_out_size` and an
+acked probe is what raises it. A reopen that finds nothing new bisects back down
+and re-arms, costing a handful of PING frames per interval.
+
+The event-driven reopens (`xqc_path_validate()` on a new path, the black-hole
+reset, and a connection-size change) clear the converged state, so a round they
+schedule stays scoped to the path that triggered it rather than lifting every
+other path's ceiling too.
+
+Covered by `xqc_test_pmtud_convergence_arms_raise_timer`,
+`xqc_test_pmtud_raise_reopens_without_lowering_conn` — which asserts
+`pkt_out_size` does not move, so it fails if the bound is cleared — and
+`xqc_test_pmtud_raise_skips_path_at_ceiling`.
+
 ### Reporting a PMTU the application already knows
 
 ```c
@@ -141,37 +179,6 @@ Covered by `xqc_test_wlb_last_path_over_pto_still_schedules` and
 `xqc_test_wlb_prefers_healthy_path_over_pto_blocked`.
 
 ## Known issues
-
-### The PMTU search never reopens after it converges
-
-Once a path's search converges, `path_pmtu_bounded` stays set and nothing probes
-that path again. A PMTU that *increases* mid-connection — roaming onto a better
-link, or a middlebox that stops clamping — is therefore never discovered, and a
-long-lived connection keeps whatever size it settled on. RFC 8899 §5.3 handles
-this with a PMTU_RAISE_TIMER (600 s by default) that drops the path back into
-search; that timer is not implemented here.
-
-This is a narrowing of an old behaviour rather than a new failure: before, the
-size could only rise, so an increase was "handled" by raising it without ever
-validating that anything could carry it — which is the black hole this change
-exists to close. Converging low is the safe direction to be wrong in, but it is
-still wrong.
-
-Nothing structural blocks the timer. The per-path state it needs already exists
-and is already reset this way in two other places (`xqc_path_validate()` on a
-new path, and the black-hole reset). The one trap is that the obvious
-implementation is wrong: clearing `path_pmtu_bounded` to reopen the search
-immediately releases the connection back up to the base size and re-opens the
-black hole for as long as the search takes to reconverge. The bound has to stay
-set and only `path_max_pkt_out_size` be raised back to the ceiling, so probing
-resumes *above* the confirmed size while the connection keeps using the proven
-one; the bound then lifts on its own when a larger probe is acked, since
-`xqc_conn_try_to_update_mss()` reads a bounded path's `curr_pkt_out_size`.
-
-It is deprioritised rather than hard because the case it covers is narrow: a
-*new* path already searches from scratch, so roaming — which replaces the path —
-is covered. The timer only matters when the same path's MTU grows underneath a
-live connection.
 
 ### Datagram MSS is connection-wide
 
