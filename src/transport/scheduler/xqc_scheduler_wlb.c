@@ -172,11 +172,17 @@ wlb_instr_log(xqc_wlb_scheduler_t *s, xqc_connection_t *conn, uint64_t now_us)
          * passes any level, and an embedder that routes it to its own INFO
          * still gets to suppress it by its own level. A once-a-second
          * aggregate is a statistics line, so this is the channel for it. */
+        /* %i, not %lld: xqc_vsprintf() is xquic's own formatter and has no
+         * length modifiers. It matches a single 'l' (consuming a long) and
+         * then copies the rest of the specifier out literally, so "%lld"
+         * rendered as "19ld" -- which parsed as nothing and is why the second
+         * instrumented run also came back empty. '%i' is the int64_t
+         * conversion here, and handles negative deficits. */
         xqc_log(conn->log, XQC_LOG_REPORT,
-                "|wlb_instr|path:%ui|weight:%ui|deficit:%lld|pins:%ui|sched:%ui"
+                "|wlb_instr|path:%ui|weight:%ui|deficit:%i|pins:%ui|sched:%ui"
                 "|rounds:%ui|n_paths:%d|",
                 s->paths[i].path_id, s->paths[i].weight,
-                (long long)s->paths[i].deficit, s->paths[i].instr_pins,
+                (int64_t)s->paths[i].deficit, s->paths[i].instr_pins,
                 s->paths[i].instr_sched, s->instr_rounds, s->n_paths);
     }
 }
@@ -412,7 +418,10 @@ wlb_flow_expire(xqc_wlb_scheduler_t *s, uint64_t now_us, xqc_connection_t *conn)
             s->recovery_prefer_path_id = newly_seen_path_id;
             xqc_log(conn->log, XQC_LOG_INFO,
                     "|wlb|recovery_detected|new_path_id:%ui|healthy_prev:%d|healthy_now:%d|",
-                    (unsigned)newly_seen_path_id, s->last_healthy_paths, active_healthy_paths);
+                    /* %ui takes uint64_t; a 4-byte cast here left the top half
+                     * of the printed id undefined. */
+                    (uint64_t)newly_seen_path_id, s->last_healthy_paths,
+                    active_healthy_paths);
         } else {
             s->recovery_prefer_path_id = WLB_NO_PATH_ID;
             xqc_log(conn->log, XQC_LOG_INFO,
@@ -1056,8 +1065,9 @@ xqc_wlb_scheduler_get_path(void *scheduler,
          * second after a path returns. */
         xqc_log(conn->log, XQC_LOG_DEBUG,
                 "|wlb|recovery_grace|flow:%ui|remain_ms:%ui|",
-                packet_out->po_flow_hash,
-                (unsigned)((s->recovery_unpin_until_us - now_us) / 1000));
+                /* Both widened to what %ui actually reads. */
+                (uint64_t)packet_out->po_flow_hash,
+                (uint64_t)((s->recovery_unpin_until_us - now_us) / 1000));
     }
 
     /* Flow table lookup — reuse existing flow→path pinning (TCP only).
@@ -1082,7 +1092,7 @@ xqc_wlb_scheduler_get_path(void *scheduler,
             {
                 xqc_log(conn->log, XQC_LOG_INFO,
                         "|wlb|flow_evict|reason:pto|flow:%ui|path:%ui|pto:%ud|",
-                        packet_out->po_flow_hash, path->path_id,
+                        (uint64_t)packet_out->po_flow_hash, path->path_id,
                         path->path_send_ctl->ctl_pto_count);
                 entry->hash = WLB_FLOW_TOMBSTONE;
                 path = NULL;
@@ -1094,7 +1104,7 @@ xqc_wlb_scheduler_get_path(void *scheduler,
                  * the highest-volume statement in the scheduler. */
                 xqc_log(conn->log, XQC_LOG_DEBUG,
                         "|wlb|flow_hit|flow:%ui|path:%ui|",
-                        packet_out->po_flow_hash, path->path_id);
+                        (uint64_t)packet_out->po_flow_hash, path->path_id);
                 wlb_instr_count_sched(s, path->path_id);
                 wlb_instr_log(s, conn, now_us);
                 return path;
@@ -1123,7 +1133,7 @@ xqc_wlb_scheduler_get_path(void *scheduler,
             wlb_flow_insert(s, packet_out->po_flow_hash, rpath->path_id, now_us);
             xqc_log(conn->log, XQC_LOG_INFO,
                     "|wlb|recovery_prefer|flow:%ui|path:%ui|",
-                    packet_out->po_flow_hash, rpath->path_id);
+                    (uint64_t)packet_out->po_flow_hash, rpath->path_id);
             return rpath;
         }
     }
@@ -1157,12 +1167,19 @@ xqc_wlb_scheduler_get_path(void *scheduler,
         /* DEBUG: a round can end every few packets when nothing is pinned.
          * The round count is in |wlb_instr| once a second instead. */
         xqc_log(conn->log, XQC_LOG_DEBUG,
-                "|wlb|round_start|n_paths:%d|p0:%ui|d0:%lld|p1:%ui|d1:%lld|",
+                /* Two pre-existing formatting bugs, both fixed here. %lld is
+                 * not a specifier xqc_vsprintf knows (it matched the single
+                 * 'l' and printed "ld" literally, so a deficit read "3ld"),
+                 * and %ui takes its argument as uint64_t while these were cast
+                 * to 4-byte unsigned -- reading a wider type than was passed
+                 * is undefined, and in practice left the top half of a path id
+                 * as whatever the register held. */
+                "|wlb|round_start|n_paths:%d|p0:%ui|d0:%i|p1:%ui|d1:%i|",
                 s->n_paths,
-                (unsigned)(s->n_paths > 0 ? s->paths[0].path_id : UINT32_MAX),
-                (long long)(s->n_paths > 0 ? s->paths[0].deficit : -1),
-                (unsigned)(s->n_paths > 1 ? s->paths[1].path_id : UINT32_MAX),
-                (long long)(s->n_paths > 1 ? s->paths[1].deficit : -1));
+                (uint64_t)(s->n_paths > 0 ? s->paths[0].path_id : UINT32_MAX),
+                (int64_t)(s->n_paths > 0 ? s->paths[0].deficit : -1),
+                (uint64_t)(s->n_paths > 1 ? s->paths[1].path_id : UINT32_MAX),
+                (int64_t)(s->n_paths > 1 ? s->paths[1].deficit : -1));
         s->force_refresh_paths = 0;
     }
 
@@ -1223,7 +1240,7 @@ xqc_wlb_scheduler_get_path(void *scheduler,
             }
             xqc_log(conn->log, XQC_LOG_INFO,
                     "|wlb|flow_pin|flow:%ui|pin:%ui|send:%ui|",
-                    packet_out->po_flow_hash, pin_path_id, sel_path_id);
+                    (uint64_t)packet_out->po_flow_hash, pin_path_id, sel_path_id);
         }
         xqc_path_ctx_t *path = wlb_find_path_ctx(conn, sel_path_id, honor_pto);
         /* DEBUG: per scheduled packet. The aggregate is in |wlb_instr|. */
