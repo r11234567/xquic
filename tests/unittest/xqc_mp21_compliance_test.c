@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include "xquic/xquic.h"
 #include "xquic/xqc_errno.h"
+#include "xqc_common_test.h"     /* xqc_null_log_cb */
 #include "src/transport/xqc_frame_parser.h"
 #include "src/transport/xqc_frame.h"
 #include "src/transport/xqc_packet_in.h"
@@ -25,6 +26,23 @@
 #include "src/transport/xqc_frame.h"
 #include "xquic/xqc_errno.h"
 
+/* xqc_log_implement() reads log->log_callbacks unconditionally once a message
+ * clears the level filter, so a calloc-zeroed xqc_log_t crashes on any log call
+ * that is NOT filtered out. Setting log_level to FATAL below hides that for
+ * DEBUG/INFO/WARN, but not for ERROR (2), and not at all for the REPORT (0)
+ * statistics channel, which no level value can filter -- one WLB statistics
+ * line was enough to segfault xqc_test_wlb_asym_p1_pin_to_wide.
+ *
+ * xqc_null_log_cb (xqc_common_test.c) is the suite's existing sink and is
+ * enough: a REPORT with no xqc_log_write_stat falls through to
+ * xqc_log_write_err, which it does set. Pointing the fixture's log at it makes
+ * the log valid at every level rather than only the quiet ones, so tests are
+ * free to exercise code that logs.
+ *
+ * `log_callbacks` is a non-const pointer in xqc_log_t, hence the cast; nothing
+ * writes through it. */
+#define MP21_LOG_CBS ((xqc_log_callbacks_t *)&xqc_null_log_cb)
+
 /* ------------------------------------------------------------------
  * Chunk 4 Task 13b: shared minimal connection fixture.
  *
@@ -41,6 +59,7 @@ xqc_test_mp21_make_conn(const xqc_test_mp21_conn_params_t *p)
         return NULL;
     }
     log->log_level = XQC_LOG_FATAL; /* suppress per-test noise */
+    log->log_callbacks = MP21_LOG_CBS;
 
     xqc_connection_t *conn = calloc(1, sizeof(xqc_connection_t));
     if (conn == NULL) {
@@ -750,10 +769,12 @@ xqc_test_mp21_path_ack_ecn_parse_skip(void)
     buf[off++] = 0xaa; /* sentinel — must NOT be consumed */
 
     /* Stub connection + log: parser reads conn->remote_settings.ack_delay_exponent
-     * (0 from calloc) and may xqc_log() on error; FATAL log_level suppresses. */
+     * (0 from calloc) and may xqc_log() on error. FATAL log_level suppresses
+     * most of it; the no-op sink covers what no level can filter. */
     xqc_log_t *log = calloc(1, sizeof(xqc_log_t));
     xqc_connection_t *conn = calloc(1, sizeof(xqc_connection_t));
     log->log_level = XQC_LOG_FATAL;
+    log->log_callbacks = MP21_LOG_CBS;
     conn->log = log;
 
     xqc_packet_in_t packet_in;
@@ -932,6 +953,7 @@ xqc_test_mp21_gen_setup(xqc_connection_t **conn_out, xqc_packet_out_t **po_out,
     xqc_connection_t *conn = calloc(1, sizeof(xqc_connection_t));
     xqc_packet_out_t *po = calloc(1, sizeof(xqc_packet_out_t));
     log->log_level = XQC_LOG_FATAL;
+    log->log_callbacks = MP21_LOG_CBS;
     conn->log = log;
     conn->conn_settings.multipath_version = mp_version;
     po->po_buf = buf;

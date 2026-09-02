@@ -30,6 +30,7 @@
 #include "src/transport/xqc_frame.h"
 #include "src/transport/scheduler/xqc_scheduler_wlb.h"
 #include "src/common/xqc_log.h"
+#include "xqc_common_test.h"     /* xqc_null_log_cb */
 #include "src/common/xqc_time.h"
 
 #include "xqc_wlb_test.h"
@@ -94,6 +95,12 @@ wlb_test_setup(wlb_test_fixture_t *f)
     memset(f, 0, sizeof(*f));
 
     f->log.log_level = XQC_LOG_FATAL;  /* suppress per-test noise */
+    /* The level alone is not enough. xqc_log_implement() dereferences
+     * log_callbacks for any message that clears the filter, and the REPORT
+     * statistics channel is level 0, so no level value filters it -- the
+     * scheduler's own once-a-second counters line segfaulted every test here
+     * the moment it moved onto that channel. */
+    f->log.log_callbacks = (xqc_log_callbacks_t *)&xqc_null_log_cb;
     f->conn.log = &f->log;
     xqc_init_list_head(&f->conn.conn_paths_list);
 
