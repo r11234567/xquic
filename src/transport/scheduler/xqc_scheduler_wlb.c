@@ -92,6 +92,16 @@ typedef struct {
     uint64_t    path_id;
     uint64_t    weight;     /* LATE estimated throughput (scaled ×1000) */
     int64_t     deficit;    /* WRR deficit counter */
+    /* Instrumentation, carried across wlb_refresh_paths() alongside deficit.
+     * Counters rather than per-decision log lines: the two questions worth
+     * asking of this scheduler -- where flows get pinned, and whether rounds
+     * keep turning over -- are about aggregates over a run, and logging them
+     * per packet at INFO would cost more throughput than it measures. */
+    uint64_t    instr_pins;     /* flows pinned here */
+    uint64_t    instr_sched;    /* packets chosen for this path by WRR or by a
+                                 * flow hit. Excludes the MinRTT fallback, which
+                                 * carries control and ACK traffic and would
+                                 * blur the datagram split this exists to show. */
 } wlb_path_weight_t;
 
 /** Top-level scheduler state, allocated by xquic via xqc_wlb_scheduler_size(). */
@@ -113,7 +123,48 @@ typedef struct {
      * re-pins all TCP flows to the just-added — possibly narrow — path. */
     xqc_bool_t           ever_lost_path;
     xqc_log_t           *log;
+    uint64_t             instr_rounds;       /* WRR rounds started */
+    uint64_t             instr_last_log_us;  /* throttle the summary to 1/sec */
 } xqc_wlb_scheduler_t;
+
+/* One summary line per second, at INFO.
+ *
+ * Reads as: are flows landing on both paths, and is the round counter still
+ * advancing? A split that freezes with rounds stalled is the signature of
+ * pinned traffic never consuming deficit -- flow hits return before the round
+ * check -- which leaves the weights frozen at whatever transient cwnd skew
+ * existed when the flows happened to be pinned. */
+/* Attribute one scheduled packet to a path by id. Needed for the flow-hit fast
+ * path, which returns before WRR and so carries the bulk of pinned traffic --
+ * the very traffic the byte split is made of. */
+static void
+wlb_instr_count_sched(xqc_wlb_scheduler_t *s, uint64_t path_id)
+{
+    for (int i = 0; i < s->n_paths; i++) {
+        if (s->paths[i].path_id == path_id) {
+            s->paths[i].instr_sched++;
+            return;
+        }
+    }
+}
+
+static void
+wlb_instr_log(xqc_wlb_scheduler_t *s, xqc_connection_t *conn, uint64_t now_us)
+{
+    if (now_us - s->instr_last_log_us < 1000000ULL) {
+        return;
+    }
+    s->instr_last_log_us = now_us;
+
+    for (int i = 0; i < s->n_paths; i++) {
+        xqc_log(conn->log, XQC_LOG_INFO,
+                "|wlb_instr|path:%ui|weight:%ui|deficit:%lld|pins:%ui|sched:%ui"
+                "|rounds:%ui|n_paths:%d|",
+                s->paths[i].path_id, s->paths[i].weight,
+                (long long)s->paths[i].deficit, s->paths[i].instr_pins,
+                s->paths[i].instr_sched, s->instr_rounds, s->n_paths);
+    }
+}
 
 /* Forward declaration — used by wlb_flow_expire() for loss-triggered eviction */
 static xqc_path_ctx_t *wlb_find_path_ctx(xqc_connection_t *conn, uint64_t path_id,
@@ -701,11 +752,15 @@ wlb_refresh_paths(xqc_wlb_scheduler_t *s, xqc_connection_t *conn)
         s->paths[n].path_id = path->path_id;
         s->paths[n].weight  = wlb_compute_weight(path, max_rtt_us);
 
-        /* Preserve deficit for existing paths */
+        /* Preserve deficit and instrumentation for existing paths */
         s->paths[n].deficit = 0;
+        s->paths[n].instr_pins = 0;
+        s->paths[n].instr_sched = 0;
         for (int j = 0; j < old_n; j++) {
             if (old[j].path_id == path->path_id) {
                 s->paths[n].deficit = old[j].deficit;
+                s->paths[n].instr_pins = old[j].instr_pins;
+                s->paths[n].instr_sched = old[j].instr_sched;
                 break;
             }
         }
@@ -760,6 +815,8 @@ wlb_start_round(xqc_wlb_scheduler_t *s)
         }
         s->paths[i].deficit += quantum;
     }
+
+    s->instr_rounds++;
 }
 
 /**
@@ -833,6 +890,7 @@ wlb_wrr_select(xqc_wlb_scheduler_t *s, xqc_connection_t *conn,
 
     if (best >= 0) {
         s->paths[best].deficit -= 1;
+        s->paths[best].instr_sched++;
         return s->paths[best].path_id;
     }
     return UINT64_MAX;
@@ -979,7 +1037,9 @@ xqc_wlb_scheduler_get_path(void *scheduler,
     xqc_bool_t in_recovery_grace =
         (pin_flow && s->recovery_unpin_until_us != 0 && now_us < s->recovery_unpin_until_us);
     if (in_recovery_grace) {
-        xqc_log(conn->log, XQC_LOG_INFO,
+        /* DEBUG: fires for every packet of every pinned flow for a full
+         * second after a path returns. */
+        xqc_log(conn->log, XQC_LOG_DEBUG,
                 "|wlb|recovery_grace|flow:%ui|remain_ms:%ui|",
                 packet_out->po_flow_hash,
                 (unsigned)((s->recovery_unpin_until_us - now_us) / 1000));
@@ -1015,9 +1075,13 @@ xqc_wlb_scheduler_get_path(void *scheduler,
 
             if (path && xqc_scheduler_check_path_can_send(path, packet_out, check_cwnd)) {
                 entry->last_ts = now_us;
-                xqc_log(conn->log, XQC_LOG_INFO,
+                /* DEBUG, not INFO: one line per packet of every pinned flow is
+                 * the highest-volume statement in the scheduler. */
+                xqc_log(conn->log, XQC_LOG_DEBUG,
                         "|wlb|flow_hit|flow:%ui|path:%ui|",
                         packet_out->po_flow_hash, path->path_id);
+                wlb_instr_count_sched(s, path->path_id);
+                wlb_instr_log(s, conn, now_us);
                 return path;
             }
             if (path) {
@@ -1075,7 +1139,9 @@ xqc_wlb_scheduler_get_path(void *scheduler,
         }
         wlb_refresh_paths(s, conn);
         wlb_start_round(s);
-        xqc_log(conn->log, XQC_LOG_INFO,
+        /* DEBUG: a round can end every few packets when nothing is pinned.
+         * The round count is in |wlb_instr| once a second instead. */
+        xqc_log(conn->log, XQC_LOG_DEBUG,
                 "|wlb|round_start|n_paths:%d|p0:%ui|d0:%lld|p1:%ui|d1:%lld|",
                 s->n_paths,
                 (unsigned)(s->n_paths > 0 ? s->paths[0].path_id : UINT32_MAX),
@@ -1099,6 +1165,8 @@ xqc_wlb_scheduler_get_path(void *scheduler,
              * for proper distribution. Pinning here would lock all early
              * flows to paths[0] permanently (Fix A prevents the wipe that
              * would otherwise rescue them). */
+            wlb_instr_count_sched(s, path->path_id);
+            wlb_instr_log(s, conn, now_us);
             return path;
         }
         if (cc_blocked) {
@@ -1132,14 +1200,22 @@ xqc_wlb_scheduler_get_path(void *scheduler,
                 pin_path_id = sel_path_id;
             }
             wlb_flow_insert(s, packet_out->po_flow_hash, pin_path_id, now_us);
+            for (int i = 0; i < s->n_paths; i++) {
+                if (s->paths[i].path_id == pin_path_id) {
+                    s->paths[i].instr_pins++;
+                    break;
+                }
+            }
             xqc_log(conn->log, XQC_LOG_INFO,
                     "|wlb|flow_pin|flow:%ui|pin:%ui|send:%ui|",
                     packet_out->po_flow_hash, pin_path_id, sel_path_id);
         }
         xqc_path_ctx_t *path = wlb_find_path_ctx(conn, sel_path_id, honor_pto);
-        xqc_log(conn->log, XQC_LOG_INFO,
+        /* DEBUG: per scheduled packet. The aggregate is in |wlb_instr|. */
+        xqc_log(conn->log, XQC_LOG_DEBUG,
                  "|wlb|select|path_id:%ui|n_paths:%d|pinned:%d|",
                  sel_path_id, s->n_paths, (int)pin_flow);
+        wlb_instr_log(s, conn, now_us);
         return path;
     }
 
