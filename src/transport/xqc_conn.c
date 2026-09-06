@@ -2362,36 +2362,69 @@ xqc_check_acked_or_dropped_pkt(xqc_connection_t *conn, xqc_packet_out_t *packet_
 
 
 /**
- * Does any active path still have room for one more packet of this size?
+ * Why is the connection out of cwnd: the controllers, or the sndbuf clamp?
  *
- * Asked at the moment a scheduling pass gives up, to separate the two reasons
- * it can: the network is genuinely full, or the scheduler declined capacity
- * that was there. Those look identical in sched_cc_blocked, and they call for
- * opposite responses.
+ * This replaces a check that could not answer anything. The previous version
+ * asked whether any path would accept one more packet, using
+ * xqc_send_packet_cwnd_allows -- which is the very predicate every scheduler
+ * consults via xqc_scheduler_check_path_can_send. So it was only ever reached
+ * when every path had already answered no to the same function, and it
+ * necessarily answered no again: sched_stop_headroom_left came back 0 in all 46
+ * rows of run 34026833126 and all 22 WLB rows of 34036912262, which is what a
+ * tautology looks like in an artifact. Only one bit of it was real -- that the
+ * PTO exclusion never dropped a path that had cwnd -- and that bit never fired.
  *
- * Deliberately ignores the scheduler's own policy -- pinning, PTO avoidance,
- * weights. The question is what the PATHS would have accepted, so that the
- * answer is a fact about the connection rather than a restatement of the
- * decision being audited.
+ * The question worth asking at this point is not WHETHER capacity exists but
+ * WHICH ceiling removed it. xqc_send_ctl_can_send takes the min of the
+ * congestion window and conn_settings.so_sndbuf, so a connection can be
+ * "cwnd-blocked" with every controller wide open, purely because the shared
+ * sndbuf clamp is below the sum of the paths' BDPs. That is a configuration
+ * bug, not congestion, and the two demand opposite responses -- yet they are
+ * indistinguishable in sched_cc_blocked, and were indistinguishable in the
+ * counter this replaces.
+ *
+ * mqvpn sets so_sndbuf to 8 MiB (mqvpn_conn_settings.c:128) against a fast
+ * leg whose BDP is ~7.6 MB, so the clamp binding is not hypothetical -- it is
+ * the leading untested explanation for the aggregate-below-one-leg rows.
+ *
+ * Returns XQC_TRUE when at least one path was refused by the sndbuf clamp
+ * while its own congestion window still had room, i.e. when the ceiling was
+ * ours rather than the network's.
  */
 static xqc_bool_t
-xqc_conn_any_path_has_headroom(xqc_connection_t *conn, xqc_packet_out_t *packet_out)
+xqc_conn_sndbuf_clamp_bound(xqc_connection_t *conn, xqc_packet_out_t *packet_out)
 {
     xqc_list_head_t *pos, *next;
     xqc_path_ctx_t  *path;
+    uint32_t sndbuf = conn->conn_settings.so_sndbuf;
+
+    /* No clamp configured means it cannot be the binding constraint. */
+    if (sndbuf == 0) {
+        return XQC_FALSE;
+    }
 
     xqc_list_for_each_safe(pos, next, &conn->conn_paths_list) {
         path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
         if (path->path_state != XQC_PATH_STATE_ACTIVE
             || path->app_path_status == XQC_APP_PATH_STATUS_FROZEN
             || (path->path_flag & XQC_PATH_FLAG_SOCKET_ERROR)
-            || path->path_send_ctl == NULL)
+            || path->path_send_ctl == NULL
+            || path->path_send_ctl->ctl_cong_callback == NULL)
         {
             continue;
         }
-        if (xqc_send_packet_cwnd_allows(path->path_send_ctl, packet_out,
-                                        path->path_schedule_bytes, 0))
-        {
+
+        /* Recompute the same comparison xqc_send_ctl_can_send makes, but
+         * against the raw congestion window instead of min(cwnd, sndbuf). If
+         * the packet fits the controller's window and not the clamp, the clamp
+         * is what stopped it. */
+        uint64_t need = (uint64_t)path->path_send_ctl->ctl_bytes_in_flight
+                        + path->path_schedule_bytes
+                        + packet_out->po_used_size;
+        unsigned cwnd = path->path_send_ctl->ctl_cong_callback
+                            ->xqc_cong_ctl_get_cwnd(path->path_send_ctl->ctl_cong);
+
+        if (need <= (uint64_t)cwnd && need > (uint64_t)sndbuf) {
             return XQC_TRUE;
         }
     }
@@ -2416,12 +2449,12 @@ xqc_conn_send_supply_log(xqc_connection_t *conn, xqc_usec_t now)
 
     xqc_log(conn->log, XQC_LOG_REPORT,
             "|send_supply|passes:%ui|drained:%ui|stop_all_blocked:%ui"
-            "|stop_headroom_left:%ui|stop_backlog:%ui|sndq_used:%ui"
+            "|stop_sndbuf_clamp:%ui|stop_backlog:%ui|sndq_used:%ui"
             "|paths:%ud|",
             conn->supply_stats.sched_passes,
             conn->supply_stats.sched_drained,
             conn->supply_stats.sched_stop_all_blocked,
-            conn->supply_stats.sched_stop_headroom_left,
+            conn->supply_stats.sched_stop_sndbuf_clamp,
             conn->supply_stats.sched_stop_backlog,
             (uint64_t)(conn->conn_send_queue
                        ? conn->conn_send_queue->sndq_packets_used : 0),
@@ -2501,8 +2534,8 @@ xqc_conn_schedule_packets(xqc_connection_t *conn, xqc_list_head_t *head,
                         backlog++;
                     }
                     conn->supply_stats.sched_stop_backlog += backlog;
-                    if (xqc_conn_any_path_has_headroom(conn, packet_out)) {
-                        conn->supply_stats.sched_stop_headroom_left++;
+                    if (xqc_conn_sndbuf_clamp_bound(conn, packet_out)) {
+                        conn->supply_stats.sched_stop_sndbuf_clamp++;
                     } else {
                         conn->supply_stats.sched_stop_all_blocked++;
                     }

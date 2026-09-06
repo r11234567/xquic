@@ -776,9 +776,10 @@ xqc_test_wlb_pinned_traffic_consumes_deficit(void)
  * long it went unobserved.
  *
  * Observable as: after a very long burst on one path, the OTHER path must not
- * absorb an unbounded run of unpinned packets. With equal weights the debt
- * clamps at WLB_DEFICIT_CAP_MIN (64), so a run of unpinned packets has to come
- * back to the hot path well inside the burst length. */
+ * absorb an unbounded run of unpinned packets. The bound is now on the SPREAD
+ * between paths (WLB_DEFICIT_SPREAD_MAX, 4096) rather than a floor under each
+ * one, so the run is longer than it used to be but still bounded well inside
+ * the burst. */
 void
 xqc_test_wlb_deficit_debt_is_bounded(void)
 {
@@ -794,7 +795,7 @@ xqc_test_wlb_deficit_debt_is_bounded(void)
     uint64_t cold_path = (hot_path == 0) ? 1 : 0;
 
     /* A burst far longer than any sane clamp. */
-    for (int i = 0; i < 5000; i++) {
+    for (int i = 0; i < 20000; i++) {
         (void)wlb_test_invoke(&f, hot);
     }
 
@@ -805,21 +806,89 @@ xqc_test_wlb_deficit_debt_is_bounded(void)
      *
      * Both bounds carry weight, and they bracket the clamp from either side.
      * Without charging at all the paths merely alternate and this is 1, so the
-     * lower bound is what proves the 5000-packet burst was seen. Without a
-     * clamp the debt would be -5000 and the hot path could not be chosen again
-     * for thousands of packets, so the upper bound is what proves the burst
-     * did not mortgage the path. Only a charged-and-clamped scheduler lands
-     * between them. */
+     * lower bound is what proves the burst was seen. Without a clamp the debt
+     * would be -20000 and the hot path could not be chosen again for that many
+     * packets, so the upper bound is what proves the burst did not mortgage
+     * the path. Only a charged-and-clamped scheduler lands between them. */
     int cold_run = 0;
-    for (int i = 0; i < 3000; i++) {
+    for (int i = 0; i < 12000; i++) {
         if (wlb_test_invoke(&f, 0xFFFFFFFFU) == hot_path) {
             break;
         }
         cold_run++;
     }
-    CU_ASSERT_TRUE(cold_run >= 8);     /* the burst was noticed at all */
-    CU_ASSERT_TRUE(cold_run < 1000);   /* ...but did not mortgage the path */
+    CU_ASSERT_TRUE(cold_run >= 8);      /* the burst was noticed at all */
+    CU_ASSERT_TRUE(cold_run < 10000);   /* ...but did not mortgage the path */
     (void)cold_path;
+
+    wlb_test_teardown(&f);
+}
+
+/* The debt floor must not erase the DIFFERENCE between two overspent paths.
+ *
+ * This is the property the old shared ceiling lost, and no test caught it: the
+ * credit cap doubled as the debt cap at 64, so on any busy tunnel both paths
+ * reached -64 within a second and stayed there. Instrumented runs put 27 of 39
+ * rows (34026833126) and 20 of 22 (34036912262) at exactly -64 on BOTH paths.
+ * WRR reads the difference between deficits, so once both sit on the floor a
+ * path that overspent by 20000 packets and one that overspent by 300 are
+ * indistinguishable -- the correction vanishes exactly when the imbalance is
+ * largest, which is the opposite of what the clamp was for.
+ *
+ * Observable without reaching into the struct: burst two DIFFERENT amounts
+ * through two flows pinned to different paths, then read the deficits with
+ * unpinned datagrams. The path that took 10x the traffic must be skipped for
+ * correspondingly longer. Under a shared 64 floor both bursts clamp to the
+ * same value and the two runs come out equal. */
+void
+xqc_test_wlb_debt_floor_preserves_imbalance(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    wlb_test_add_path(&f, 0, 10000, 64 * 1024, 0);
+    wlb_test_add_path(&f, 1, 10000, 64 * 1024, 0);
+
+    /* Two flows. Whichever paths they land on, one gets 10x the other. */
+    uint32_t flow_a = 0x7D7D0001;
+    (void)wlb_test_invoke(&f, flow_a);
+    uint64_t path_a = wlb_test_invoke(&f, flow_a);
+
+    uint32_t flow_b = 0x7D7D0002;
+    uint64_t path_b = wlb_test_invoke(&f, flow_b);
+    for (int i = 0; i < 40 && path_b == path_a; i++) {
+        /* Land the second flow on the other path. Hashes are arbitrary here,
+         * so retry with fresh ones rather than assume the pin policy. */
+        flow_b = 0x7D7D0002 + (uint32_t)(i + 1) * 0x1000U;
+        path_b = wlb_test_invoke(&f, flow_b);
+    }
+    if (path_b == path_a) {
+        /* Could not separate the flows; nothing to compare. Not a failure of
+         * the property under test, so do not assert one either way. */
+        wlb_test_teardown(&f);
+        return;
+    }
+
+    for (int i = 0; i < 3000; i++) {
+        (void)wlb_test_invoke(&f, flow_a);   /* the heavy one */
+    }
+    for (int i = 0; i < 300; i++) {
+        (void)wlb_test_invoke(&f, flow_b);   /* one tenth as much */
+    }
+
+    /* Unpinned datagrams read the deficits directly. The heavier path must be
+     * skipped for materially longer than the lighter one. */
+    int run_off_a = 0;
+    for (int i = 0; i < 6000; i++) {
+        if (wlb_test_invoke(&f, 0xFFFFFFFFU) == path_a) {
+            break;
+        }
+        run_off_a++;
+    }
+
+    /* Under the old shared floor both paths pinned at -64, so this ratio was
+     * 1. Any real separation proves the debts stayed distinguishable. */
+    CU_ASSERT_TRUE(run_off_a > 100);
 
     wlb_test_teardown(&f);
 }

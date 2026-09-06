@@ -68,6 +68,7 @@ void xqc_test_wlb_pinned_traffic_consumes_deficit(void);
 /* ...and the debt one burst can run up is clamped, so the correction stays
  * proportional to the imbalance rather than to how long it went unobserved. */
 void xqc_test_wlb_deficit_debt_is_bounded(void);
+void xqc_test_wlb_debt_floor_preserves_imbalance(void);
 
 /* LATE weights must track live path state. They used to be recomputed only at
  * a WRR round boundary, which a fully-pinned tunnel never reaches, freezing

@@ -104,6 +104,35 @@
 #define WLB_DEFICIT_CAP_ROUNDS 8
 #define WLB_DEFICIT_CAP_MIN    64
 
+/* Debt is bounded as a SPREAD between paths, not as a floor under each one.
+ *
+ * The floor is what the previous version used -- the credit cap doing double
+ * duty at -64 -- and it destroyed the only quantity WRR reads. Instrumented
+ * runs put 27 of 39 rows (34026833126) and 20 of 22 (34036912262) at exactly
+ * -64 on BOTH paths. Selection compares deficits against each other, so once
+ * two paths are both resting on the floor their difference is zero and a path
+ * that overspent fourfold is indistinguishable from one that overspent by a
+ * fifth. The correction vanishes exactly when the imbalance is largest.
+ *
+ * Raising the floor does not fix it; it only postpones it. A simulation of the
+ * observed traffic shape (90% pinned, split 80/20 across two legs, 200k
+ * packets) puts both paths on the floor at -64 and equally on the floor at
+ * -2048. Any per-path floor is reached by every busy path eventually, and the
+ * information is gone from that moment on.
+ *
+ * Bounding the spread keeps the ledger meaningful indefinitely, because it is
+ * scale-free: subtracting a common offset from every deficit leaves every
+ * pairwise comparison unchanged, so compressing the vector is a no-op for
+ * selection in a way that flooring an individual entry is not. In the same
+ * simulation the spread rule holds the 80/20 case at a 4096 gap and steers the
+ * unpinned traffic to a 144k/56k correction, where the floor gave 158k/42k --
+ * i.e. the floor was quietly failing to correct the imbalance it existed for.
+ *
+ * The allowance is generous because it costs nothing to be: it bounds how far
+ * WRR will chase one path before calling the debt settled, and 4096 packets is
+ * a few hundred milliseconds of a saturated leg. */
+#define WLB_DEFICIT_SPREAD_MAX 4096
+
 /*
  * Tombstone marker for deleted flow table entries.
  * Using 0xFFFFFFFF which equals WLB_FLOW_HASH_UNPINNED — safe because
@@ -129,9 +158,10 @@ typedef struct {
     uint64_t    path_id;
     uint64_t    weight;     /* LATE estimated throughput (scaled ×1000) */
     int64_t     deficit;    /* WRR deficit counter */
-    int64_t     deficit_cap; /* |deficit| ceiling, set at round start; bounds
-                              * both the credit an idle path accrues and the
-                              * debt a saturated one runs up */
+    int64_t     deficit_cap; /* credit ceiling, set at round start: bounds what
+                              * an idle path accrues */
+    /* No debt floor here on purpose: debt is bounded as a spread across paths
+     * in wlb_charge_path_idx, not per entry. See WLB_DEFICIT_SPREAD_MAX. */
     /* Instrumentation, carried across wlb_refresh_paths() alongside deficit.
      * Counters rather than per-decision log lines: the two questions worth
      * asking of this scheduler -- where flows get pinned, and whether rounds
@@ -145,6 +175,15 @@ typedef struct {
                                  * flow hit. Excludes the MinRTT fallback, which
                                  * carries control and ACK traffic and would
                                  * blur the datagram split this exists to show. */
+    uint64_t    instr_spread_clamped; /* times this path was pulled up to the
+                                 * spread allowance. Without it a deficit at
+                                 * the allowance is ambiguous -- a path that
+                                 * just reached it and one held there for a
+                                 * million packets read identically. The
+                                 * previous floor was only found to bind at all
+                                 * because a separate column happened to show
+                                 * every row at the same value; a counter is
+                                 * cheaper than that coincidence. */
 } wlb_path_weight_t;
 
 /** Top-level scheduler state, allocated by xquic via xqc_wlb_scheduler_size(). */
@@ -222,16 +261,32 @@ wlb_charge_path_idx(xqc_wlb_scheduler_t *s, int i)
 
     s->paths[i].deficit -= 1;
 
-    /* Bound the debt as well as the credit. A single fat pinned flow can charge
+    /* Bound the SPREAD, not this entry. A single fat pinned flow can charge
      * thousands of packets to one path between two WRR decisions; left
-     * unbounded that path would then be skipped by WRR for as many packets
-     * again, long after the pin distribution that caused it had changed. The
-     * cap makes the correction proportional to the imbalance rather than to
-     * however long it went unobserved. */
-    if (s->paths[i].deficit_cap > 0
-        && s->paths[i].deficit < -s->paths[i].deficit_cap)
-    {
-        s->paths[i].deficit = -s->paths[i].deficit_cap;
+     * unbounded, that path would be skipped long after the pin distribution
+     * that caused it had changed. But flooring the entry (which is what sharing
+     * the credit cap did) erases the difference between two overspent paths,
+     * and the difference is all WRR reads -- see WLB_DEFICIT_SPREAD_MAX.
+     *
+     * Lifting the whole vector by a common offset preserves every pairwise
+     * comparison, so this compresses without losing the ordering or the gaps.
+     * Only the paths that have fallen further behind than the allowance are
+     * pulled up, and they are pulled up to exactly the allowance -- so the
+     * ledger stays bounded and stays readable. */
+    if (s->n_paths > 1) {
+        int64_t max_d = INT64_MIN;
+        for (int j = 0; j < s->n_paths; j++) {
+            if (s->paths[j].deficit > max_d) {
+                max_d = s->paths[j].deficit;
+            }
+        }
+        int64_t floor_d = max_d - WLB_DEFICIT_SPREAD_MAX;
+        for (int j = 0; j < s->n_paths; j++) {
+            if (s->paths[j].deficit < floor_d) {
+                s->paths[j].deficit = floor_d;
+                s->paths[j].instr_spread_clamped++;
+            }
+        }
     }
 }
 
@@ -278,10 +333,12 @@ wlb_instr_log(xqc_wlb_scheduler_t *s, xqc_connection_t *conn, uint64_t now_us)
          * conversion here, and handles negative deficits. */
         xqc_log(conn->log, XQC_LOG_REPORT,
                 "|wlb_instr|path:%ui|weight:%ui|deficit:%i|pins:%ui|sched:%ui"
-                "|rounds:%ui|n_paths:%d|",
+                "|rounds:%ui|spread_clamped:%ui|spread_max:%i|n_paths:%d|",
                 s->paths[i].path_id, s->paths[i].weight,
                 (int64_t)s->paths[i].deficit, s->paths[i].instr_pins,
-                s->paths[i].instr_sched, s->instr_rounds, s->n_paths);
+                s->paths[i].instr_sched, s->instr_rounds,
+                s->paths[i].instr_spread_clamped,
+                (int64_t)WLB_DEFICIT_SPREAD_MAX, s->n_paths);
     }
 }
 
@@ -888,6 +945,7 @@ wlb_refresh_paths(xqc_wlb_scheduler_t *s, xqc_connection_t *conn)
         s->paths[n].pinned_now = 0;
         s->paths[n].instr_pins = 0;
         s->paths[n].instr_sched = 0;
+        s->paths[n].instr_spread_clamped = 0;
         for (int j = 0; j < old_n; j++) {
             if (old[j].path_id == path->path_id) {
                 s->paths[n].deficit = old[j].deficit;
@@ -895,6 +953,7 @@ wlb_refresh_paths(xqc_wlb_scheduler_t *s, xqc_connection_t *conn)
                 s->paths[n].pinned_now = old[j].pinned_now;
                 s->paths[n].instr_pins = old[j].instr_pins;
                 s->paths[n].instr_sched = old[j].instr_sched;
+                s->paths[n].instr_spread_clamped = old[j].instr_spread_clamped;
                 break;
             }
         }
@@ -998,6 +1057,10 @@ wlb_start_round(xqc_wlb_scheduler_t *s)
         if (s->paths[i].deficit > cap) {
             s->paths[i].deficit = cap;
         }
+
+        /* No debt clamp at the round boundary. It lives in
+         * wlb_charge_path_idx, where it can see the whole vector at once --
+         * which a spread bound needs and a per-path floor did not. */
     }
 
     s->instr_rounds++;

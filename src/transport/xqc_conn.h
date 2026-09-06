@@ -555,13 +555,22 @@ struct xqc_connection_s {
          * saturate what the paths would have taken -- the supply question. */
         uint64_t sched_drained;
         /* ...stopped with packets still queued because the scheduler returned
-         * no path. Split by whether ANY active path had cwnd headroom at that
-         * moment: "no_path_all_blocked" is honest backpressure from the
-         * network, while "no_path_headroom_left" means capacity was available
-         * and the scheduler declined to use it -- the interesting case, and
-         * the one that would explain aggregate below one leg's solo figure. */
+         * no path. Split by WHICH ceiling took the capacity away, which is the
+         * only form of this question that has an answer: asking whether any
+         * path had headroom meant re-running the predicate the scheduler had
+         * just consulted, so the answer was always no (0 in every row of runs
+         * 34026833126 and 34036912262).
+         *
+         * "all_blocked" is backpressure from the network -- the congestion
+         * controllers are genuinely full. "sndbuf_clamp" means at least one
+         * path's own congestion window still had room and the shared
+         * conn_settings.so_sndbuf ceiling is what refused the packet. The
+         * second is a configuration bug rather than congestion, and it is the
+         * leading untested explanation for a two-path connection aggregating
+         * below one of its legs (mqvpn clamps at 8 MiB against a ~7.6 MB
+         * fast-leg BDP). */
         uint64_t sched_stop_all_blocked;
-        uint64_t sched_stop_headroom_left;
+        uint64_t sched_stop_sndbuf_clamp;
         /* Packets left unscheduled at the moment a pass stopped. Depth, not
          * just occurrence: stopping with 3 queued once a millisecond is noise,
          * stopping with 3000 queued is the bottleneck. */
