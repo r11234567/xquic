@@ -59,6 +59,21 @@ void xqc_test_wlb_new_path_detected_without_expire_throttle(void);
  * flow whose replica's po_path_id equals the pinned path. */
 void xqc_test_wlb_reinject_bypasses_pin(void);
 
+/* A pinned flow's packets must consume WRR quantum. The flow-hit fast path
+ * used to return before touching deficit, so on a fully-pinned tunnel the
+ * deficits described only the unpinned minority and the weighted ratio was
+ * applied to a rounding error. */
+void xqc_test_wlb_pinned_traffic_consumes_deficit(void);
+
+/* ...and the debt one burst can run up is clamped, so the correction stays
+ * proportional to the imbalance rather than to how long it went unobserved. */
+void xqc_test_wlb_deficit_debt_is_bounded(void);
+
+/* LATE weights must track live path state. They used to be recomputed only at
+ * a WRR round boundary, which a fully-pinned tunnel never reaches, freezing
+ * them at the cwnd skew of the connection's first few packets. */
+void xqc_test_wlb_weights_refresh_off_the_round_boundary(void);
+
 /* The consecutive-PTO guard is a preference between paths, not an absolute
  * exclusion: it must never refuse the last usable path. ctl_pto_count is
  * cleared only by an incoming ACK, so a path nothing is sent on can never

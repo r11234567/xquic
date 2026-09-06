@@ -12,8 +12,16 @@
  *   1. Compute real-time weights for all active paths using an iterative
  *      LATE model (Yang 2021) simplified for unreliable datagrams:
  *      no FR/RTO categories, expected-value cwnd update per round.
- *   2. Distribute packets via OLB round-based WRR (deficit counter).
+ *      Recomputed on a WLB_WEIGHT_REFRESH_US clock, not at round boundaries:
+ *      rounds turn over only as fast as traffic reaches the WRR, and a tunnel
+ *      whose flows are all pinned barely gets there at all.
+ *   2. Distribute packets via OLB round-based WRR (deficit counter). Every
+ *      scheduled packet consumes a quantum, including one that took the
+ *      pinned-flow fast path -- otherwise the deficits describe only the
+ *      unpinned minority and the weighted ratio is applied to nothing.
  *   3. Pin inner flows to paths via hash table to prevent TCP reordering.
+ *      The pin goes to whichever path is furthest below the share of flows
+ *      its weight entitles it to (wlb_pick_pin_path).
  *   4. If no path can send (all cwnd-blocked), fall back to MinRTT.
  *
  * Soft pinning (cwnd-blocked spillover):
@@ -67,6 +75,35 @@
 #define WLB_RECOVERY_UNPIN_GRACE_US (1000ULL * 1000) /* 1s temporary unpin after path recovery */
 #define WLB_NO_PATH_ID UINT64_MAX
 
+/* How often the LATE weights may be recomputed from live path state.
+ *
+ * This used to happen only at a WRR round boundary, which turned out to mean
+ * "almost never" for the traffic this scheduler actually carries. A round ends
+ * when the paths' deficit counters are spent, deficit is only spent by
+ * wlb_wrr_select, and wlb_wrr_select is only reached on a flow-table MISS --
+ * every packet of an already-pinned flow returns from the flow-hit fast path
+ * long before it. A tunnel whose flows are all pinned therefore froze its
+ * weights at whatever cwnd skew existed during the first few packets of the
+ * connection, and every later pin decision was made against that snapshot.
+ * Measured: weight ratios of 2.4x to 10.4x between two legs the scenario had
+ * made identical (run 33621937964).
+ *
+ * 20 ms is short against the timescale the weights model (cwnd over an RTT of
+ * 10-250 ms in these scenarios) and long enough that the refresh -- an
+ * allocation plus one LATE integration per path -- stays off the per-packet
+ * cost. */
+#define WLB_WEIGHT_REFRESH_US 20000
+
+/* Ceiling on a path's deficit, in quanta of its own weight.
+ *
+ * Now that every scheduled packet is charged, a path that receives no traffic
+ * for a long stretch -- because every flow happens to be pinned elsewhere --
+ * would otherwise accumulate credit without bound and then absorb a burst of
+ * that size the moment it is picked. Capping the credit at a few rounds' worth
+ * keeps the compensation prompt without making it explosive. */
+#define WLB_DEFICIT_CAP_ROUNDS 8
+#define WLB_DEFICIT_CAP_MIN    64
+
 /*
  * Tombstone marker for deleted flow table entries.
  * Using 0xFFFFFFFF which equals WLB_FLOW_HASH_UNPINNED — safe because
@@ -92,6 +129,9 @@ typedef struct {
     uint64_t    path_id;
     uint64_t    weight;     /* LATE estimated throughput (scaled ×1000) */
     int64_t     deficit;    /* WRR deficit counter */
+    int64_t     deficit_cap; /* |deficit| ceiling, set at round start; bounds
+                              * both the credit an idle path accrues and the
+                              * debt a saturated one runs up */
     /* Instrumentation, carried across wlb_refresh_paths() alongside deficit.
      * Counters rather than per-decision log lines: the two questions worth
      * asking of this scheduler -- where flows get pinned, and whether rounds
@@ -126,27 +166,81 @@ typedef struct {
      * re-pins all TCP flows to the just-added — possibly narrow — path. */
     xqc_bool_t           ever_lost_path;
     xqc_log_t           *log;
+    uint64_t             weights_ts;         /* last LATE weight recompute (us) */
     uint64_t             pin_counts_ts;      /* last pinned_now refresh (us) */
     uint64_t             instr_rounds;       /* WRR rounds started */
     uint64_t             instr_last_log_us;  /* throttle the summary to 1/sec */
 } xqc_wlb_scheduler_t;
 
-/* One summary line per second, at INFO.
+/* One summary line per second.
  *
  * Reads as: are flows landing on both paths, and is the round counter still
- * advancing? A split that freezes with rounds stalled is the signature of
- * pinned traffic never consuming deficit -- flow hits return before the round
- * check -- which leaves the weights frozen at whatever transient cwnd skew
- * existed when the flows happened to be pinned. */
-/* Attribute one scheduled packet to a path by id. Needed for the flow-hit fast
- * path, which returns before WRR and so carries the bulk of pinned traffic --
- * the very traffic the byte split is made of. */
+ * advancing? A split that freezes with rounds stalled was the signature of
+ * pinned traffic never consuming deficit -- flow hits returned before the
+ * round check -- which left the weights frozen at whatever transient cwnd skew
+ * existed when the flows happened to be pinned. Both halves of that are now
+ * fixed (charging, and the weight clock), so the line's job is to show it
+ * staying fixed: rounds should advance in proportion to total packets, and the
+ * weights should track the emulated capacities rather than each other. */
+/* Charge one scheduled packet to a path: the WRR quantum it consumes, and the
+ * instrumentation counter.
+ *
+ * Every packet, not only the ones WRR picked. A packet taking the flow-hit fast
+ * path is as much traffic on that path as one wlb_wrr_select chose, and until
+ * this existed the fast path was free -- so on a tunnel whose flows are all
+ * pinned, which is the steady state this scheduler is built for, the deficits
+ * described only the handful of unpinned packets. The WRR ratio the deficits
+ * encode was being applied to a rounding error rather than to the traffic.
+ *
+ * What this buys, precisely: a path carrying more than its weight entitles it
+ * to goes into debt, so the next packet that DOES reach wlb_wrr_select -- a new
+ * flow's first packet, an unpinned datagram, a spillover -- is steered to the
+ * path that has been idle. Without it a single fat pinned flow could saturate
+ * one leg while WRR went on believing both legs were untouched.
+ *
+ * What it does NOT buy: round advancement on a fully-pinned tunnel. The fast
+ * path returns before the round check, so the deficits saturate at their debt
+ * clamp and instr_rounds stops climbing. That is correct -- with no unpinned
+ * traffic there is nothing for a round to apportion -- but it means a stalled
+ * `rounds` counter in |wlb_instr| alongside a healthy `sched` count is the
+ * expected reading for pinned traffic, not the pathology it used to be.
+ */
 static void
-wlb_instr_count_sched(xqc_wlb_scheduler_t *s, uint64_t path_id)
+wlb_charge_path_idx(xqc_wlb_scheduler_t *s, int i)
+{
+    s->paths[i].instr_sched++;
+
+    /* Deficit is a ratio between paths, so there is nothing to charge when
+     * there is only one. Skipping it also avoids pointless churn on the
+     * commonest case: a single-path connection pins nothing (see the
+     * n_paths == 1 branch), so every packet reaches the round check, and a
+     * charged deficit would hit zero and restart a round every single packet.
+     */
+    if (s->n_paths < 2) {
+        return;
+    }
+
+    s->paths[i].deficit -= 1;
+
+    /* Bound the debt as well as the credit. A single fat pinned flow can charge
+     * thousands of packets to one path between two WRR decisions; left
+     * unbounded that path would then be skipped by WRR for as many packets
+     * again, long after the pin distribution that caused it had changed. The
+     * cap makes the correction proportional to the imbalance rather than to
+     * however long it went unobserved. */
+    if (s->paths[i].deficit_cap > 0
+        && s->paths[i].deficit < -s->paths[i].deficit_cap)
+    {
+        s->paths[i].deficit = -s->paths[i].deficit_cap;
+    }
+}
+
+static void
+wlb_charge_path(xqc_wlb_scheduler_t *s, uint64_t path_id)
 {
     for (int i = 0; i < s->n_paths; i++) {
         if (s->paths[i].path_id == path_id) {
-            s->paths[i].instr_sched++;
+            wlb_charge_path_idx(s, i);
             return;
         }
     }
@@ -689,10 +783,12 @@ wlb_compute_weight(xqc_path_ctx_t *path, uint64_t max_rtt_us)
  *  WRR scheduling
  *
  *  OLB-style deficit-counter WRR.  Each round adds a normalized quantum
- *  (weight / min_weight) to each path's deficit.  The path with the
- *  highest positive deficit is selected and its deficit decremented.
- *  When all deficits are exhausted, a new round begins and LATE weights
- *  are recomputed from real-time path metrics.
+ *  (weight / min_weight) to each path's deficit, clamped to a few rounds'
+ *  worth in either direction.  The path with the highest deficit is
+ *  selected and charged; so is any path that carried a packet via the
+ *  pinned-flow fast path.  When all deficits are exhausted a new round
+ *  begins.  LATE weights are refreshed on their own clock
+ *  (wlb_weights_maybe_refresh), not at the round boundary.
  * ================================================================ */
 
 /**
@@ -780,14 +876,22 @@ wlb_refresh_paths(xqc_wlb_scheduler_t *s, xqc_connection_t *conn)
         s->paths[n].path_id = path->path_id;
         s->paths[n].weight  = wlb_compute_weight(path, max_rtt_us);
 
-        /* Preserve deficit and instrumentation for existing paths */
+        /* Preserve deficit and instrumentation for existing paths.
+         *
+         * deficit_cap comes along because charging now clamps against it on
+         * every packet, and this function runs on a 20 ms clock: leaving it at
+         * zero between a refresh and the next round start would drop the debt
+         * clamp for that window, which is exactly the window a burst of pinned
+         * traffic occupies. */
         s->paths[n].deficit = 0;
+        s->paths[n].deficit_cap = 0;
         s->paths[n].pinned_now = 0;
         s->paths[n].instr_pins = 0;
         s->paths[n].instr_sched = 0;
         for (int j = 0; j < old_n; j++) {
             if (old[j].path_id == path->path_id) {
                 s->paths[n].deficit = old[j].deficit;
+                s->paths[n].deficit_cap = old[j].deficit_cap;
                 s->paths[n].pinned_now = old[j].pinned_now;
                 s->paths[n].instr_pins = old[j].instr_pins;
                 s->paths[n].instr_sched = old[j].instr_sched;
@@ -801,6 +905,42 @@ wlb_refresh_paths(xqc_wlb_scheduler_t *s, xqc_connection_t *conn)
     if (old != NULL) {
         xqc_free(old);
     }
+}
+
+/**
+ * Recompute the LATE weights on a clock, independently of the WRR round.
+ *
+ * Refreshing only at a round boundary made the weights hostage to the deficit
+ * counters, and the deficits are driven by traffic that reaches WRR -- which,
+ * on a tunnel whose flows are all pinned, is nearly none. The weights then
+ * stayed frozen at the cwnd skew of the connection's first few packets, and
+ * every later pin decision was made against that snapshot. Measured: weight
+ * ratios of 2.4x to 10.4x between two legs the scenario had made identical.
+ *
+ * Charging pinned packets (wlb_charge_path) makes the deficits describe real
+ * traffic, but it cannot fix this on its own: the fast path returns before the
+ * round check, so a fully-pinned tunnel still reaches no round boundary. The
+ * weights therefore need a clock of their own, called from the fast path too --
+ * a steady-state tunnel spends all its time there, and that is exactly the case
+ * the frozen weights broke.
+ */
+static void
+wlb_weights_maybe_refresh(xqc_wlb_scheduler_t *s, xqc_connection_t *conn,
+                          uint64_t now_us)
+{
+    if (!s->force_refresh_paths
+        && s->weights_ts != 0
+        && now_us - s->weights_ts <= WLB_WEIGHT_REFRESH_US)
+    {
+        return;
+    }
+    if (s->force_refresh_paths) {
+        xqc_log(conn->log, XQC_LOG_INFO,
+                "|wlb|refresh|reason:recovery|old_n_paths:%d|", s->n_paths);
+    }
+    s->weights_ts = now_us;
+    wlb_refresh_paths(s, conn);
+    s->force_refresh_paths = 0;
 }
 
 /**
@@ -844,6 +984,20 @@ wlb_start_round(xqc_wlb_scheduler_t *s)
             quantum = 1;
         }
         s->paths[i].deficit += quantum;
+
+        /* Cap the accrued credit. Now that pinned traffic is charged too, a
+         * path every flow happens to avoid keeps earning quanta it never
+         * spends; uncapped, it would eventually hold enough credit to take
+         * thousands of consecutive packets the moment one unpinned packet
+         * reached WRR. The cap keeps the correction proportional. */
+        int64_t cap = quantum * WLB_DEFICIT_CAP_ROUNDS;
+        if (cap < WLB_DEFICIT_CAP_MIN) {
+            cap = WLB_DEFICIT_CAP_MIN;
+        }
+        s->paths[i].deficit_cap = cap;
+        if (s->paths[i].deficit > cap) {
+            s->paths[i].deficit = cap;
+        }
     }
 
     s->instr_rounds++;
@@ -984,8 +1138,7 @@ wlb_wrr_select(xqc_wlb_scheduler_t *s, xqc_connection_t *conn,
     }
 
     if (best >= 0) {
-        s->paths[best].deficit -= 1;
-        s->paths[best].instr_sched++;
+        wlb_charge_path_idx(s, best);
         return s->paths[best].path_id;
     }
     return UINT64_MAX;
@@ -1176,7 +1329,13 @@ xqc_wlb_scheduler_get_path(void *scheduler,
                 xqc_log(conn->log, XQC_LOG_DEBUG,
                         "|wlb|flow_hit|flow:%ui|path:%ui|",
                         (uint64_t)packet_out->po_flow_hash, path->path_id);
-                wlb_instr_count_sched(s, path->path_id);
+                /* The weights matter here even though this branch makes no
+                 * routing decision: a steady-state tunnel takes this path for
+                 * essentially every packet, so if the refresh lived only past
+                 * the flow-table miss it would never run, and the next flow to
+                 * arrive would be pinned against a snapshot minutes old. */
+                wlb_weights_maybe_refresh(s, conn, now_us);
+                wlb_charge_path(s, path->path_id);
                 wlb_instr_log(s, conn, now_us);
                 return path;
             }
@@ -1225,15 +1384,21 @@ xqc_wlb_scheduler_get_path(void *scheduler,
         s->force_refresh_paths = 1;
     }
 
-    /* Start new WRR round if current round is exhausted.
-     * Recompute LATE weights from real-time metrics at round boundary. */
-    if (s->force_refresh_paths || wlb_needs_new_round(s)) {
-        if (s->force_refresh_paths) {
-            xqc_log(conn->log, XQC_LOG_INFO,
-                    "|wlb|refresh|reason:recovery|old_n_paths:%d|",
-                    s->n_paths);
-        }
-        wlb_refresh_paths(s, conn);
+    xqc_bool_t force_round = s->force_refresh_paths;
+    wlb_weights_maybe_refresh(s, conn, now_us);
+
+    /* Start a new WRR round if the current one is exhausted.
+     *
+     * No longer paired with wlb_refresh_paths. Keeping them together meant
+     * every round boundary paid for an allocation and a LATE integration per
+     * path, and rounds can end every few packets when little is pinned.
+     * Weights have their own clock above; a round start is now just
+     * arithmetic.
+     *
+     * A newly detected path still forces one, because wlb_refresh_paths gives
+     * it zero deficit and wlb_wrr_select would otherwise not pick it until the
+     * existing paths had spent theirs. */
+    if (force_round || wlb_needs_new_round(s)) {
         wlb_start_round(s);
         /* DEBUG: a round can end every few packets when nothing is pinned.
          * The round count is in |wlb_instr| once a second instead. */
@@ -1251,7 +1416,6 @@ xqc_wlb_scheduler_get_path(void *scheduler,
                 (int64_t)(s->n_paths > 0 ? s->paths[0].deficit : -1),
                 (uint64_t)(s->n_paths > 1 ? s->paths[1].path_id : UINT32_MAX),
                 (int64_t)(s->n_paths > 1 ? s->paths[1].deficit : -1));
-        s->force_refresh_paths = 0;
     }
 
     if (s->n_paths == 0) {
@@ -1268,7 +1432,7 @@ xqc_wlb_scheduler_get_path(void *scheduler,
              * for proper distribution. Pinning here would lock all early
              * flows to paths[0] permanently (Fix A prevents the wipe that
              * would otherwise rescue them). */
-            wlb_instr_count_sched(s, path->path_id);
+            wlb_charge_path(s, path->path_id);
             wlb_instr_log(s, conn, now_us);
             return path;
         }
@@ -1285,19 +1449,25 @@ xqc_wlb_scheduler_get_path(void *scheduler,
          * If no path could be selected, force a fresh round once.
          * This avoids stalling on stale deficits when one path keeps a
          * positive deficit but is temporarily unsendable.
+         *
+         * Round only, no refresh: the weights were recomputed at most
+         * WLB_WEIGHT_REFRESH_US ago at the top of this function, and this
+         * branch is reached once per packet while every path is cwnd-blocked
+         * -- precisely when an allocation and a LATE integration per path are
+         * least affordable.
          */
-        wlb_refresh_paths(s, conn);
         wlb_start_round(s);
         sel_path_id = wlb_wrr_select(s, conn, packet_out, check_cwnd, honor_pto);
     }
 
     if (sel_path_id != UINT64_MAX) {
         if (pin_flow) {
-            /* Pin to the highest-deficit (≈ highest LATE-weight) path even if
-             * it is currently cwnd-blocked. The wrr_select above already chose
-             * a sendable path for this exact packet (sel_path_id); the pin is
-             * what subsequent packets of this flow will key off, and it must
-             * reflect the long-term best path, not transient cwnd state. */
+            /* Pin by weight share (wlb_pick_pin_path), which may well name a
+             * path other than the one carrying this packet, and may name one
+             * that is cwnd-blocked right now. The wrr_select above already
+             * chose a sendable path for this exact packet (sel_path_id); the
+             * pin is what subsequent packets of this flow key off, and it must
+             * reflect long-term capacity, not transient cwnd state. */
             uint64_t pin_path_id = wlb_pick_pin_path(s, conn, honor_pto, now_us);
             if (pin_path_id == WLB_NO_PATH_ID) {
                 pin_path_id = sel_path_id;

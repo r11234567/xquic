@@ -35,6 +35,14 @@
 
 #include "xqc_wlb_test.h"
 
+/* Mirror of WLB_WEIGHT_REFRESH_US, which is private to the scheduler .c. Kept
+ * as a separate name rather than reaching into the implementation: the test
+ * asserts the observable contract ("weights follow live path state within a
+ * short interval"), and only needs to advance a clock past whatever that
+ * interval is. If the scheduler's value grows past this, the test advances too
+ * little and fails loudly rather than silently passing. */
+#define WLB_TEST_WEIGHT_REFRESH_US 20000
+
 /* ───────────────────────── fake clock ───────────────────────── */
 
 static xqc_usec_t g_fake_now_us = 1000000;  /* start at 1s so non-zero */
@@ -691,6 +699,156 @@ xqc_test_wlb_prefers_healthy_path_over_pto_blocked(void)
     CU_ASSERT_EQUAL(wlb_test_invoke(&f, 0xC0FFEE01), 1);
     CU_ASSERT_EQUAL(wlb_test_invoke(&f, 0), 1);
     CU_ASSERT_EQUAL(wlb_test_invoke(&f, 0xFFFFFFFFU), 1);
+
+    wlb_test_teardown(&f);
+}
+
+/* Charging: a pinned flow's packets must consume WRR quantum.
+ *
+ * The flow-hit fast path used to return before touching deficit, so on a tunnel
+ * whose flows are all pinned -- the steady state this scheduler exists for --
+ * the deficits described only the unpinned minority. WRR's weighted ratio was
+ * being applied to a rounding error, and a path could be saturated by one fat
+ * pinned flow while the scheduler went on treating it as untouched.
+ *
+ * Read indirectly, as the fixture requires: pin a flow to one path, push a lot
+ * of traffic through it, then present a NEW flow. The new flow's first packet
+ * is the first thing to reach wlb_wrr_select since the burst, and it must be
+ * steered to the path that carried none of it. Pre-fix, the burst left no trace
+ * and the new flow could land on the already-saturated path. */
+void
+xqc_test_wlb_pinned_traffic_consumes_deficit(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    /* Two identical paths, so only the traffic history can distinguish them. */
+    wlb_test_add_path(&f, 0, 10000, 64 * 1024, 0);
+    wlb_test_add_path(&f, 1, 10000, 64 * 1024, 0);
+
+    /* Establish one flow and find out where it landed. */
+    uint32_t hot = 0x5A5A0001;
+    (void)wlb_test_invoke(&f, hot);
+    uint64_t hot_path = wlb_test_invoke(&f, hot);
+    CU_ASSERT_TRUE(hot_path == 0 || hot_path == 1);
+    uint64_t cold_path = (hot_path == 0) ? 1 : 0;
+
+    /* Drive a burst through it. Every one of these takes the flow-hit fast
+     * path; pre-fix, none of them changed any deficit. */
+    for (int i = 0; i < 200; i++) {
+        CU_ASSERT_EQUAL(wlb_test_invoke(&f, hot), hot_path);
+    }
+
+    /* A brand-new flow. Its first packet goes through wlb_wrr_select, which
+     * picks on deficit -- and the burst has put the hot path into debt. */
+    uint32_t fresh = 0x5A5A0002;
+    uint64_t sent_on = wlb_test_invoke(&f, fresh);
+    CU_ASSERT_EQUAL(sent_on, cold_path);
+
+    wlb_test_teardown(&f);
+}
+
+/* The debt a burst can run up is bounded.
+ *
+ * Charging pinned traffic without a clamp would let one path accumulate
+ * unbounded debt, and WRR would then skip it for as many packets again --
+ * long after the pin distribution that caused the imbalance had changed. The
+ * clamp keeps the correction proportional to the imbalance rather than to how
+ * long it went unobserved.
+ *
+ * Observable as: after a very long burst on one path, the OTHER path must not
+ * absorb an unbounded run of unpinned packets. With equal weights the debt
+ * clamps at WLB_DEFICIT_CAP_MIN (64), so a run of unpinned packets has to come
+ * back to the hot path well inside the burst length. */
+void
+xqc_test_wlb_deficit_debt_is_bounded(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    wlb_test_add_path(&f, 0, 10000, 64 * 1024, 0);
+    wlb_test_add_path(&f, 1, 10000, 64 * 1024, 0);
+
+    uint32_t hot = 0x6B6B0001;
+    (void)wlb_test_invoke(&f, hot);
+    uint64_t hot_path = wlb_test_invoke(&f, hot);
+    uint64_t cold_path = (hot_path == 0) ? 1 : 0;
+
+    /* A burst far longer than any sane clamp. */
+    for (int i = 0; i < 5000; i++) {
+        (void)wlb_test_invoke(&f, hot);
+    }
+
+    /* Unpinned datagrams (hash == WLB_FLOW_HASH_UNPINNED) go through WRR every
+     * time without ever being pinned, so they read the deficits directly.
+     * Count how many land on the cold path before the hot path is chosen
+     * again. Unbounded debt would make this run for thousands; the clamp plus
+     * one round's quantum should bring it back inside a few hundred. */
+    int cold_run = 0;
+    for (int i = 0; i < 2000; i++) {
+        if (wlb_test_invoke(&f, 0xFFFFFFFFU) == hot_path) {
+            break;
+        }
+        cold_run++;
+    }
+    CU_ASSERT_TRUE(cold_run > 0);      /* the burst was noticed at all */
+    CU_ASSERT_TRUE(cold_run < 1000);   /* ...but did not mortgage the path */
+    (void)cold_path;
+
+    wlb_test_teardown(&f);
+}
+
+/* Weights must track live path state, not the state at connection start.
+ *
+ * They used to be recomputed only at a WRR round boundary, and rounds only end
+ * when traffic reaches wlb_wrr_select -- which a fully-pinned tunnel almost
+ * never does. So the weights froze at the cwnd skew of the first few packets,
+ * and every later pin was decided against that snapshot. Now they are on a
+ * WLB_WEIGHT_REFRESH_US clock, ticked from the pinned fast path too.
+ *
+ * Read indirectly: start with path 0 wide, pin a flow (it goes to 0). Then
+ * reverse the cwnds and let the refresh clock elapse, driving only pinned
+ * traffic in the meantime -- the fast path, which pre-fix updated nothing. A
+ * new flow must now be pinned by the CURRENT weights, i.e. to path 1. */
+void
+xqc_test_wlb_weights_refresh_off_the_round_boundary(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    /* Same RTT so cwnd alone decides the weight. Path 0 starts far wider. */
+    wlb_test_add_path(&f, 0, 10000, 256 * 1024, 0);
+    wlb_test_add_path(&f, 1, 10000,  16 * 1024, 0);
+
+    uint32_t first = 0x7C7C0001;
+    (void)wlb_test_invoke(&f, first);
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, first), 0 /* the wide path */);
+
+    /* The paths swap capacity -- path 1 is now the wide one. */
+    f.cong_states[0].cwnd_bytes =  16 * 1024;
+    f.cong_states[1].cwnd_bytes = 256 * 1024;
+
+    /* Time passes with nothing but pinned traffic, which is the case that used
+     * to leave the weights untouched. Stay under the 1 s flow-expire throttle
+     * so this tests the weight clock and not the expire sweep. */
+    wlb_test_clock_advance(WLB_TEST_WEIGHT_REFRESH_US * 3);
+    for (int i = 0; i < 8; i++) {
+        (void)wlb_test_invoke(&f, first);
+    }
+
+    /* New flows must follow the new capacities. Several, because the pin
+     * balances flow counts against weight share: with one flow already on
+     * path 0, a 1:1 split of two more would be wrong but a majority on the
+     * now-wide path 1 is the contract. */
+    int on0 = 0, on1 = 0;
+    for (int i = 0; i < 8; i++) {
+        uint32_t flow = 0x7C7C1000u + (uint32_t)i;
+        (void)wlb_test_invoke(&f, flow);
+        uint64_t pinned = wlb_test_invoke(&f, flow);
+        if (pinned == 0)      on0++;
+        else if (pinned == 1) on1++;
+    }
+    CU_ASSERT_TRUE(on1 > on0);
 
     wlb_test_teardown(&f);
 }
