@@ -739,11 +739,30 @@ xqc_test_wlb_pinned_traffic_consumes_deficit(void)
         CU_ASSERT_EQUAL(wlb_test_invoke(&f, hot), hot_path);
     }
 
-    /* A brand-new flow. Its first packet goes through wlb_wrr_select, which
-     * picks on deficit -- and the burst has put the hot path into debt. */
-    uint32_t fresh = 0x5A5A0002;
-    uint64_t sent_on = wlb_test_invoke(&f, fresh);
-    CU_ASSERT_EQUAL(sent_on, cold_path);
+    /* Now read the deficits directly, with unpinned datagrams -- they take the
+     * WRR every time and are never pinned, so nothing about the pin policy
+     * enters the measurement.
+     *
+     * Assert on the LENGTH of the run that lands on the cold path, not on
+     * where the first packet goes. The first packet is not a discriminator:
+     * the cold path holds one round's quantum in both versions of the code, so
+     * it wins that one selection whether or not the burst was charged. What
+     * the burst buys is a run -- the hot path has to climb back out of debt,
+     * one quantum per round, before it can compete again. Charged, that is the
+     * clamp's worth of rounds; uncharged, the hot path never left zero and the
+     * two simply alternate. */
+    int cold_run = 0;
+    for (int i = 0; i < 400; i++) {
+        if (wlb_test_invoke(&f, 0xFFFFFFFFU) != cold_path) {
+            break;
+        }
+        cold_run++;
+    }
+
+    /* Alternation gives 1. The debt clamp gives WLB_DEFICIT_CAP_MIN-ish, and
+     * the exact figure depends on quantum rounding, so assert the order of
+     * magnitude rather than the value. */
+    CU_ASSERT_TRUE(cold_run >= 8);
 
     wlb_test_teardown(&f);
 }
@@ -782,16 +801,23 @@ xqc_test_wlb_deficit_debt_is_bounded(void)
     /* Unpinned datagrams (hash == WLB_FLOW_HASH_UNPINNED) go through WRR every
      * time without ever being pinned, so they read the deficits directly.
      * Count how many land on the cold path before the hot path is chosen
-     * again. Unbounded debt would make this run for thousands; the clamp plus
-     * one round's quantum should bring it back inside a few hundred. */
+     * again.
+     *
+     * Both bounds carry weight, and they bracket the clamp from either side.
+     * Without charging at all the paths merely alternate and this is 1, so the
+     * lower bound is what proves the 5000-packet burst was seen. Without a
+     * clamp the debt would be -5000 and the hot path could not be chosen again
+     * for thousands of packets, so the upper bound is what proves the burst
+     * did not mortgage the path. Only a charged-and-clamped scheduler lands
+     * between them. */
     int cold_run = 0;
-    for (int i = 0; i < 2000; i++) {
+    for (int i = 0; i < 3000; i++) {
         if (wlb_test_invoke(&f, 0xFFFFFFFFU) == hot_path) {
             break;
         }
         cold_run++;
     }
-    CU_ASSERT_TRUE(cold_run > 0);      /* the burst was noticed at all */
+    CU_ASSERT_TRUE(cold_run >= 8);     /* the burst was noticed at all */
     CU_ASSERT_TRUE(cold_run < 1000);   /* ...but did not mortgage the path */
     (void)cold_path;
 
