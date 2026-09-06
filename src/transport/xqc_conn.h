@@ -37,6 +37,13 @@
 /* maximum accumulated number of xqc_engine_packet_process */
 #define XQC_MAX_PACKET_PROCESS_BATCH 100
 
+/* Ceiling on the backlog count taken when a scheduling pass stops early. The
+ * measurement only has to separate "a couple of packets left" from "the queue
+ * is backed up", and the queue can hold sndq_packets_used_max (18000 by
+ * default) entries -- walking all of them once per engine tick would cost more
+ * than the scheduling being measured. */
+#define XQC_SCHED_BACKLOG_PROBE_MAX 512
+
 #define XQC_MAX_RECV_WINDOW (16 * 1024 * 1024)
 
 #define XQC_MP_SETTINGS_STR_LEN (30)
@@ -523,6 +530,44 @@ struct xqc_connection_s {
     /* cc blocking stats */
     uint32_t sched_cc_blocked;
     uint32_t send_cc_blocked;
+
+    /* Where the send side actually stops.
+     *
+     * The question these answer: a two-path connection whose legs measure 43
+     * and 235 Mbps alone delivers 50 Mbps together. Everything above the
+     * scheduler was ruled out by inspection -- connection flow control does
+     * not apply to DATAGRAM, the per-tick send budget is per-path, the packet
+     * pool is 18000 deep -- which leaves the question of whether the send side
+     * is even offered enough to fill both legs, and if it is, which layer
+     * refuses it. Existing counters cannot answer that: sched_cc_blocked
+     * counts scheduling passes that ended early without saying whether any
+     * path had headroom at the time, and nothing at all counts the passes that
+     * ended because the queue simply ran dry.
+     *
+     * Cheap: one increment per scheduling pass or per refused packet, no
+     * allocation, no clock read. Reported once per second by
+     * xqc_conn_send_supply_log() so a run's summary can be read without
+     * enabling DEBUG. */
+    struct {
+        /* Scheduling passes over sndq_send_packets, and how each one ended. */
+        uint64_t sched_passes;
+        /* ...ran out of packets. The send side did not supply enough to
+         * saturate what the paths would have taken -- the supply question. */
+        uint64_t sched_drained;
+        /* ...stopped with packets still queued because the scheduler returned
+         * no path. Split by whether ANY active path had cwnd headroom at that
+         * moment: "no_path_all_blocked" is honest backpressure from the
+         * network, while "no_path_headroom_left" means capacity was available
+         * and the scheduler declined to use it -- the interesting case, and
+         * the one that would explain aggregate below one leg's solo figure. */
+        uint64_t sched_stop_all_blocked;
+        uint64_t sched_stop_headroom_left;
+        /* Packets left unscheduled at the moment a pass stopped. Depth, not
+         * just occurrence: stopping with 3 queued once a millisecond is noise,
+         * stopping with 3000 queued is the bottleneck. */
+        uint64_t sched_stop_backlog;
+    } supply_stats;
+    xqc_usec_t supply_log_ts;
 
     /* internal loss detection stats */
     uint32_t detected_loss_cnt;

@@ -2361,6 +2361,73 @@ xqc_check_acked_or_dropped_pkt(xqc_connection_t *conn, xqc_packet_out_t *packet_
 }
 
 
+/**
+ * Does any active path still have room for one more packet of this size?
+ *
+ * Asked at the moment a scheduling pass gives up, to separate the two reasons
+ * it can: the network is genuinely full, or the scheduler declined capacity
+ * that was there. Those look identical in sched_cc_blocked, and they call for
+ * opposite responses.
+ *
+ * Deliberately ignores the scheduler's own policy -- pinning, PTO avoidance,
+ * weights. The question is what the PATHS would have accepted, so that the
+ * answer is a fact about the connection rather than a restatement of the
+ * decision being audited.
+ */
+static xqc_bool_t
+xqc_conn_any_path_has_headroom(xqc_connection_t *conn, xqc_packet_out_t *packet_out)
+{
+    xqc_list_head_t *pos, *next;
+    xqc_path_ctx_t  *path;
+
+    xqc_list_for_each_safe(pos, next, &conn->conn_paths_list) {
+        path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
+        if (path->path_state != XQC_PATH_STATE_ACTIVE
+            || path->app_path_status == XQC_APP_PATH_STATUS_FROZEN
+            || (path->path_flag & XQC_PATH_FLAG_SOCKET_ERROR)
+            || path->path_send_ctl == NULL)
+        {
+            continue;
+        }
+        if (xqc_send_packet_cwnd_allows(path->path_send_ctl, packet_out,
+                                        path->path_schedule_bytes, 0))
+        {
+            return XQC_TRUE;
+        }
+    }
+    return XQC_FALSE;
+}
+
+/**
+ * One line per second naming where the send side stopped.
+ *
+ * REPORT, not INFO: this is a statistics line, and an embedder that maps its
+ * own INFO onto a higher xquic level would otherwise never see it -- mqvpn
+ * does exactly that, which is how two earlier instrumentation attempts came
+ * back with empty logs.
+ */
+static void
+xqc_conn_send_supply_log(xqc_connection_t *conn, xqc_usec_t now)
+{
+    if (now - conn->supply_log_ts < 1000000) {
+        return;
+    }
+    conn->supply_log_ts = now;
+
+    xqc_log(conn->log, XQC_LOG_REPORT,
+            "|send_supply|passes:%ui|drained:%ui|stop_all_blocked:%ui"
+            "|stop_headroom_left:%ui|stop_backlog:%ui|sndq_used:%ui"
+            "|paths:%ud|",
+            conn->supply_stats.sched_passes,
+            conn->supply_stats.sched_drained,
+            conn->supply_stats.sched_stop_all_blocked,
+            conn->supply_stats.sched_stop_headroom_left,
+            conn->supply_stats.sched_stop_backlog,
+            (uint64_t)(conn->conn_send_queue
+                       ? conn->conn_send_queue->sndq_packets_used : 0),
+            conn->active_path_count);
+}
+
 void
 xqc_conn_schedule_packets(xqc_connection_t *conn, xqc_list_head_t *head,
                           xqc_bool_t packets_are_limited_by_cc, xqc_send_type_t send_type)
@@ -2377,6 +2444,10 @@ xqc_conn_schedule_packets(xqc_connection_t *conn, xqc_list_head_t *head,
 
     now = xqc_monotonic_timestamp();
     reset_rpr_timer = 0;
+    xqc_bool_t stopped_early = XQC_FALSE;
+    /* Sampled before the loop: the loop empties the list, so testing it
+     * afterwards would report "empty" precisely on the passes that succeeded. */
+    xqc_bool_t had_work = !xqc_list_empty(head);
 
     xqc_list_for_each_safe(pos, next, head)
     {
@@ -2409,6 +2480,34 @@ xqc_conn_schedule_packets(xqc_connection_t *conn, xqc_list_head_t *head,
                 if (xqc_timer_is_set(&conn->conn_timer_manager, XQC_TIMER_QUEUE_FIN)) {
                     reset_rpr_timer = 1;
                 }
+                /* Record what this pass left behind and why. Only for the
+                 * normal-data list: the others (PTO, retrans, high-pri) run
+                 * uncapped by cc or carry a handful of packets, so counting
+                 * them would drown the signal from the list that carries the
+                 * datagrams. */
+                if (send_type == XQC_SEND_TYPE_NORMAL) {
+                    xqc_list_head_t *rest;
+                    uint64_t backlog = 0;
+                    /* Capped walk. The queue can hold 18000 packets and this
+                     * runs once per engine tick, so an unbounded count would
+                     * cost more than the scheduling it measures. The cap only
+                     * has to be big enough to distinguish "stopped with a
+                     * couple queued" from "stopped with the queue full", which
+                     * is the whole question. */
+                    for (rest = pos;
+                         rest != head && backlog < XQC_SCHED_BACKLOG_PROBE_MAX;
+                         rest = rest->next)
+                    {
+                        backlog++;
+                    }
+                    conn->supply_stats.sched_stop_backlog += backlog;
+                    if (xqc_conn_any_path_has_headroom(conn, packet_out)) {
+                        conn->supply_stats.sched_stop_headroom_left++;
+                    } else {
+                        conn->supply_stats.sched_stop_all_blocked++;
+                    }
+                }
+                stopped_early = XQC_TRUE;
                 break;
             }
         }
@@ -2431,6 +2530,20 @@ xqc_conn_schedule_packets(xqc_connection_t *conn, xqc_list_head_t *head,
         xqc_path_send_buffer_append(path, packet_out,
                                     &path->path_schedule_buf[send_type]);
     }
+
+    /* A pass that reached the end of the list placed everything offered, so the
+     * limit was the supply, not the paths. Counted only for the normal-data
+     * list, and only when it had something to do -- an empty queue on an idle
+     * connection is not a drained pass, and counting it would swamp the ratio
+     * this exists to report. */
+    if (send_type == XQC_SEND_TYPE_NORMAL && had_work) {
+        conn->supply_stats.sched_passes++;
+        if (!stopped_early) {
+            conn->supply_stats.sched_drained++;
+        }
+        xqc_conn_send_supply_log(conn, now);
+    }
+
     if (conn->conn_settings.fec_params.fec_encoder_scheme == XQC_PACKET_MASK_CODE &&
         send_type == XQC_SEND_TYPE_NORMAL && reset_rpr_timer) {
         cq_fin_timeout = xqc_conn_get_queue_fin_timeout(conn);
