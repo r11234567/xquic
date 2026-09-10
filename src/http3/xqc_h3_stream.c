@@ -1058,7 +1058,7 @@ xqc_h3_stream_process_request(xqc_h3_stream_t *h3s, unsigned char *data, size_t 
                 hdrs = xqc_h3_request_get_writing_headers(h3s->h3r);
                 if (NULL == hdrs) {
                     xqc_log(h3s->log, XQC_LOG_ERROR, "|get writing header error|");
-                    /* NULL here means current_header has reached
+                    /* NULL here means completed_header_count has reached
                      * XQC_H3_REQUEST_MAX_HEADERS_CNT (=2): our internal
                      * capacity for stored header blocks is exhausted.
                      * This is an implementation-side limit, not malformed
@@ -1151,6 +1151,20 @@ xqc_h3_stream_process_request(xqc_h3_stream_t *h3s, unsigned char *data, size_t 
                 break;
 
             case XQC_H3_FRM_DATA:
+                /*
+                 * RFC 9114 Section 4.1: DATA before the initial HEADERS
+                 * frame is an invalid frame sequence.
+                 */
+                if (h3s->h3r->completed_header_count == 0) {
+                    xqc_log(h3s->log, XQC_LOG_ERROR,
+                            "|DATA before initial HEADERS|stream_id:%ui|",
+                            h3s->stream_id);
+                    xqc_h3_frm_reset_pctx(pctx);
+                    XQC_H3_CONN_ERR(h3s->h3c, H3_FRAME_UNEXPECTED,
+                                    -XQC_H3_REQUEST_FRAME_UNEXPECTED);
+                    return -XQC_H3_REQUEST_FRAME_UNEXPECTED;
+                }
+
                 len = xqc_min(pctx->frame.len - pctx->frame.consumed_len,
                               data_len - processed);
                 buf = xqc_var_buf_create(len);
@@ -1558,6 +1572,19 @@ xqc_h3_stream_process_bidi_type_unknown(xqc_h3_stream_t *h3s, unsigned char *dat
             return -XQC_H3_REQUEST_FRAME_UNEXPECTED;
         }
 
+        /*
+         * RFC 9114 Section 4.1: the unknown-type dispatcher consumes a
+         * complete zero-length first frame before request-stream processing.
+         * Reject DATA here so that form cannot bypass the sequence check.
+         */
+        if (pctx->frame.type == XQC_H3_FRM_DATA) {
+            xqc_log(h3s->log, XQC_LOG_ERROR,
+                    "|DATA before initial HEADERS on unknown bidi stream|");
+            xqc_h3_frm_reset_pctx(pctx);
+            XQC_H3_CONN_ERR(h3s->h3c, H3_FRAME_UNEXPECTED,
+                            -XQC_H3_REQUEST_FRAME_UNEXPECTED);
+            return -XQC_H3_REQUEST_FRAME_UNEXPECTED;
+        }
 
         if (pctx->frame.type != XQC_H3_EXT_FRM_BIDI_STREAM_TYPE) {
             /* the first frame is not BIDI_STREAM_TYPE */
