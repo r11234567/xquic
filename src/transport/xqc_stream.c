@@ -990,53 +990,59 @@ xqc_stream_close_with_error(xqc_stream_t *stream, uint64_t err_code)
                                                     stream->stream_id);
     xqc_bool_t recv_only = xqc_stream_is_recv_only(conn->conn_type,
                                                     stream->stream_id);
+    xqc_bool_t send_reset;
+    xqc_bool_t send_stop;
     xqc_log(
         conn->log, XQC_LOG_DEBUG,
         "|stream_id:%ui|stream_state_send:%d|stream_state_recv:%d|conn:%p|conn_state:%s|err_code:%ui|",
         stream->stream_id, stream->stream_state_send, stream->stream_state_recv, conn,
         xqc_conn_state_2_str(conn->conn_state), err_code);
 
+    /* Preserve the local cause even when no close frame remains legal. */
+    if (stream->stream_close_msg == NULL) {
+        stream->stream_err = err_code;
+    }
     XQC_STREAM_CLOSE_MSG(stream, "local reset");
 
-    if ((!recv_only
-         && stream->stream_state_send >= XQC_SEND_STREAM_ST_RESET_SENT)
-        || (recv_only
-            && (stream->stream_flag
-                & XQC_STREAM_FLAG_STOP_SENDING_SENT)))
-    {
+    send_reset = !recv_only
+                 && stream->stream_state_send
+                    < XQC_SEND_STREAM_ST_DATA_RECVD;
+    send_stop = !send_only
+                && !(stream->stream_flag
+                     & XQC_STREAM_FLAG_STOP_SENDING_SENT)
+                && (stream->stream_state_recv == XQC_RECV_STREAM_ST_RECV
+                    || stream->stream_state_recv
+                       == XQC_RECV_STREAM_ST_SIZE_KNOWN);
+    if (!send_reset && !send_stop) {
         return XQC_OK;
     }
     if (conn->conn_state >= XQC_CONN_STATE_CLOSING) {
         return XQC_OK;
     }
 
-    /* With conn_settings.defer_send_flush enabled, accepted bytes may still be
-     * queued when we get here, and the drop below discards them: an
-     * application that writes and then ABORTS a stream from the same callback
-     * loses that write.
-     *
-     * Flushing here first was tried and reverted, deliberately. Driving the
-     * engine from inside a close runs timers and application notifications
-     * re-entrantly — xqc_timer_stream_close_timeout() can xqc_destroy_stream()
-     * the very `stream` this function still holds (its guard above admits
-     * DATA_RECVD, which is below RESET_SENT), and a notification can re-enter
-     * close and set RESET_SENT without this invocation rechecking. It also
-     * no-ops entirely when called from inside an engine callback, which is
-     * precisely where the loss is hardest to avoid. A use-after-free is worse
-     * than the truncation it was meant to prevent.
-     *
-     * The exposure is bounded: this is the abort path (xqc_stream_close()
-     * passes H3_REQUEST_CANCELLED), normal FIN completion retires streams via
-     * xqc_stream_maybe_need_close() without coming here, a connection already
-     * CLOSING returned above, and the peer receives RESET_STREAM so the
-     * truncation is visible rather than silent. Recorded in the
-     * defer_send_flush field doc in xquic.h. */
-    xqc_send_queue_drop_stream_frame_packets(conn, stream->stream_id);
     /*
      * RFC 9000 Sections 3.3, 19.4, and 19.5: a stream receiver sends
      * STOP_SENDING, while a stream sender sends RESET_STREAM.
      */
-    if (!recv_only) {
+    if (send_reset) {
+        /* With conn_settings.defer_send_flush enabled, accepted bytes may still
+         * be queued when we get here, and the drop below discards them: an
+         * application that writes and then ABORTS a stream from the same
+         * callback loses that write.
+         *
+         * Flushing here first was tried and reverted, deliberately. Driving the
+         * engine from inside a close runs timers and application notifications
+         * re-entrantly: xqc_timer_stream_close_timeout() can
+         * xqc_destroy_stream() the very `stream` this function still holds, and
+         * a notification can re-enter close. It also no-ops when called from an
+         * engine callback, where the loss is hardest to avoid. A use-after-free
+         * is worse than the truncation it was meant to prevent.
+         *
+         * The exposure is bounded: this is the abort path, normal FIN completion
+         * retires streams via xqc_stream_maybe_need_close(), and the peer
+         * receives RESET_STREAM so the truncation is visible. Recorded in the
+         * defer_send_flush field doc in xquic.h. */
+        xqc_send_queue_drop_stream_frame_packets(conn, stream->stream_id);
         ret = xqc_write_reset_stream_to_packet(conn, stream, err_code,
                                                stream->stream_send_offset);
         if (ret < 0) {
@@ -1046,12 +1052,7 @@ xqc_stream_close_with_error(xqc_stream_t *stream, uint64_t err_code)
         }
     }
 
-    /* A STOP_SENDING frame can be sent for streams in the "Recv" or "Size
-       Known" states */
-    if (!send_only
-        && (stream->stream_state_recv == XQC_RECV_STREAM_ST_RECV
-            || stream->stream_state_recv == XQC_RECV_STREAM_ST_SIZE_KNOWN))
-    {
+    if (send_stop) {
         ret = xqc_write_stop_sending_to_packet(conn, stream, err_code);
         if (ret < 0) {
             xqc_log(conn->log, XQC_LOG_ERROR,
