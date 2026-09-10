@@ -89,7 +89,7 @@ its case is retired so later changes cannot reuse it.
 | `[1400, 1499]` | MoQT | None |
 | `[1500, 1599]` | LOC and MSF application protocols | None |
 | `[1600, 1699]` | FEC and experimental transport extensions | None |
-| `[1700, 1799]` | Common runtime, public API, and test harness | None |
+| `[1700, 1799]` | Common runtime, public API, and test harness | `1702-1703` |
 
 Apply these allocation rules before running a new case:
 
