@@ -67,6 +67,9 @@ Verify certificate.
 #### XQC_TLS_CERT_FLAG_ALLOW_SELF_SIGNED (0x02)
 Self-signed certificates is allowed.
 
+#### XQC_TLS_CERT_FLAG_APP_VERIFY (0x04)
+Delegate the whole certificate decision to cert_verify_cb on every full handshake; implies peer verification even without XQC_TLS_CERT_FLAG_NEED_VERIFY.
+
 ### xqc_0rtt_flag_t
 Statistics flag of 0-RTT packets during the lifetime of QUIC connection.
 
