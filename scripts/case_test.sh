@@ -4980,24 +4980,53 @@ fi
 #   4. If the old enum truncated bit 32 to 0, "FEC_REPAIR" would NEVER
 #      appear in the log -> grep fails -> test fails
 #
-# Test 1: verify client SENDS repair symbols (grep clog)
-# Test 2: verify server RECEIVES repair symbols (grep slog)
+# One transfer verifies both that the client SENDS repair symbols (clog) and
+# the server RECEIVES them (slog). FEC repair emission is asynchronous with
+# application completion, so a short-lived test process can occasionally
+# finish before the repair packet is logged. Use a bounded whole-transfer
+# retry: a real bit-32 regression remains absent on every attempt, while send
+# and receive must be observed together in the same successful attempt.
 #
 # Keep this test single-path. Its contract is the frame-type bit, and enabling
 # multipath makes repair delivery depend on asynchronous standby-path setup.
 
-clear_log
-killall test_server 2> /dev/null
-stdbuf -oL ${SERVER_BIN} -l d -e -f -x 700 > /dev/null &
-sleep 1
+fec_frame_sent=0
+fec_frame_received=0
+fec_frame_transfer_ok=0
+fec_frame_error_free=0
+fec_frame_attempt=0
 
-rm -rf tp_localhost test_session xqc_token
+for fec_frame_attempt in 1 2 3; do
+    clear_log
+    killall test_server 2> /dev/null
+    stdbuf -oL ${SERVER_BIN} -l d -e -f -x 700 > /dev/null &
+    sleep 1
+
+    rm -rf tp_localhost test_session xqc_token
+    sudo ${CLIENT_BIN} -s 5120000 -l d -E -d 30 -g -x 700 > stdlog
+    clog_repair=`grep 'frame:.*FEC_REPAIR' clog`
+    slog_repair=`grep 'frame:.*FEC_REPAIR' slog`
+    echo_result=`grep ">>>>>>>> pass" stdlog`
+    errlog=`grep_err_log`
+
+    fec_frame_sent=0
+    fec_frame_received=0
+    fec_frame_transfer_ok=0
+    fec_frame_error_free=0
+    [ -n "$clog_repair" ] && fec_frame_sent=1
+    [ -n "$slog_repair" ] && fec_frame_received=1
+    [ "$echo_result" == ">>>>>>>> pass:1" ] && fec_frame_transfer_ok=1
+    [ -z "$errlog" ] && fec_frame_error_free=1
+
+    if [ $fec_frame_sent -eq 1 ] && [ $fec_frame_received -eq 1 ] \
+        && [ $fec_frame_transfer_ok -eq 1 ] && [ $fec_frame_error_free -eq 1 ]; then
+        break
+    fi
+done
+
 echo -e "frame_type_bit repair symbol sent (bit 32 non-zero) ...\c"
-sudo ${CLIENT_BIN} -s 5120000 -l d -E -d 30 -g -x 700 > stdlog
-clog_repair=`grep 'frame:.*FEC_REPAIR' clog`
-echo_result=`grep ">>>>>>>> pass" stdlog`
-errlog=`grep_err_log`
-if [ -z "$errlog" ] && [ -n "$clog_repair" ] && [ "$echo_result" == ">>>>>>>> pass:1" ]; then
+if [ $fec_frame_sent -eq 1 ] && [ $fec_frame_transfer_ok -eq 1 ] \
+    && [ $fec_frame_error_free -eq 1 ]; then
     echo ">>>>>>>> pass:1"
     case_print_result "frame_type_bit_repair_sent" "pass"
 else
@@ -5005,24 +5034,20 @@ else
     case_print_result "frame_type_bit_repair_sent" "fail"
 fi
 
-
-clear_log
-killall test_server 2> /dev/null
-stdbuf -oL ${SERVER_BIN} -l d -e -f -x 700 > /dev/null &
-sleep 1
-
-rm -rf tp_localhost test_session xqc_token
 echo -e "frame_type_bit repair symbol received (bit 32 non-zero) ...\c"
-sudo ${CLIENT_BIN} -s 5120000 -l d -E -d 30 -g -x 700 > stdlog
-slog_repair=`grep 'frame:.*FEC_REPAIR' slog`
-echo_result=`grep ">>>>>>>> pass" stdlog`
-errlog=`grep_err_log`
-if [ -z "$errlog" ] && [ -n "$slog_repair" ] && [ "$echo_result" == ">>>>>>>> pass:1" ]; then
+if [ $fec_frame_received -eq 1 ] && [ $fec_frame_transfer_ok -eq 1 ] \
+    && [ $fec_frame_error_free -eq 1 ]; then
     echo ">>>>>>>> pass:1"
     case_print_result "frame_type_bit_repair_received" "pass"
 else
     echo ">>>>>>>> pass:0"
     case_print_result "frame_type_bit_repair_received" "fail"
+fi
+
+if [ $fec_frame_sent -ne 1 ] || [ $fec_frame_received -ne 1 ] \
+    || [ $fec_frame_transfer_ok -ne 1 ] || [ $fec_frame_error_free -ne 1 ]; then
+    echo "FEC frame check exhausted attempts:$fec_frame_attempt sent:$fec_frame_sent received:$fec_frame_received transfer:$fec_frame_transfer_ok error_free:$fec_frame_error_free"
+    echo "$errlog"
 fi
 
 
