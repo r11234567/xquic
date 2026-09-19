@@ -30,9 +30,7 @@ The public request API exposes the connection send-queue estimate through
 `xqc_h3_request_get_send_queue_bytes()` and lets an event-driven proxy retain or
 release write callbacks with `xqc_h3_request_set_write_notify()`. Together they
 allow a proxy to stop reading a fast h2c backend at a high-water mark and resume
-only after QUIC acknowledgements drain the queue below a low-water mark. Releasing
-the callback also removes an otherwise idle transport stream from writable
-scheduling, while preserving H3's own buffered-frame retries.
+only after QUIC acknowledgements drain the queue below a low-water mark.
 
 RFC 9218 urgency 0 and 1 now use a dedicated urgent packet queue. It is
 scheduled ahead of normal application data but, unlike the fork's private
