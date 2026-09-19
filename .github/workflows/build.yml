@@ -31,8 +31,10 @@ jobs:
         submodules: 'recursive'
 
     - name: Select test scope
+      env:
+        TEST_SCOPE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
       run: |
-        if git log -1 --pretty=%B | grep -Fq '[ci:fec-rsc-only]'; then
+        if git log -1 --pretty=%B "$TEST_SCOPE_SHA" | grep -Fq '[ci:fec-rsc-only]'; then
           echo "RSC_ONLY=1" >> "$GITHUB_ENV"
           echo "Running only the FEC RSC end-to-end case for this commit."
         else
