@@ -797,7 +797,9 @@ uint64_t xqc_h3_request_get_send_queue_bytes(xqc_h3_request_t *h3_request);
 /**
  * @brief Enable or disable application write notifications for a request.
  * Enabling also schedules a notification so an application can re-check its
- * own low-water mark after pausing an upstream producer.
+ * own low-water mark after pausing an upstream producer. Disabling removes an
+ * otherwise idle transport stream from writable scheduling; H3-internal
+ * buffered-frame retries remain scheduled.
  */
 XQC_EXPORT_PUBLIC_API
 xqc_int_t xqc_h3_request_set_write_notify(xqc_h3_request_t *h3_request,
