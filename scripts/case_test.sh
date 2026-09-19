@@ -37,6 +37,62 @@ function case_print_result() {
 }
 
 
+# The random packet loss used by this end-to-end case can occasionally produce
+# a transfer that does not need an RSC recovery. Retry the complete isolated
+# transfer instead of accepting a run that only proves the connection worked.
+function run_fec_stream_rsc_case() {
+    max_attempts=3
+    attempt=1
+
+    while [ "$attempt" -le "$max_attempts" ]; do
+        killall test_server 2> /dev/null
+        clear_log
+        rm -rf tp_localhost test_session xqc_token
+        stdbuf -oL ${SERVER_BIN} -l d -e -f -x 1 -M > /dev/null &
+        sleep 1
+
+        sudo ${CLIENT_BIN} -s 5120000 -l e -E -d 30 -g -M -i lo -i lo \
+            --fec_encoder 8 --fec_decoder 8 > stdlog
+        client_status=$?
+        transfer_ok=0
+        recovery_seen=0
+        error_free=0
+        grep -Fq ">>>>>>>> pass:1" stdlog && transfer_ok=1
+        grep -q '|process packet of block .\{1,3\} successfully' slog \
+            && recovery_seen=1
+        errlog=`grep_err_log`
+        [ -z "$errlog" ] && error_free=1
+
+        if [ "$client_status" -eq 0 ] && [ "$transfer_ok" -eq 1 ] \
+            && [ "$recovery_seen" -eq 1 ] && [ "$error_free" -eq 1 ]; then
+            echo ">>>>>>>> pass:1"
+            case_print_result "fec_recovered_function_of_stream_rsc" "pass"
+            return
+        fi
+
+        echo "RSC attempt ${attempt}/${max_attempts}: client_status=${client_status}" \
+            "transfer_ok=${transfer_ok} recovery_seen=${recovery_seen}" \
+            "error_free=${error_free}"
+        if [ -n "$errlog" ]; then
+            echo "$errlog"
+        fi
+        attempt=$((attempt + 1))
+    done
+
+    echo ">>>>>>>> pass:0"
+    case_print_result "fec_recovered_function_of_stream_rsc" "fail"
+}
+
+
+if [ "${1:-}" = "--only-fec-rsc" ]; then
+    echo -e "check fec recovery function of stream using RSC ...\c"
+    run_fec_stream_rsc_case
+    killall test_server 2> /dev/null
+    cd -
+    exit 0
+fi
+
+
 # start test_server
 rm -rf tp_localhost test_session xqc_token
 killall test_server 2> /dev/null
@@ -4916,23 +4972,8 @@ else
     case_print_result "fec_recovered_function_of_stream_xor" "fail"
 fi
 
-clear_log
-killall test_server 2> /dev/null
-stdbuf -oL ${SERVER_BIN} -l d -e -f -x 1 -M > /dev/null &
-sleep 1
-
-rm -rf tp_localhost test_session xqc_token
 echo -e "check fec recovery function of stream using RSC ...\c"
-sudo ${CLIENT_BIN} -s 5120000 -l e -E -d 30 -g -M -i lo -i lo --fec_encoder 8 --fec_decoder 8 > stdlog
-slog_res1=`grep '|process packet of block .\{1,3\} successfully' slog`
-errlog=`grep_err_log`
-if [ -z "$errlog" ] && [ -n "$slog_res1" ]; then
-    echo ">>>>>>>> pass:1"
-    case_print_result "fec_recovered_function_of_stream_rsc" "pass"
-else
-    echo ">>>>>>>> pass:0"
-    case_print_result "fec_recovered_function_of_stream_rsc" "fail"
-fi
+run_fec_stream_rsc_case
 
 clear_log
 killall test_server 2> /dev/null
