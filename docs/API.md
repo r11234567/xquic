@@ -61,11 +61,14 @@ Support version count.
 ### xqc_cert_verify_flag_e
 Certificate verify flag.
 
-#### XQC_TLS_CERT_FLAG_NEED_VERIFY (0x00)
+#### XQC_TLS_CERT_FLAG_NEED_VERIFY (0x01)
 Verify certificate.
 
-#### XQC_TLS_CERT_FLAG_ALLOW_SELF_SIGNED (0x01)
+#### XQC_TLS_CERT_FLAG_ALLOW_SELF_SIGNED (0x02)
 Self-signed certificates is allowed.
+
+#### XQC_TLS_CERT_FLAG_APP_VERIFY (0x04)
+Delegate the whole certificate decision to cert_verify_cb on every full handshake; implies peer verification even without XQC_TLS_CERT_FLAG_NEED_VERIFY.
 
 ### xqc_0rtt_flag_t
 Statistics flag of 0-RTT packets during the lifetime of QUIC connection.
@@ -620,13 +623,13 @@ If equal, XQC_OK will be returned.
 
 #### xqc_scid_str
 ```
-unsigned char *xqc_scid_str(const xqc_cid_t *scid);
+unsigned char *xqc_scid_str(xqc_engine_t *engine, const xqc_cid_t *scid);
 ```
 Transfer scid to human-readable string.
 
 #### xqc_dcid_str
 ```
-unsigned char *xqc_dcid_str(const xqc_cid_t *dcid);
+unsigned char *xqc_dcid_str(xqc_engine_t *engine, const xqc_cid_t *dcid);
 ```
 Transfer dcid to human-readable string.
 

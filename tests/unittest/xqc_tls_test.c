@@ -7,6 +7,10 @@
 #include "src/transport/xqc_conn.h"
 #include "src/tls/xqc_tls_ctx.h"
 #include "src/tls/xqc_tls.h"
+#include <stdio.h>
+#include <string.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
 
 #define XQC_TEST_MAX_CRYPTO_DATA_BUF 16 * 1024
 
@@ -32,9 +36,11 @@ typedef struct xqc_tls_test_buff_s {
             size_t             crypto_data_total_len;
         
             uint64_t           error_code;
+            uint64_t           transport_error_code;
         };
         xqc_connection_t conn;
     };
+    int                  cert_cb_called;
 } xqc_tls_test_buff_t;
 
 static inline xqc_tls_test_buff_t*
@@ -54,6 +60,8 @@ xqc_create_tls_test_buffer()
     ttbuf->crypto_data_total_len = 0;
 
     ttbuf->error_code = 0;
+    ttbuf->transport_error_code = 0;
+    ttbuf->cert_cb_called = 0;
 
     return ttbuf;
 }
@@ -177,6 +185,20 @@ xqc_tt_cert_verify_cb(const unsigned char *certs[], const size_t cert_len[],
     return XQC_OK;
 }
 
+xqc_int_t
+xqc_tt_cert_cb(const char *sni, void **chain, void **crt, void **key,
+               void *user_data)
+{
+    xqc_tls_test_buff_t *ttbuf = (xqc_tls_test_buff_t *)user_data;
+
+    if (sni == NULL) {
+        return -XQC_TLS_INVALID_ARGUMENT;
+    }
+
+    ttbuf->cert_cb_called++;
+    return XQC_OK;
+}
+
 void
 xqc_tt_session_cb(const char *data, size_t data_len, void *user_data)
 {
@@ -202,6 +224,14 @@ xqc_tt_tls_error_cb(xqc_int_t tls_err, void *user_data)
 }
 
 void
+xqc_tt_transport_error_cb(xqc_int_t transport_err, void *user_data)
+{
+    xqc_tls_test_buff_t *ttbuf = (xqc_tls_test_buff_t *)user_data;
+
+    ttbuf->transport_error_code = transport_err;
+}
+
+void
 xqc_tt_handshake_completed_cb(void *user_data)
 {
     xqc_tls_test_buff_t *ttbuf = (xqc_tls_test_buff_t *)user_data;
@@ -216,6 +246,7 @@ xqc_tls_callbacks_t tls_test_cbs = {
     .session_cb = xqc_tt_session_cb,
     .keylog_cb = xqc_tt_keylog_cb,
     .error_cb = xqc_tt_tls_error_cb,
+    .transport_error_cb = xqc_tt_transport_error_cb,
     .hsk_completed_cb = xqc_tt_handshake_completed_cb,
 };
 
@@ -235,6 +266,164 @@ xqc_tls_callbacks_t tls_test_cbs = {
     
 static xqc_log_t *test_log;
 static xqc_tls_ctx_t *ctx_cli, *ctx_svr;
+
+#define TEST_ALPN_1 "transport"
+#define TEST_ALPN_2 "h3"
+
+static xqc_int_t
+xqc_test_tls_default_cert_handshake(xqc_bool_t with_sni,
+                                    int *cert_cb_called)
+{
+    xqc_int_t              ret = -XQC_EFATAL;
+    size_t                 data_len;
+    uint8_t               *data_buf = NULL;
+    xqc_log_t             *log = NULL;
+    xqc_tls_ctx_t         *local_ctx_cli = NULL;
+    xqc_tls_ctx_t         *local_ctx_svr = NULL;
+    xqc_tls_t             *tls_cli = NULL;
+    xqc_tls_t             *tls_svr = NULL;
+    xqc_tls_test_buff_t   *ttbuf_cli = NULL;
+    xqc_tls_test_buff_t   *ttbuf_svr = NULL;
+    xqc_log_callbacks_t    log_cb = xqc_null_log_cb;
+    xqc_tls_callbacks_t    cert_test_cbs = tls_test_cbs;
+    xqc_tls_config_t       tls_config = {0};
+    xqc_cid_t              odcid = {1};
+    def_engine_ssl_config_cli;
+    def_engine_ssl_config_svr;
+
+    *cert_cb_called = 0;
+    cert_test_cbs.cert_cb = xqc_tt_cert_cb;
+
+    log = xqc_log_init(0, 0, 0, 0, 0, NULL, &log_cb, NULL);
+    if (log == NULL) {
+        goto end;
+    }
+
+    local_ctx_cli = xqc_tls_ctx_create(XQC_TLS_TYPE_CLIENT,
+        &engine_ssl_config_cli, &cert_test_cbs, log);
+    local_ctx_svr = xqc_tls_ctx_create(XQC_TLS_TYPE_SERVER,
+        &engine_ssl_config_svr, &cert_test_cbs, log);
+    if (local_ctx_cli == NULL || local_ctx_svr == NULL) {
+        goto end;
+    }
+
+    ret = xqc_tls_ctx_register_alpn(local_ctx_svr, TEST_ALPN_1,
+                                    sizeof(TEST_ALPN_1) - 1);
+    if (ret != XQC_OK) {
+        goto end;
+    }
+
+    tls_config.hostname = "test.xquic.com";
+    tls_config.alpn = TEST_ALPN_1;
+    tls_config.trans_params = "10086";
+    tls_config.trans_params_len = 5;
+
+    ttbuf_cli = xqc_create_tls_test_buffer();
+    ttbuf_svr = xqc_create_tls_test_buffer();
+    if (ttbuf_cli == NULL || ttbuf_svr == NULL) {
+        ret = -XQC_EMALLOC;
+        goto end;
+    }
+
+    tls_cli = xqc_tls_create(local_ctx_cli, &tls_config, log, ttbuf_cli);
+    tls_svr = xqc_tls_create(local_ctx_svr, &tls_config, log, ttbuf_svr);
+    if (tls_cli == NULL || tls_svr == NULL) {
+        ret = -XQC_TLS_INTERNAL;
+        goto end;
+    }
+
+    if (!with_sni
+        && SSL_set_tlsext_host_name(xqc_tls_get_ssl(tls_cli), NULL)
+           != XQC_SSL_SUCCESS)
+    {
+        ret = -XQC_TLS_INTERNAL;
+        goto end;
+    }
+
+    ret = xqc_tls_init(tls_cli, XQC_VERSION_V1, &odcid);
+    if (ret != XQC_OK
+        || xqc_list_empty(&ttbuf_cli->initial_crypto_data_list))
+    {
+        ret = -XQC_TLS_INTERNAL;
+        goto end;
+    }
+
+    ret = xqc_tls_init(tls_svr, XQC_VERSION_V1, &odcid);
+    if (ret != XQC_OK) {
+        goto end;
+    }
+
+    data_buf = xqc_malloc(XQC_TEST_MAX_CRYPTO_DATA_BUF);
+    if (data_buf == NULL) {
+        ret = -XQC_EMALLOC;
+        goto end;
+    }
+
+    data_len = xqc_crypto_data_list_get_buf(
+        &ttbuf_cli->initial_crypto_data_list, data_buf);
+    if (data_len == 0 || data_len > XQC_TEST_MAX_CRYPTO_DATA_BUF) {
+        ret = -XQC_TLS_INTERNAL;
+        goto end;
+    }
+
+    ret = xqc_tls_process_crypto_data(tls_svr, XQC_ENC_LEV_INIT,
+                                      data_buf, data_len);
+    *cert_cb_called = ttbuf_svr->cert_cb_called;
+    if (ret == XQC_OK
+        && (xqc_list_empty(&ttbuf_svr->initial_crypto_data_list)
+            || xqc_list_empty(&ttbuf_svr->hsk_crypto_data_list)))
+    {
+        ret = -XQC_TLS_INTERNAL;
+    }
+
+end:
+    if (data_buf != NULL) {
+        xqc_free(data_buf);
+    }
+    if (tls_cli != NULL) {
+        xqc_tls_destroy(tls_cli);
+    }
+    if (tls_svr != NULL) {
+        xqc_tls_destroy(tls_svr);
+    }
+    if (ttbuf_cli != NULL) {
+        xqc_destroy_tls_test_buffer(ttbuf_cli);
+    }
+    if (ttbuf_svr != NULL) {
+        xqc_destroy_tls_test_buffer(ttbuf_svr);
+    }
+    if (local_ctx_cli != NULL) {
+        xqc_tls_ctx_destroy(local_ctx_cli);
+    }
+    if (local_ctx_svr != NULL) {
+        xqc_tls_ctx_destroy(local_ctx_svr);
+    }
+    if (log != NULL) {
+        xqc_free(log);
+    }
+
+    return ret;
+}
+
+void
+xqc_test_tls_default_cert_with_sni(void)
+{
+    int cert_cb_called;
+
+    CU_ASSERT_EQUAL(xqc_test_tls_default_cert_handshake(
+        XQC_TRUE, &cert_cb_called), XQC_OK);
+    CU_ASSERT_EQUAL(cert_cb_called, 1);
+}
+
+void
+xqc_test_tls_default_cert_without_sni(void)
+{
+    int cert_cb_called;
+
+    CU_ASSERT_EQUAL(xqc_test_tls_default_cert_handshake(
+        XQC_FALSE, &cert_cb_called), XQC_OK);
+    CU_ASSERT_EQUAL(cert_cb_called, 0);
+}
 
 void
 xqc_test_create_client_tls_ctx()
@@ -349,9 +538,6 @@ xqc_test_create_server_tls_ctx()
     ctx_svr = ctx;
 }
 
-#define TEST_ALPN_1 "transport"
-#define TEST_ALPN_2 "h3"
-
 void
 xqc_test_tls_ctx_register_alpn()
 {
@@ -436,6 +622,7 @@ xqc_test_tls_generic()
 {
     xqc_int_t ret;
     int cnt;
+    size_t early_data_offset;
 
     uint8_t *data_buf = malloc(XQC_TEST_MAX_CRYPTO_DATA_BUF);
     size_t   data_len = 0;
@@ -502,8 +689,32 @@ xqc_test_tls_generic()
     data_len = xqc_crypto_data_list_get_buf(&ttbuf_svr->application_crypto_data_list, data_buf);
     CU_ASSERT(data_len > 0);
     ret = xqc_tls_process_crypto_data(tls_cli, XQC_ENC_LEV_1RTT, data_buf, data_len);
+    CU_ASSERT(ret == XQC_OK);
     CU_ASSERT(ttbuf_cli->new_session_ticket != NULL);
     CU_ASSERT(ttbuf_cli->new_session_ticket_len > 0);
+    CU_ASSERT(ttbuf_cli->transport_error_code == 0);
+
+    /* RFC 9001 Section 4.6.1 requires this sentinel for QUIC 0-RTT. */
+    for (early_data_offset = 0; early_data_offset + 8 <= data_len;
+         early_data_offset++)
+    {
+        if (data_buf[early_data_offset] == 0
+            && data_buf[early_data_offset + 1] == TLSEXT_TYPE_early_data
+            && data_buf[early_data_offset + 2] == 0
+            && data_buf[early_data_offset + 3] == 4
+            && memcmp(data_buf + early_data_offset + 4,
+                      "\xff\xff\xff\xff", 4) == 0)
+        {
+            break;
+        }
+    }
+    CU_ASSERT(early_data_offset + 8 <= data_len);
+    data_buf[early_data_offset + 7] = 0;
+    ret = xqc_tls_process_crypto_data(tls_cli, XQC_ENC_LEV_1RTT,
+                                      data_buf, data_len);
+    CU_ASSERT(ret != XQC_OK);
+    CU_ASSERT(ttbuf_cli->transport_error_code == TRA_PROTOCOL_VIOLATION);
+    CU_ASSERT(ttbuf_cli->error_code == 0);
 
     /* 0-RTT */
     tls_config.session_ticket = ttbuf_cli->new_session_ticket;
@@ -875,6 +1086,202 @@ xqc_test_tls_failure()
     free(data_buf);
 }
 
+
+/* ---- XQC_TLS_CERT_FLAG_APP_VERIFY: the application owns the chain decision ---- */
+
+static struct {
+    int             calls;
+    size_t          n_certs;
+    unsigned char   leaf[4096];
+    size_t          leaf_len;
+    xqc_int_t       ret;        /* what cert_verify_cb returns */
+    xqc_int_t       first_err;  /* first error_cb value (0 = none yet) */
+} xqc_tt_av;
+
+static xqc_int_t
+xqc_tt_av_cert_verify_cb(const unsigned char *certs[], const size_t cert_len[],
+    size_t certs_len, void *user_data)
+{
+    xqc_tt_av.calls++;
+    xqc_tt_av.n_certs = certs_len;
+    xqc_tt_av.leaf_len = 0;
+    if (certs_len > 0 && cert_len[0] <= sizeof(xqc_tt_av.leaf)) {
+        memcpy(xqc_tt_av.leaf, certs[0], cert_len[0]);
+        xqc_tt_av.leaf_len = cert_len[0];
+    }
+    return xqc_tt_av.ret;
+}
+
+static void
+xqc_tt_av_error_cb(xqc_int_t tls_err, void *user_data)
+{
+    if (xqc_tt_av.first_err == 0) {
+        xqc_tt_av.first_err = tls_err;
+    }
+}
+
+/* DER of ./server.crt, the certificate ctx_svr serves. 0 on failure. */
+static size_t
+xqc_tt_load_server_cert_der(unsigned char *out, size_t cap)
+{
+    FILE *fp = fopen("./server.crt", "r");
+    if (fp == NULL) {
+        return 0;
+    }
+    X509 *x = PEM_read_X509(fp, NULL, NULL, NULL);
+    fclose(fp);
+    if (x == NULL) {
+        return 0;
+    }
+    int len = i2d_X509(x, NULL);
+    if (len <= 0 || (size_t)len > cap) {
+        X509_free(x);
+        return 0;
+    }
+    unsigned char *p = out;
+    i2d_X509(x, &p);
+    X509_free(x);
+    return (size_t)len;
+}
+
+/* Run one client (with the flag under test and the recording callbacks)
+ * against ctx_svr up to the server's Handshake flight, i.e. through the
+ * client's certificate verification. Returns the client's result for that
+ * flight; *completed reports the client's handshake_completed. */
+static xqc_int_t
+xqc_tt_av_handshake(uint8_t cert_verify_flag, xqc_bool_t with_cb, xqc_bool_t *completed)
+{
+    uint8_t *data_buf = malloc(XQC_TEST_MAX_CRYPTO_DATA_BUF);
+    size_t data_len = 0;
+    xqc_cid_t odcid = {1};
+
+    xqc_tls_config_t tls_config = {0};
+    tls_config.cert_verify_flag = cert_verify_flag;
+    tls_config.hostname = "test.xquic.com";
+    tls_config.alpn = "transport";
+    tls_config.trans_params = "10086";
+    tls_config.trans_params_len = 5;
+
+    xqc_tls_callbacks_t cbs = tls_test_cbs;
+    cbs.cert_verify_cb = with_cb ? xqc_tt_av_cert_verify_cb : NULL;
+    cbs.error_cb = xqc_tt_av_error_cb;
+    def_engine_ssl_config_cli;
+    xqc_tls_ctx_t *ctx = xqc_tls_ctx_create(XQC_TLS_TYPE_CLIENT, &engine_ssl_config_cli,
+                                            &cbs, test_log);
+    CU_ASSERT(ctx != NULL);
+
+    xqc_tls_test_buff_t *ttbuf_cli = xqc_create_tls_test_buffer();
+    xqc_tls_t *tls_cli = xqc_tls_create(ctx, &tls_config, test_log, ttbuf_cli);
+    CU_ASSERT(xqc_tls_init(tls_cli, XQC_VERSION_V1, &odcid) == XQC_OK);
+
+    xqc_tls_test_buff_t *ttbuf_svr = xqc_create_tls_test_buffer();
+    xqc_tls_t *tls_svr = xqc_tls_create(ctx_svr, &tls_config, test_log, ttbuf_svr);
+    CU_ASSERT(xqc_tls_init(tls_svr, XQC_VERSION_V1, &odcid) == XQC_OK);
+
+    /* ClientHello -> server */
+    data_len = xqc_crypto_data_list_get_buf(&ttbuf_cli->initial_crypto_data_list, data_buf);
+    CU_ASSERT(data_len > 0);
+    CU_ASSERT(xqc_tls_process_crypto_data(tls_svr, XQC_ENC_LEV_INIT, data_buf, data_len) == XQC_OK);
+
+    /* ServerHello -> client */
+    data_len = xqc_crypto_data_list_get_buf(&ttbuf_svr->initial_crypto_data_list, data_buf);
+    CU_ASSERT(data_len > 0);
+    CU_ASSERT(xqc_tls_process_crypto_data(tls_cli, XQC_ENC_LEV_INIT, data_buf, data_len) == XQC_OK);
+
+    /* EE, CERT, CV, FIN -> client: certificate verification happens here */
+    data_len = xqc_crypto_data_list_get_buf(&ttbuf_svr->hsk_crypto_data_list, data_buf);
+    CU_ASSERT(data_len > 0);
+    xqc_int_t ret = xqc_tls_process_crypto_data(tls_cli, XQC_ENC_LEV_HSK, data_buf, data_len);
+    *completed = ttbuf_cli->handshake_completed;
+
+    xqc_destroy_tls_test_buffer(ttbuf_cli);
+    xqc_destroy_tls_test_buffer(ttbuf_svr);
+    xqc_tls_destroy(tls_cli);
+    xqc_tls_destroy(tls_svr);
+    xqc_tls_ctx_destroy(ctx);
+    free(data_buf);
+    return ret;
+}
+
+void
+xqc_test_tls_app_verify()
+{
+    unsigned char der[4096];
+    size_t der_len = xqc_tt_load_server_cert_der(der, sizeof(der));
+    CU_ASSERT(der_len > 0);
+    xqc_bool_t completed = XQC_FALSE;
+
+    /* 1. APP_VERIFY + accepting callback: the presented chain (leaf first)
+     *    reaches the application on every handshake, and its OK is final —
+     *    no root store, no hostname check by the library. */
+    memset(&xqc_tt_av, 0, sizeof(xqc_tt_av));
+    xqc_tt_av.ret = XQC_OK;
+    CU_ASSERT(xqc_tt_av_handshake(XQC_TLS_CERT_FLAG_NEED_VERIFY | XQC_TLS_CERT_FLAG_APP_VERIFY,
+                                  XQC_TRUE, &completed) == XQC_OK);
+    CU_ASSERT(completed == XQC_TRUE);
+    CU_ASSERT(xqc_tt_av.calls == 1);
+    CU_ASSERT(xqc_tt_av.n_certs == 1);
+    CU_ASSERT(xqc_tt_av.leaf_len == der_len);
+    CU_ASSERT(memcmp(xqc_tt_av.leaf, der, der_len) == 0);
+    CU_ASSERT(xqc_tt_av.first_err == 0);
+
+    /* 2. APP_VERIFY + rejecting callback: the ssl library turns the rejection
+     *    into handshake_failure(40), delivered through xqc_tls_send_alert. */
+    memset(&xqc_tt_av, 0, sizeof(xqc_tt_av));
+    xqc_tt_av.ret = -XQC_TLS_INTERNAL;
+    CU_ASSERT(xqc_tt_av_handshake(XQC_TLS_CERT_FLAG_NEED_VERIFY | XQC_TLS_CERT_FLAG_APP_VERIFY,
+                                  XQC_TRUE, &completed) != XQC_OK);
+    CU_ASSERT(completed == XQC_FALSE);
+    CU_ASSERT(xqc_tt_av.calls == 1);
+    CU_ASSERT(xqc_tt_av.first_err == 40);
+
+    /* 3. NEED_VERIFY only (existing users): the ctx-level callback delegates
+     *    to X509_verify_cert, so the legacy per-certificate path rejects the
+     *    self-signed server.crt (18) before any application callback. The
+     *    first error_cb value is the X509 code, not the alert that follows. */
+    memset(&xqc_tt_av, 0, sizeof(xqc_tt_av));
+    xqc_tt_av.ret = XQC_OK;
+    CU_ASSERT(xqc_tt_av_handshake(XQC_TLS_CERT_FLAG_NEED_VERIFY, XQC_TRUE, &completed) != XQC_OK);
+    CU_ASSERT(completed == XQC_FALSE);
+    CU_ASSERT(xqc_tt_av.calls == 0);
+    CU_ASSERT(xqc_tt_av.first_err == X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT);
+
+    /* 4. APP_VERIFY alone (no NEED_VERIFY) + rejecting callback: the flag
+     *    must turn on SSL_VERIFY_PEER by itself, or the ssl library runs
+     *    under verify_mode NONE and silently ignores the rejection
+     *    (fail-open). */
+    memset(&xqc_tt_av, 0, sizeof(xqc_tt_av));
+    xqc_tt_av.ret = -XQC_TLS_INTERNAL;
+    CU_ASSERT(xqc_tt_av_handshake(XQC_TLS_CERT_FLAG_APP_VERIFY, XQC_TRUE, &completed) != XQC_OK);
+    CU_ASSERT(completed == XQC_FALSE);
+    CU_ASSERT(xqc_tt_av.calls == 1);
+    CU_ASSERT(xqc_tt_av.first_err == 40);
+
+    /* 5. APP_VERIFY requested but no cert_verify_cb registered: fail closed
+     *    rather than silently accepting because there is nothing to ask. */
+    memset(&xqc_tt_av, 0, sizeof(xqc_tt_av));
+    xqc_tt_av.ret = XQC_OK;
+    CU_ASSERT(xqc_tt_av_handshake(XQC_TLS_CERT_FLAG_NEED_VERIFY | XQC_TLS_CERT_FLAG_APP_VERIFY,
+                                  XQC_FALSE, &completed) != XQC_OK);
+    CU_ASSERT(completed == XQC_FALSE);
+    CU_ASSERT(xqc_tt_av.calls == 0);
+    CU_ASSERT(xqc_tt_av.first_err == 40);
+
+    /* 6. NEED_VERIFY | ALLOW_SELF_SIGNED, accepting callback: legacy
+     *    contract pin — the self-signed exemption still routes the
+     *    presented chain to the application callback via the per-certificate
+     *    path (xqc_ssl_cert_verify_cb), unaffected by APP_VERIFY. */
+    memset(&xqc_tt_av, 0, sizeof(xqc_tt_av));
+    xqc_tt_av.ret = XQC_OK;
+    CU_ASSERT(xqc_tt_av_handshake(
+        XQC_TLS_CERT_FLAG_NEED_VERIFY | XQC_TLS_CERT_FLAG_ALLOW_SELF_SIGNED,
+        XQC_TRUE, &completed) == XQC_OK);
+    CU_ASSERT(completed == XQC_TRUE);
+    CU_ASSERT(xqc_tt_av.calls == 1);
+    CU_ASSERT(xqc_tt_av.n_certs == 1);
+    CU_ASSERT(xqc_tt_av.first_err == 0);
+}
+
 void xqc_test_destroy_tls_ctx()
 {
     xqc_tls_ctx_destroy(ctx_cli);
@@ -882,7 +1289,7 @@ void xqc_test_destroy_tls_ctx()
 }
 
 void
-xqc_test_tls()
+xqc_test_tls(void)
 {
     xqc_log_callbacks_t log_cb =  xqc_null_log_cb;
     test_log =  xqc_log_init(0, 0, 0, 0, 0, NULL, &log_cb, NULL);
@@ -896,6 +1303,7 @@ xqc_test_tls()
     xqc_test_tls_generic();
     xqc_test_tls_process_truncated_crypto_handshake();
     xqc_test_tls_failure();
+    xqc_test_tls_app_verify();
     
     xqc_test_destroy_tls_ctx();
     xqc_free(test_log);

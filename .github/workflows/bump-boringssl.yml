@@ -3,13 +3,8 @@
 # third_party/boringssl, open a PR bumping the submodule pin so the maintainer
 # notices it.
 #
-# Awareness-first by design: the branch push and PR are done with the default
-# GITHUB_TOKEN. The push starts no run (token pushes don't spawn workflow runs,
-# and the bump branch is not in build.yml's push filter). The PR's opened event
-# DOES create build.yml / CodeQL runs, but GITHUB_TOKEN-created PRs land in an
-# approval-required state and won't execute until a maintainer approves them.
-# Real validation happens at that review and when the mqvpn consumer bumps its
-# xquic pin.
+# The workflow explicitly dispatches Build and CodeQL for a changed pin because
+# events created by GITHUB_TOKEN do not recursively start other workflows.
 name: Bump BoringSSL submodule
 
 on:
@@ -18,6 +13,7 @@ on:
   workflow_dispatch:          # Manual trigger for on-demand checks
 
 permissions:
+  actions: write
   contents: write
   pull-requests: write
 
@@ -31,10 +27,10 @@ jobs:
   bump:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout mqvpn-main (with submodules)
-        uses: actions/checkout@v4
+      - name: Checkout main (with submodules)
+        uses: actions/checkout@v5
         with:
-          ref: mqvpn-main
+          ref: main
           fetch-depth: 0
           submodules: recursive
 
@@ -90,20 +86,21 @@ jobs:
             echo "::warning::current pin ($CURRENT) is not an ancestor of $LATEST — skipping to avoid a downgrade/divergent bump."
             exit 0
           fi
-          branch="chore/bump-boringssl-$LATEST"
+          branch="perf/boringssl-$LATEST"
           git -C third_party/boringssl checkout --quiet "refs/tags/$LATEST"
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -c "$branch"
           git add third_party/boringssl
-          git commit -m "build: bump BoringSSL to $LATEST"
-          # Idempotent push, never forced: reuse an existing bump branch. The PR is
-          # ensured independently below, so a prior run that pushed but failed to
-          # open a PR still gets one on the next run.
-          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
-            echo "Remote branch $branch already exists — reusing it (not pushing)."
+          git commit -m "[=]: Bump BoringSSL to $LATEST"
+          # Refresh a prior bot branch against current main, but only when it
+          # still points at the SHA observed here (guarded force update).
+          remote_sha=$(git ls-remote --heads origin "$branch" | awk '{print $1}')
+          if [ -n "$remote_sha" ]; then
+            git push --force-with-lease="refs/heads/$branch:$remote_sha" \
+              origin "HEAD:refs/heads/$branch"
           else
-            git push origin "$branch"
+            git push origin "HEAD:refs/heads/$branch"
           fi
           echo "changed=true"   >> "$GITHUB_OUTPUT"
           echo "branch=$branch" >> "$GITHUB_OUTPUT"
@@ -120,16 +117,17 @@ jobs:
           # A pushed branch is NOT proof an open PR exists (create could have
           # failed, or a PR was closed without deleting its branch). Check for an
           # open PR independently, then create one only if none is open.
-          existing=$(gh pr list --base mqvpn-main --head "$BRANCH" --state open \
+          existing=$(gh pr list --base main --head "$BRANCH" --state open \
                       --json number --jq '.[0].number // empty')
           if [ -n "$existing" ]; then
             echo "PR #$existing already open for $BRANCH."
             exit 0
           fi
           gh pr create \
-            --base mqvpn-main \
+            --base main \
             --head "$BRANCH" \
-            --title "build: bump BoringSSL $CURRENT → $LATEST" \
+            --draft \
+            --title "[=]: Bump BoringSSL $CURRENT to $LATEST" \
             --body "$(cat <<'BODY'
           ## Auto BoringSSL pin bump
 
@@ -137,14 +135,22 @@ jobs:
           `third_party/boringssl` submodule pin to it. Opened automatically by
           `.github/workflows/bump-boringssl.yml` (weekly, Monday 09:00 JST).
 
-          > Token-authored PR: the branch push starts no run, but the PR's opened
-          > event **creates** `build.yml` / CodeQL runs in an approval-required
-          > state — they will not execute until a maintainer approves them. Approve
-          > the runs (or push a commit) and validate before merge.
+          The workflow dispatches Build and CodeQL explicitly for the bump
+          branch because token-authored events do not recursively start them.
 
           ### Review checklist
           - [ ] Skim the BoringSSL changelog between the old and new tag for API / build breaks
           - [ ] Local build passes against the new pin (`./third_party/boringssl` + xquic)
-          - [ ] mqvpn builds against this xquic SHA (bump the consumer's xquic pin to test)
+          - [ ] mqvpn builds against this xquic SHA before its submodule is updated
           BODY
           )"
+
+      - name: Dispatch validation workflows
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ steps.bump.outputs.branch }}
+        run: |
+          set -euo pipefail
+          gh workflow run build.yml --ref "$BRANCH"
+          gh workflow run codeql-analysis.yml --ref "$BRANCH"

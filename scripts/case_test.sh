@@ -440,6 +440,7 @@ else
 fi
 
 
+
 clear_log
 echo -e "forbidden_header_e2e ...\c"
 ${CLIENT_BIN} -s 5120 -l d -t 1 -E -x 55 >> clog
@@ -499,9 +500,15 @@ clear_log
 echo -e "Reset stream when receiving...\c"
 ${CLIENT_BIN} -s 1024000 -l d -t 1 -E -x 21 > stdlog
 result=`grep "xqc_send_queue_drop_stream_frame_packets" slog`
-flag=`grep "send_state:5|recv_state:5" clog`
+flag=`grep -E "send_state:(3|5)\|recv_state:5" clog`
+acked=`grep "send_state:3|recv_state:5" clog`
 errlog=`grep_err_log|grep -v stream`
-if [ -n "$flag" ] && [ -z "$errlog" ] && [ -n "$result" ]; then
+# The request data can be acknowledged before the response callback runs. In
+# that state RFC 9000 forbids RESET_STREAM, so no queued STREAM frame is
+# dropped; before that transition the original RESET_STREAM path remains legal.
+if [ -n "$flag" ] && [ -z "$errlog" ] \
+    && { { [ -n "$acked" ] && [ -z "$result" ]; } \
+         || { [ -z "$acked" ] && [ -n "$result" ]; }; }; then
     echo ">>>>>>>> pass:1"
     case_print_result "reset_stream_when_receiving" "pass"
 else
@@ -515,7 +522,7 @@ clear_log
 echo -e "Send header after reset stream...\c"
 ${CLIENT_BIN} -s 1024000 -l d -t 1 -E -x 28 > stdlog
 result=`grep "xqc_conn_destroy.*err:0x0" clog`
-flag=`grep "send_state:5|recv_state:5" clog`
+flag=`grep -E "send_state:(3|5)\|recv_state:5" clog`
 errlog=`grep_err_log|grep -v stream`
 if [ -n "$flag" ] && [ -z "$errlog" ] && [ -n "$result" ]; then
     echo ">>>>>>>> pass:1"
@@ -870,6 +877,98 @@ else
     echo "$frame_encoding_err"
 fi
 
+clear_log
+rm -rf tp_localhost test_session xqc_token
+echo -e "active_connection_id_limit accepts minimum value ...\c"
+killall test_server 2> /dev/null
+${SERVER_BIN} -l d -e -x 710 > svr_stdlog &
+sleep 1
+${CLIENT_BIN} -s 1024 -l d -t 1 -E > stdlog 2>&1
+advertised=`grep "\[active-cid-limit-min-test\] advertised_limit:2" svr_stdlog`
+result=`grep ">>>>>>>> pass:1" stdlog`
+tp_err=`grep -E "(conn errno:8|conn_err:8[^0-9])" stdlog`
+errlog=`grep_err_log`
+if [ -z "$errlog" ] && [ -n "$advertised" ] && [ -z "$tp_err" ] \
+    && [ "$result" == ">>>>>>>> pass:1" ]; then
+    echo ">>>>>>>> pass:1"
+    case_print_result "active_cid_limit_minimum_accept" "pass"
+else
+    echo ">>>>>>>> pass:0"
+    case_print_result "active_cid_limit_minimum_accept" "fail"
+    echo "$advertised"
+    echo "$errlog"
+fi
+
+clear_log
+rm -rf tp_localhost test_session xqc_token
+echo -e "active_connection_id_limit rejects value below minimum ...\c"
+killall test_server 2> /dev/null
+${SERVER_BIN} -l d -e -x 709 > svr_stdlog &
+sleep 1
+${CLIENT_BIN} -s 1024 -l d -t 2 -E > stdlog 2>&1
+advertised=`grep "\[active-cid-limit-min-test\] advertised_limit:1" svr_stdlog`
+tp_err=`grep -E "(conn errno:8|conn_err:8[^0-9])" stdlog`
+transport_type=`grep "conn_err_type:1" stdlog`
+req_ok=`grep ">>>>>>>> pass:1" stdlog`
+cid_limit_err=`grep -E "(conn errno:9|conn_err:9[^0-9])" stdlog`
+if [ -n "$advertised" ] && [ -n "$tp_err" ] && [ -n "$transport_type" ] \
+    && [ -z "$req_ok" ] && [ -z "$cid_limit_err" ]; then
+    echo ">>>>>>>> pass:1"
+    case_print_result "active_cid_limit_below_minimum" "pass"
+else
+    echo ">>>>>>>> pass:0"
+    case_print_result "active_cid_limit_below_minimum" "fail"
+    echo "$advertised"
+    echo "$tp_err"
+    echo "$cid_limit_err"
+fi
+
+clear_log
+rm -rf tp_localhost test_session xqc_token
+echo -e "max_ack_delay accepts the largest valid value ...\c"
+killall test_server 2> /dev/null
+${SERVER_BIN} -l d -e -x 714 > svr_stdlog &
+sleep 1
+${CLIENT_BIN} -s 1024 -l d -t 1 -E > stdlog 2>&1
+advertised=`grep "advertised_max_ack_delay:16383" svr_stdlog`
+result=`grep ">>>>>>>> pass:1" stdlog`
+tp_err=`grep -E "(conn errno:8|conn_err:8[^0-9])" stdlog`
+errlog=`grep_err_log`
+if [ -z "$errlog" ] && [ -n "$advertised" ] && [ -z "$tp_err" ] \
+    && [ "$result" == ">>>>>>>> pass:1" ]; then
+    echo ">>>>>>>> pass:1"
+    case_print_result "max_ack_delay_valid_boundary" "pass"
+else
+    echo ">>>>>>>> pass:0"
+    case_print_result "max_ack_delay_valid_boundary" "fail"
+    echo "$advertised"
+    echo "$errlog"
+fi
+
+clear_log
+rm -rf tp_localhost test_session xqc_token
+echo -e "max_ack_delay rejects the first invalid value ...\c"
+killall test_server 2> /dev/null
+${SERVER_BIN} -l d -e -x 713 > svr_stdlog &
+sleep 1
+${CLIENT_BIN} -s 1024 -l d -t 2 -E > stdlog 2>&1
+advertised=`grep "advertised_max_ack_delay:16384" svr_stdlog`
+tp_err=`grep -E "(conn errno:8|conn_err:8[^0-9])" stdlog`
+transport_type=`grep "conn_err_type:1" stdlog`
+req_ok=`grep ">>>>>>>> pass:1" stdlog`
+if [ -n "$advertised" ] && [ -n "$tp_err" ] && [ -n "$transport_type" ] \
+    && [ -z "$req_ok" ]; then
+    echo ">>>>>>>> pass:1"
+    case_print_result "max_ack_delay_invalid_boundary" "pass"
+else
+    echo ">>>>>>>> pass:0"
+    case_print_result "max_ack_delay_invalid_boundary" "fail"
+    echo "$advertised"
+    echo "$tp_err"
+    echo "$transport_type"
+fi
+
+rm -rf tp_localhost test_session xqc_token
 killall test_server 2> /dev/null
 ${SERVER_BIN} -l d -e > /dev/null &
 sleep 1
@@ -1929,6 +2028,48 @@ else
 fi
 grep_err_log
 
+clear_log
+rm -f test_session tp_localhost xqc_token
+echo -e "NAT rebinding PATH_RESPONSE no repair ...\c"
+sudo ${CLIENT_BIN} -s 2048000 -l d -t 5 -M -i lo -i lo -E -n 2 -x 802 -N > stdlog
+client_ret=$?
+result=`grep -a ">>>>>>>> pass:0" stdlog`
+client_pass=`grep -a ">>>>>>>> pass:1" stdlog`
+errlog=`grep -a "\[error\]" clog; grep -a "\[error\]" slog`
+rebind=`grep -a "|path:0|REBINDING|validate NAT rebinding addr|" slog`
+drop_count=`grep -a -c "\[path-response-e2e\]|drop|path:0|ordinal:1|" stdlog`
+sent_pr=`grep -a "|<==|" clog | grep "|path:0|" | grep "frame:.*PATH_RESPONSE" | head -1`
+pr_pkt=`echo "$sent_pr" | sed -n 's/.*|pkt_num:\([0-9]*\)|.*/\1/p'`
+lost_pr=`grep -a "|mark lost|" clog | grep "|pkt_num:$pr_pkt|" | grep "PATH_RESPONSE"`
+bad_repair=`echo "$lost_pr" | grep -v "|repair:0|"`
+origin_pr=`grep -a -E "origin_pktnum:$pr_pkt|origin_pkt_num:$pr_pkt" clog | grep "PATH_RESPONSE"`
+path_response_cnt=`grep -a "|<==|" clog | grep "|path:0|" | grep "frame:.*PATH_RESPONSE" | wc -l`
+if [ "$client_ret" -eq 0 ] && [ -z "$errlog" ] && [ -z "$result" ] && [ -n "$client_pass" ] \
+    && [ -n "$rebind" ] && [ "$drop_count" -eq 1 ] \
+    && [ -n "$sent_pr" ] && [ -n "$pr_pkt" ] && [ -n "$lost_pr" ] \
+    && [ -z "$bad_repair" ] && [ -z "$origin_pr" ] \
+    && [ "$path_response_cnt" -ge 2 ]; then
+    echo ">>>>>>>> pass:1"
+    case_print_result "NAT_rebinding_path_response_not_repaired" "pass"
+else
+    echo ">>>>>>>> pass:0"
+    echo $errlog
+    echo $client_ret
+    echo $result
+    echo $client_pass
+    echo $rebind
+    echo $drop_count
+    echo $sent_pr
+    echo $pr_pkt
+    echo $lost_pr
+    echo $bad_repair
+    echo $origin_pr
+    echo $path_response_cnt
+    case_print_result "NAT_rebinding_path_response_not_repaired" "fail"
+fi
+grep_err_log
+rm -f test_session tp_localhost xqc_token
+
 killall test_server
 ${SERVER_BIN} -l d -e -M -y > /dev/null &
 sleep 1
@@ -2015,8 +2156,8 @@ clear_log
 echo -e "0RTT max_datagram_frame_size is invalid...\c"
 ${CLIENT_BIN} -l d >> stdlog
 cli_result=`grep "|0RTT_transport_params|max_datagram_frame_size:9000|" clog`
-cli_err=`grep "[error].*err:0xe" clog`
-svr_err=`grep "[error].*err:0xe" slog`
+cli_err=`grep "[error].*err:0x55" clog`
+svr_err=`grep "[error].*err:0xa" slog`
 if [ -n "$cli_result" ] && [ -n "$cli_err" ] && [ -n "$svr_err" ]; then
     echo ">>>>>>>> pass:1"
     case_print_result "0rtt_max_datagram_frame_size_is_invalid" "pass"
@@ -3997,7 +4138,7 @@ sleep 1
 clear_log
 echo -e "check_clear_0rtt_ticket_flag_in_close_notify...\c"
 ${CLIENT_BIN} -l d -T 1 -s 4800 -U 1 -Q 65535 -E > stdlog
-cli_res2=`grep "should_clear_0rtt_ticket, conn_err:14, clear_0rtt_ticket:1" stdlog`
+cli_res2=`grep "conn_err:85, clear_0rtt_ticket:1" stdlog`
 errlog=`grep_err_log`
 if [ -n "$cli_res2" ] && [ -n "$errlog" ]; then
     echo ">>>>>>>> pass:1"
@@ -4019,7 +4160,7 @@ sleep 1
 clear_log
 echo -e "check_clear_0rtt_ticket_flag_in_h3_close_notify...\c"
 ${CLIENT_BIN} -l d -s 4800 -Q 65535 -E > stdlog
-cli_res2=`grep "should_clear_0rtt_ticket, conn_err:14, clear_0rtt_ticket:1" stdlog`
+cli_res2=`grep "conn_err:85, clear_0rtt_ticket:1" stdlog`
 errlog=`grep_err_log`
 if [ -n "$cli_res2" ] && [ -n "$errlog" ]; then
     echo ">>>>>>>> pass:1"
@@ -4041,7 +4182,7 @@ sleep 1
 clear_log
 echo -e "check_clear_0rtt_ticket_flag_in_h3_close_notify...\c"
 ${CLIENT_BIN} -l d -s 4800 -Q 65535 -E > stdlog
-cli_res2=`grep "should_clear_0rtt_ticket, conn_err:14, clear_0rtt_ticket:1" stdlog`
+cli_res2=`grep "conn_err:85, clear_0rtt_ticket:1" stdlog`
 errlog=`grep_err_log`
 if [ -n "$cli_res2" ] && [ -n "$errlog" ]; then
     echo ">>>>>>>> pass:1"
@@ -4211,6 +4352,57 @@ if [ -z "$errlog" ] && [ -n "$result" ] && [ -n "$cli_res" ] ; then
 else
     echo ">>>>>>>> pass:0"
     case_print_result "MP_no_reinjection_for_normal_h3_ext_datagrams" "fail"
+fi
+grep_err_log
+
+
+killall test_server
+stdbuf -oL ${SERVER_BIN} -l d -e -Q 65535 -U 1 -x 711 > /dev/null &
+sleep 1
+
+rm -rf tp_localhost test_session xqc_token
+clear_log
+echo -e "PMTUD force enable with peer option omitted...\c"
+sudo ${CLIENT_BIN} -s 1024 -l d -t 1 -E -x 711 -Q 65535 -U 1 -T 1 > stdlog
+sleep 1
+result=`grep "\[dgram\]|recv_dgram_bytes:1024|sent_dgram_bytes:1024|" stdlog`
+probe_res=`grep "\[dgram\]|mss_callback|updated_mss:1404|" stdlog`
+cli_res=`grep -E "xqc_conn_destroy.*enable_pmtud:1" clog`
+svr_res=`grep -E "xqc_conn_destroy.*enable_pmtud:0" slog`
+errlog=`grep_err_log`
+if [ -z "$errlog" ] && [ -n "$result" ] && [ -n "$probe_res" ] \
+    && [ -n "$cli_res" ] && [ -n "$svr_res" ]
+then
+    echo ">>>>>>>> pass:1"
+    case_print_result "PMTUD_force_enable_peer_omits_option" "pass"
+else
+    echo ">>>>>>>> pass:0"
+    case_print_result "PMTUD_force_enable_peer_omits_option" "fail"
+fi
+grep_err_log
+
+killall test_server
+stdbuf -oL ${SERVER_BIN} -l d -e -Q 65535 -U 1 -x 712 > /dev/null &
+sleep 1
+
+rm -rf tp_localhost test_session xqc_token
+clear_log
+echo -e "PMTUD negotiated mode with peer option omitted...\c"
+sudo ${CLIENT_BIN} -s 1024 -l d -t 1 -E -x 712 -Q 65535 -U 1 -T 1 > stdlog
+sleep 1
+result=`grep "\[dgram\]|recv_dgram_bytes:1024|sent_dgram_bytes:1024|" stdlog`
+probe_res=`grep "\[dgram\]|mss_callback|updated_mss:1404|" stdlog`
+cli_res=`grep -E "xqc_conn_destroy.*enable_pmtud:0" clog`
+svr_res=`grep -E "xqc_conn_destroy.*enable_pmtud:0" slog`
+errlog=`grep_err_log`
+if [ -z "$errlog" ] && [ -n "$result" ] && [ -z "$probe_res" ] \
+    && [ -n "$cli_res" ] && [ -n "$svr_res" ]
+then
+    echo ">>>>>>>> pass:1"
+    case_print_result "PMTUD_negotiated_mode_peer_omits_option" "pass"
+else
+    echo ">>>>>>>> pass:0"
+    case_print_result "PMTUD_negotiated_mode_peer_omits_option" "fail"
 fi
 grep_err_log
 
@@ -4790,15 +4982,18 @@ fi
 #
 # Test 1: verify client SENDS repair symbols (grep clog)
 # Test 2: verify server RECEIVES repair symbols (grep slog)
+#
+# Keep this test single-path. Its contract is the frame-type bit, and enabling
+# multipath makes repair delivery depend on asynchronous standby-path setup.
 
 clear_log
 killall test_server 2> /dev/null
-stdbuf -oL ${SERVER_BIN} -l d -e -f -x 700 -M > /dev/null &
+stdbuf -oL ${SERVER_BIN} -l d -e -f -x 700 > /dev/null &
 sleep 1
 
 rm -rf tp_localhost test_session xqc_token
 echo -e "frame_type_bit repair symbol sent (bit 32 non-zero) ...\c"
-sudo ${CLIENT_BIN} -s 5120000 -l d -E -d 30 -g -x 700 -M -i lo -i lo > stdlog
+sudo ${CLIENT_BIN} -s 5120000 -l d -E -d 30 -g -x 700 > stdlog
 clog_repair=`grep 'frame:.*FEC_REPAIR' clog`
 echo_result=`grep ">>>>>>>> pass" stdlog`
 errlog=`grep_err_log`
@@ -4813,12 +5008,12 @@ fi
 
 clear_log
 killall test_server 2> /dev/null
-stdbuf -oL ${SERVER_BIN} -l d -e -f -x 700 -M > /dev/null &
+stdbuf -oL ${SERVER_BIN} -l d -e -f -x 700 > /dev/null &
 sleep 1
 
 rm -rf tp_localhost test_session xqc_token
 echo -e "frame_type_bit repair symbol received (bit 32 non-zero) ...\c"
-sudo ${CLIENT_BIN} -s 5120000 -l d -E -d 30 -g -x 700 -M -i lo -i lo > stdlog
+sudo ${CLIENT_BIN} -s 5120000 -l d -E -d 30 -g -x 700 > stdlog
 slog_repair=`grep 'frame:.*FEC_REPAIR' slog`
 echo_result=`grep ">>>>>>>> pass" stdlog`
 errlog=`grep_err_log`
@@ -5298,11 +5493,59 @@ else
     case_print_result "crypto_error_not_fixed_enum" "fail"
 fi
 
+## RFC 9001 Section 6.6: AEAD confidentiality limits
+
+killall test_server 2> /dev/null
+clear_log
+rm -f test_session xqc_token tp_localhost aead_confidentiality_server.log
+${SERVER_BIN} -l d -e -x 902 > aead_confidentiality_server.log &
+sleep 1
+echo -e "AEAD confidentiality: last permitted packet updates keys ...\c"
+${CLIENT_BIN} -s 1024 -l d -t 1 -E -x 902 > stdlog
+injected=`grep "\[aead-confidentiality-test\]|case:902|" stdlog`
+updated=`grep "|key phase changed to" clog`
+received=`grep "\[aead-confidentiality-test\]|request_received|case:902|" \
+    aead_confidentiality_server.log`
+success=`grep ">>>>>>>> pass:1" stdlog`
+limit_error=`grep "|AEAD confidentiality limit reached|" clog`
+if [ -n "$injected" ] && [ -n "$updated" ] && [ -n "$received" ] \
+    && [ -n "$success" ] && [ -z "$limit_error" ]; then
+    echo ">>>>>>>> pass:1"
+    case_print_result "aead_confidentiality_boundary_updates_keys" "pass"
+else
+    echo ">>>>>>>> pass:0"
+    case_print_result "aead_confidentiality_boundary_updates_keys" "fail"
+fi
+
+killall test_server 2> /dev/null
+clear_log
+rm -f test_session xqc_token tp_localhost aead_confidentiality_server.log
+${SERVER_BIN} -l d -e -x 903 > aead_confidentiality_server.log &
+sleep 1
+echo -e "AEAD confidentiality: exhausted keys reject next packet ...\c"
+${CLIENT_BIN} -s 1024 -l d -t 1 -E -x 903 > stdlog
+injected=`grep "\[aead-confidentiality-test\]|case:903|" stdlog`
+limit_error=`grep "|AEAD confidentiality limit reached|" clog`
+wire_error=`grep "|err:0xf" clog`
+received=`grep "\[aead-confidentiality-test\]|request_received|case:903|" \
+    aead_confidentiality_server.log`
+if [ -n "$injected" ] && [ -n "$limit_error" ] && [ -n "$wire_error" ] \
+    && [ -z "$received" ]; then
+    echo ">>>>>>>> pass:1"
+    case_print_result "aead_confidentiality_exhaustion_stops_sender" "pass"
+else
+    echo ">>>>>>>> pass:0"
+    case_print_result "aead_confidentiality_exhaustion_stops_sender" "fail"
+fi
+
+killall test_server 2> /dev/null
+rm -f aead_confidentiality_server.log
+
 ## RFC 9000 Section 7.4.1: 0-RTT transport parameter validation
 
 # test 701: server reduces max_streams_bidi after first connection,
-# client detects reduction on 0-RTT resumption and closes with
-# TRANSPORT_PARAMETER_ERROR (0x0E = conn_err:14)
+# client detects reduction on 0-RTT resumption, reports its local cleanup
+# reason (0x54 = conn_err:84), and sends TRANSPORT_PARAMETER_ERROR (0x08)
 killall test_server 2> /dev/null
 clear_log
 rm -f test_session xqc_token tp_localhost
@@ -5313,8 +5556,9 @@ sleep 1
 ${CLIENT_BIN} -s 1024 -l d -t 1 -E > stdlog
 # second connection: 0-RTT with reduced max_streams_bidi on server
 ${CLIENT_BIN} -s 1024 -l d -t 1 -E > stdlog
-conn_err=`grep "conn_err:14" stdlog`
-if [ -n "$conn_err" ]; then
+conn_err=`grep "conn_err:84" stdlog`
+peer_err=`grep "[error].*err:0x8" slog`
+if [ -n "$conn_err" ] && [ -n "$peer_err" ]; then
     echo ">>>>>>>> pass:1"
     case_print_result "0RTT_param_reduction" "pass"
 else
@@ -5547,6 +5791,58 @@ killall test_server 2> /dev/null
 rm -f h3_frame_length_server.log
 
 
+## RFC 9114 Sections 7.2.3 and 9 control-frame handling
+
+clear_log
+rm -f test_session xqc_token tp_localhost h3_control_frame_server.log
+stdbuf -oL ${SERVER_BIN} -l d -e -x 1009 > h3_control_frame_server.log &
+sleep 1
+echo -e "HTTP/3 reserved control frame remains usable ...\c"
+${CLIENT_BIN} -s 1024 -l d -t 1 -E -x 1009 > stdlog
+sent=`grep "\\[h3-control-frame-test\\]|type:0x21|write:0|send:0|" \
+    h3_control_frame_server.log`
+received=`grep "ignore unknown frame|type:21|" clog`
+client_ok=`grep "\\[h3-control-frame-test\\]|case:1009|conn_err:0|" stdlog`
+server_ok=`grep "\\[h3-control-frame-test\\]|case:1009|conn_err:0|" \
+    h3_control_frame_server.log`
+result=`grep ">>>>>>>> pass:1" stdlog`
+if [ -n "$sent" ] && [ -n "$received" ] && [ -n "$client_ok" ] \
+    && [ -n "$server_ok" ] && [ -n "$result" ]; then
+    echo ">>>>>>>> pass:1"
+    case_print_result "h3_reserved_control_frame_accepted" "pass"
+else
+    echo ">>>>>>>> pass:0"
+    case_print_result "h3_reserved_control_frame_accepted" "fail"
+fi
+
+killall test_server 2> /dev/null
+clear_log
+rm -f test_session xqc_token tp_localhost h3_control_frame_server.log
+stdbuf -oL ${SERVER_BIN} -l d -e -x 1010 > h3_control_frame_server.log &
+sleep 1
+echo -e "HTTP/3 CANCEL_PUSH above unset maximum gets H3_ID_ERROR ...\c"
+${CLIENT_BIN} -s 1024 -l d -t 1 -E -x 1010 > stdlog
+sent=`grep "\\[h3-control-frame-test\\]|type:0x3|write:0|send:0|" \
+    h3_control_frame_server.log`
+wire_err=`grep "err:0x108" clog`
+client_err=`grep "\\[h3-control-frame-test\\]|case:1010|conn_err:264|" \
+    stdlog`
+server_err=`grep "\\[h3-control-frame-test\\]|case:1010|conn_err:264|" \
+    h3_control_frame_server.log`
+application_type=`grep "conn_err_type:2" stdlog`
+if [ -n "$sent" ] && [ -n "$wire_err" ] && [ -n "$client_err" ] \
+    && [ -n "$server_err" ] && [ -n "$application_type" ]; then
+    echo ">>>>>>>> pass:1"
+    case_print_result "h3_cancel_push_unset_rejected" "pass"
+else
+    echo ">>>>>>>> pass:0"
+    case_print_result "h3_cancel_push_unset_rejected" "fail"
+fi
+
+killall test_server 2> /dev/null
+rm -f h3_control_frame_server.log
+
+
 ## RFC 9114 Sections 4.1.2 and 10.5.1 field-section limits
 
 clear_log
@@ -5606,5 +5902,126 @@ fi
 
 killall test_server 2> /dev/null
 rm -f h3_field_section_server.log
+
+
+## RFC 9114 Sections 4.2 and 4.1.2 field-name validation
+
+clear_log
+rm -f test_session xqc_token tp_localhost
+${SERVER_BIN} -l d -e -x 1013 > /dev/null &
+sleep 1
+echo -e "HTTP/3 lowercase response field name is accepted ...\c"
+${CLIENT_BIN} -G -l d -t 1 -x 1013 >> clog
+lowercase_ok=`grep "lowercase_header_received:1" clog`
+stream_ok=`grep "lowercase_header_request_succeeded:1" clog`
+if [ -n "$lowercase_ok" ] && [ -n "$stream_ok" ]; then
+    echo ">>>>>>>> pass:1"
+    case_print_result "h3_lowercase_response_field_name_accepted" "pass"
+else
+    echo ">>>>>>>> pass:0"
+    case_print_result "h3_lowercase_response_field_name_accepted" "fail"
+fi
+
+killall test_server 2> /dev/null
+clear_log
+rm -f test_session xqc_token tp_localhost
+${SERVER_BIN} -l d -e -x 1014 > /dev/null &
+sleep 1
+echo -e "HTTP/3 uppercase response field name resets only stream ...\c"
+${CLIENT_BIN} -G -l d -n 2 -t 2 -x 1014 >> clog
+stream_error_ok=`grep "uppercase_header_stream_error:1" clog`
+connection_reuse_ok=`grep "post_error_request_succeeded:1" clog`
+transport_error=`grep "conn_err:1" clog`
+if [ -n "$stream_error_ok" ] && [ -n "$connection_reuse_ok" ] \
+    && [ -z "$transport_error" ]; then
+    echo ">>>>>>>> pass:1"
+    case_print_result "h3_uppercase_response_field_name_rejected" "pass"
+else
+    echo ">>>>>>>> pass:0"
+    case_print_result "h3_uppercase_response_field_name_rejected" "fail"
+fi
+
+killall test_server 2> /dev/null
+
+
+# issues #565 / #566 / #567: a frame naming a stream the peer does not own must
+# close the connection with STREAM_STATE_ERROR (0x5) per RFC 9000 section 19.4,
+# section 19.5 and section 19.8. Each case asserts both the server side reason
+# and the error code the client actually observes in CONNECTION_CLOSE, so a
+# generic failure or an unrelated close cannot satisfy it.
+
+function wrong_direction_stream_case() {
+    case_id=$1
+    case_name=$2
+    server_reason=$3
+
+    killall test_server 2> /dev/null
+    clear_log
+    rm -f test_session xqc_token tp_localhost
+    ${SERVER_BIN} -l d -e > /dev/null &
+    sleep 1
+    echo -e "${case_name} ...\c"
+    ${CLIENT_BIN} -s 1024 -l d -t 1 -E -x ${case_id} >> clog
+    sleep 1
+    server_rejected=`grep "${server_reason}" slog`
+    client_close_code=`grep "xqc_parse_conn_close_frame|type:18|err_code:5|" clog`
+    if [ -n "$server_rejected" ] && [ -n "$client_close_code" ]; then
+        echo ">>>>>>>> pass:1"
+        case_print_result "${case_name}" "pass"
+    else
+        echo ">>>>>>>> pass:0"
+        case_print_result "${case_name}" "fail"
+    fi
+    killall test_server 2> /dev/null
+}
+
+wrong_direction_stream_case 705 "reset_stream_on_send_only_stream" \
+    "RESET_STREAM on send-only stream|stream_id:3|"
+
+wrong_direction_stream_case 706 "stop_sending_on_recv_only_stream" \
+    "STOP_SENDING on recv-only stream|stream_id:2|"
+
+wrong_direction_stream_case 707 "stream_frame_on_send_only_stream" \
+    "STREAM frame on send-only stream|stream_id:3|"
+
+wrong_direction_stream_case 708 "stream_frame_on_local_uncreated_stream" \
+    "STREAM frame on locally initiated uncreated stream|stream_id:1|"
+
+killall test_server 2> /dev/null
+
+# QUIC transport stream-reassembly cap. IDs 727/728 avoid the existing
+# 705/706 wrong-direction stream allocations.
+killall test_server 2> /dev/null
+${SERVER_BIN} -l d -e > /dev/null &
+sleep 1
+clear_log
+echo -e "stream reassembly cap happy path ...\c"
+result=`${CLIENT_BIN} -s 2048000 -l d -t 5 -E -d 300 -x 727|grep ">>>>>>>> pass:1"`
+cap_hit=`grep "stream frame buffered count exceed" slog`
+if [ -n "$result" ] && [ -z "$cap_hit" ]; then
+    echo ">>>>>>>> pass:1"
+    case_print_result "stream_reassembly_cap_happy" "pass"
+else
+    echo ">>>>>>>> pass:0"
+    case_print_result "stream_reassembly_cap_happy" "fail"
+fi
+
+killall test_server 2> /dev/null
+${SERVER_BIN} -l d -e -x 728 > /dev/null &
+sleep 1
+clear_log
+echo -e "stream reassembly cap pressure recovery ...\c"
+result=`${CLIENT_BIN} -s 65536 -l d -t 12 -E -d 150 -x 728|grep ">>>>>>>> pass:1"`
+cap_hit=`grep "stream frame buffered count exceed" slog`
+fatal=`grep "fail to process packets" slog`
+if [ -n "$result" ] && [ -n "$cap_hit" ] && [ -z "$fatal" ]; then
+    echo ">>>>>>>> pass:1"
+    case_print_result "stream_reassembly_cap_pressure_recovery" "pass"
+else
+    echo ">>>>>>>> pass:0"
+    case_print_result "stream_reassembly_cap_pressure_recovery" "fail"
+fi
+
+killall test_server 2> /dev/null
 
 cd -

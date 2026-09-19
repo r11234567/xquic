@@ -26,6 +26,9 @@ typedef enum xqc_tls_flag_e {
      */
     XQC_TLS_FLAG_HSK_COMPLETED = 1 << 1,
 
+    /* TLS is processing an incoming NewSessionTicket */
+    XQC_TLS_FLAG_RECV_NST               = 1 << 2,
+
 } xqc_tls_flag_t;
 
 
@@ -35,6 +38,9 @@ typedef struct xqc_tls_s {
 
     /* SSL handler */
     SSL *ssl;
+
+    /* SSL-owned peer transport parameter buffer */
+    const uint8_t              *peer_tp;
 
     /* tls type. instance of client and server got different behaviour */
     xqc_tls_type_t type;
@@ -229,8 +235,11 @@ xqc_tls_init_client_ssl(xqc_tls_t *tls, xqc_tls_config_t *cfg)
         }
     }
 
-    /* set verify if flag set */
-    if (cfg->cert_verify_flag & XQC_TLS_CERT_FLAG_NEED_VERIFY) {
+    /* set verify if flag set. XQC_TLS_CERT_FLAG_APP_VERIFY alone also turns
+     * on SSL_VERIFY_PEER: without it the ssl library would run under
+     * verify_mode NONE and silently ignore whatever cert_verify_cb decided
+     * (fail-open). */
+    if (cfg->cert_verify_flag & (XQC_TLS_CERT_FLAG_NEED_VERIFY | XQC_TLS_CERT_FLAG_APP_VERIFY)) {
         if (X509_VERIFY_PARAM_set1_host(SSL_get0_param(ssl), hostname,
                                         strlen(hostname)) != XQC_SSL_SUCCESS) {
             /* hostname set failed need log */
@@ -377,7 +386,6 @@ fail:
 void
 xqc_tls_process_trans_param(xqc_tls_t *tls)
 {
-    const uint8_t *peer_tp;
     size_t tp_len = 0;
 
     if (tls->flag & XQC_TLS_FLAG_TRANSPORT_PARAM_RCVD) {
@@ -386,14 +394,15 @@ xqc_tls_process_trans_param(xqc_tls_t *tls)
     }
 
     /* get buffer */
-    SSL_get_peer_quic_transport_params(tls->ssl, &peer_tp, &tp_len);
+    tls->peer_tp = NULL;
+    SSL_get_peer_quic_transport_params(tls->ssl, &tls->peer_tp, &tp_len);
     if (tp_len <= 0) {
         return;
     }
 
     /* callback to Transport layer */
     if (tls->cbs->tp_cb) {
-        tls->cbs->tp_cb(peer_tp, tp_len, tls->user_data);
+        tls->cbs->tp_cb(tls->peer_tp, tp_len, tls->user_data);
     }
 
     tls->flag |= XQC_TLS_FLAG_TRANSPORT_PARAM_RCVD;
@@ -591,6 +600,7 @@ xqc_tls_process_crypto_data(xqc_tls_t *tls, xqc_encrypt_level_t level,
     } else {
         /* handshake finished, process NewSessionTicket */
         ret = SSL_process_quic_post_handshake(ssl);
+        tls->flag &= ~XQC_TLS_FLAG_RECV_NST;
 
         if (ret != XQC_SSL_SUCCESS) {
             err = SSL_get_error(ssl, ret);
@@ -692,6 +702,14 @@ xqc_tls_is_key_ready(xqc_tls_t *tls, xqc_encrypt_level_t level, xqc_key_type_t k
 
     return xqc_crypto_is_key_ready(tls->crypto[level], key_type);
 }
+
+
+xqc_encrypt_level_t
+xqc_tls_get_read_level(xqc_tls_t *tls)
+{
+    return (xqc_encrypt_level_t) SSL_quic_read_level(tls->ssl);
+}
+
 
 uint32_t
 xqc_tls_get_cipher_id(SSL *ssl, const SSL_CIPHER *cipher, xqc_encrypt_level_t level,
@@ -850,18 +868,31 @@ xqc_ssl_msg_cb(int write_p, int version, int content_type, const void *buf, size
                SSL *ssl, void *arg)
 {
     xqc_tls_t *tls = (xqc_tls_t *)SSL_get_app_data(ssl);
-    if (content_type == SSL3_RT_HANDSHAKE) {
+
+    if (!write_p) {
+        tls->flag &= ~XQC_TLS_FLAG_RECV_NST;
+    }
+
+    if (content_type == SSL3_RT_HANDSHAKE && len > 0) {
         const unsigned char *p = buf;
+        if (*p == SSL3_MT_NEWSESSION_TICKET && !write_p
+            && tls->type == XQC_TLS_TYPE_CLIENT)
+        {
+            tls->flag |= XQC_TLS_FLAG_RECV_NST;
+        }
+
         if (*p == SSL3_MT_CLIENT_HELLO && !write_p) {
-            // Incoming ClientHello
+            /* Incoming ClientHello. */
             if (tls->cbs->msg_cb) {
-                tls->cbs->msg_cb(XQC_TLS_1_3_CLIENT_HELLO, buf, len, tls->user_data);
+                tls->cbs->msg_cb(XQC_TLS_1_3_CLIENT_HELLO,
+                                 buf, len, tls->user_data);
             }
 
         } else if (*p == SSL3_MT_SERVER_HELLO && write_p) {
-            // Outgoing ServerHello
+            /* Outgoing ServerHello. */
             if (tls->cbs->msg_cb) {
-                tls->cbs->msg_cb(XQC_TLS_1_3_SERVER_HELLO, buf, len, tls->user_data);
+                tls->cbs->msg_cb(XQC_TLS_1_3_SERVER_HELLO,
+                                 buf, len, tls->user_data);
             }
         }
     }
@@ -1031,6 +1062,65 @@ end:
 
 
 int
+xqc_ssl_chain_verify_cb(X509_STORE_CTX *store_ctx, void *arg)
+{
+    (void)arg;
+    int verify_res = XQC_SSL_SUCCESS;
+    size_t certs_array_len = 0;
+    unsigned char *certs_array[XQC_MAX_VERIFY_DEPTH] = {0};
+    size_t certs_len[XQC_MAX_VERIFY_DEPTH] = {0};
+
+    SSL *ssl = X509_STORE_CTX_get_ex_data(store_ctx, SSL_get_ex_data_X509_STORE_CTX_idx());
+    xqc_tls_t *tls = (ssl != NULL) ? (xqc_tls_t *)SSL_get_app_data(ssl) : NULL;
+
+    /* No delegation requested (or no connection to ask): the library decides.
+     * The per-certificate callback and the hostname check run inside
+     * X509_verify_cert exactly as before. No error_cb and no log here: under
+     * verify_mode NONE the ssl library still calls this and ignores the
+     * result, so reporting an error would break the insecure path. */
+    if (tls == NULL) {
+        return X509_verify_cert(store_ctx);
+    }
+    if ((tls->cert_verify_flag & XQC_TLS_CERT_FLAG_APP_VERIFY) == 0) {
+        return X509_verify_cert(store_ctx);
+    }
+
+    /* the application owns the decision: hand over the presented chain */
+    xqc_int_t ret = xqc_ssl_get_certs_array(ssl, store_ctx, certs_array, XQC_MAX_VERIFY_DEPTH,
+                                            &certs_array_len, certs_len);
+    if (ret != XQC_OK) {
+        xqc_log(tls->log, XQC_LOG_ERROR, "|get cert array error|%d|", ret);
+        /* the backend already bounded certs_array_len by our capacity (and
+         * zeroed it on the CERT_CHAIN_TOO_LONG path), so the free below is
+         * safe as-is */
+        verify_res = XQC_SSL_FAIL;
+
+    } else if (tls->cbs->cert_verify_cb == NULL) {
+        xqc_log(tls->log, XQC_LOG_ERROR, "|app verify requested without cert_verify_cb|");
+        verify_res = XQC_SSL_FAIL;
+
+    } else if (tls->cbs->cert_verify_cb((const unsigned char **)certs_array, certs_len,
+                                        certs_array_len, tls->user_data) != XQC_OK)
+    {
+        xqc_log(tls->log, XQC_LOG_ERROR, "|certificate rejected by application|");
+        verify_res = XQC_SSL_FAIL;
+    }
+
+    if (verify_res != XQC_SSL_SUCCESS && X509_STORE_CTX_get_error(store_ctx) == X509_V_OK) {
+        /* only fill in a generic reason when nothing more specific is
+         * already set (e.g. the get-certs failure path above already left
+         * X509_V_ERR_CERT_CHAIN_TOO_LONG in store_ctx). the ssl library maps
+         * whichever error is set to an alert and reports it through
+         * xqc_tls_send_alert -> error_cb; do not notify twice here */
+        X509_STORE_CTX_set_error(store_ctx, X509_V_ERR_APPLICATION_VERIFICATION);
+    }
+
+    xqc_ssl_free_certs_array(certs_array, certs_array_len);
+    return verify_res;
+}
+
+
+int
 xqc_ssl_cert_verify_cb(int ok, X509_STORE_CTX *store_ctx)
 {
     int verify_res = XQC_SSL_SUCCESS;
@@ -1111,9 +1201,11 @@ xqc_ssl_cert_cb(SSL *ssl, void *arg)
     }
 
     hostname = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+    /* RFC 8446 Section 9.2 permits a missing server_name extension. */
     if (NULL == hostname) {
-        xqc_log(tls->log, XQC_LOG_ERROR, "|hostname is NULL");
-        return XQC_SSL_FAIL;
+        xqc_log(tls->log, XQC_LOG_INFO,
+                "|hostname is NULL|use default certificate");
+        goto end;
     }
 
     /* callback to upper layer to get SSL_CTX */
@@ -1203,11 +1295,21 @@ xqc_tls_check_mp_aead_nonce_len(xqc_tls_t *tls, uint8_t multipath_enabled)
     if (!multipath_enabled) {
         return XQC_OK;
     }
-    if (tls == NULL || tls->crypto[XQC_ENC_LEV_1RTT] == NULL) {
-        if (tls != NULL) {
-            xqc_log(tls->log, XQC_LOG_ERROR,
-                    "|mp21|1RTT crypto not installed when nonce-len check requested|");
-        }
+    if (tls == NULL) {
+        return -XQC_TLS_INTERNAL;
+    }
+
+    /* The no-crypto transport parameter selects NID_undef for the test/demo
+     * packet-inspection mode, so there is no AEAD nonce to constrain. Real
+     * cipher suites still take the strict draft-21 check below. */
+    if (tls->no_crypto) {
+        return XQC_OK;
+    }
+
+    if (tls->crypto[XQC_ENC_LEV_1RTT] == NULL) {
+        xqc_log(tls->log, XQC_LOG_ERROR,
+                "|mp21|1RTT crypto not installed when nonce-len check "
+                "requested|");
         return -XQC_TLS_INTERNAL;
     }
     size_t noncelen = tls->crypto[XQC_ENC_LEV_1RTT]->pp_aead.noncelen;
@@ -1266,7 +1368,7 @@ xqc_tls_set_read_secret(SSL *ssl, enum ssl_encryption_level_t level,
     xqc_crypto_t *crypto = tls->crypto[level];
     ret = xqc_crypto_derive_keys(crypto, secret, secret_len, XQC_KEY_TYPE_RX_READ);
     if (ret != XQC_OK) {
-        xqc_log(tls->log, XQC_LOG_ERROR, "|install write key error|level:%d|ret:%d",
+        xqc_log(tls->log, XQC_LOG_ERROR, "|install read key error|level:%d|ret:%d",
                 level, ret);
         return XQC_SSL_FAIL;
     }
@@ -1353,6 +1455,17 @@ xqc_tls_send_alert(SSL *ssl, enum ssl_encryption_level_t level, uint8_t alert)
 
     xqc_log(tls->log, XQC_LOG_ERROR, "|ssl alert|level:%d|alert:%d|error:%s", level,
             alert, ERR_error_string(ERR_get_error(), NULL));
+
+    if (tls->type == XQC_TLS_TYPE_CLIENT
+        && (tls->flag & XQC_TLS_FLAG_RECV_NST)
+        && alert == SSL_AD_ILLEGAL_PARAMETER
+        && tls->cbs->transport_error_cb)
+    {
+        /* RFC 9001 Section 4.6.1 requires PROTOCOL_VIOLATION. */
+        tls->cbs->transport_error_cb(TRA_PROTOCOL_VIOLATION,
+                                     tls->user_data);
+        return XQC_SSL_SUCCESS;
+    }
 
     /* callback to upper layer. */
     if (tls->cbs->error_cb) {

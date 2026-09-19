@@ -39,6 +39,9 @@
 
 #define XQC_DEFAULT_MAX_STREAMS 1024
 
+static void xqc_conn_tls_transport_error_cb(xqc_int_t transport_err,
+    void *user_data);
+
 xqc_conn_settings_t internal_default_conn_settings = {
     .pacing_on = 0,
     .ping_on = 0,
@@ -187,6 +190,8 @@ xqc_server_set_conn_settings(xqc_engine_t *engine, const xqc_conn_settings_t *se
     engine->default_conn_settings.ping_on = settings->ping_on;
     engine->default_conn_settings.so_sndbuf = settings->so_sndbuf;
     engine->default_conn_settings.sndq_packets_used_max = settings->sndq_packets_used_max;
+    engine->default_conn_settings.max_stream_frame_buffered_cnt =
+        settings->max_stream_frame_buffered_cnt;
     engine->default_conn_settings.linger = settings->linger;
     engine->default_conn_settings.spurious_loss_detect_on =
         settings->spurious_loss_detect_on;
@@ -809,6 +814,7 @@ xqc_conn_init_key_update_ctx(xqc_connection_t *conn)
     ctx->first_sent_pktno = 0;
     ctx->first_recv_pktno = 0;
     ctx->enc_pkt_cnt = 0;
+    ctx->aead_confidentiality_limit = 0;
 
     ctx->initiate_time_guard = 0;
 }
@@ -1542,7 +1548,8 @@ xqc_conn_server_on_alpn(xqc_connection_t *conn, const unsigned char *alpn,
         }
 
         conn->conn_flag &= ~XQC_CONN_FLAG_LOCAL_TP_UPDATED;
-        xqc_log(conn->log, XQC_LOG_INFO, "|update tp|max_datagram_frame_size:%ud|",
+        xqc_log(conn->log, XQC_LOG_INFO,
+                "|update tp|max_datagram_frame_size:%ui|",
                 conn->local_settings.max_datagram_frame_size);
     }
 
@@ -1755,7 +1762,7 @@ xqc_conn_destroy(xqc_connection_t *xc)
             ? (xc->first_data_send_time - xc->conn_create_time)
             : 0,
         xqc_monotonic_timestamp() - xc->conn_create_time,
-        xc->key_update_ctx.key_update_cnt, xc->conn_err,
+        xc->key_update_ctx.key_update_cnt, XQC_CONN_ERR_CODE(xc->conn_err),
         xc->conn_close_msg ? xc->conn_close_msg : "", xqc_conn_addr_str(xc),
         xqc_calc_delay(xc->conn_hsk_recv_time, xc->conn_create_time),
         xqc_calc_delay(xc->conn_close_recv_time, xc->conn_create_time),
@@ -1772,7 +1779,7 @@ xqc_conn_destroy(xqc_connection_t *xc)
         conn_stats.send_fec_cnt, xc->fec_ctl ? xc->fec_ctl->fec_recover_pkt_cnt : 0,
         xc->pkt_out_size, xc->max_pkt_out_size, xc->probing_pkt_out_size,
         conn_stats.extern_conn_info, xc->max_acked_po_size,
-        xc->local_settings.enable_pmtud & xc->remote_settings.enable_pmtud,
+        (uint64_t)xc->enable_pmtud,
         xc->conn_avg_close_delay);
     xqc_log_event(xc->log, CON_CONNECTION_CLOSED, xc);
 
@@ -3738,14 +3745,14 @@ end:
 xqc_int_t
 xqc_conn_close_with_error(xqc_connection_t *conn, uint64_t err_code)
 {
-    XQC_CONN_ERR(conn, err_code);
+    XQC_CONN_APP_ERR(conn, err_code);
     return XQC_OK;
 }
 
 xqc_int_t
 xqc_conn_get_errno(xqc_connection_t *conn)
 {
-    return conn->conn_err;
+    return XQC_CONN_ERR_CODE(conn->conn_err);
 }
 
 xqc_conn_err_type_t
@@ -4207,7 +4214,7 @@ xqc_conn_get_stats_internal(xqc_connection_t *conn, xqc_conn_stats_t *conn_stats
         conn_stats->alpn[1] = '1';
     }
 
-    conn_stats->conn_err = (int)conn->conn_err;
+    conn_stats->conn_err = (int)XQC_CONN_ERR_CODE(conn->conn_err);
     conn_stats->early_data_flag = XQC_0RTT_NONE;
     conn_stats->enable_multipath = conn->enable_multipath;
     conn_stats->enable_fec = conn->conn_settings.fec_params.fec_encoder_scheme ? 1 : 0;
@@ -4770,7 +4777,7 @@ xqc_conn_early_data_reject(xqc_connection_t *conn)
  * check retry packet condition first and send retry packet if needed
  */
 xqc_int_t
-xqc_conn_server_accept(xqc_connection_t *c)
+xqc_conn_server_accept(xqc_connection_t *c, xqc_packet_in_t *packet_in)
 {
     xqc_int_t ret = XQC_OK;
     /* check whether to send retry packet */
@@ -4784,7 +4791,13 @@ xqc_conn_server_accept(xqc_connection_t *c)
             xqc_log(c->log, XQC_LOG_INFO, "|check_token fail|conn:%p|%s|", c,
                     xqc_conn_addr_str(c));
             if (c->conn_flag & XQC_CONN_FLAG_RETRY_SENT) {
-                return -XQC_EIGNORE_PKT; /* retry packet already sent */
+                if (packet_in != NULL
+                    && xqc_cid_is_equal(&packet_in->pi_pkt.pkt_dcid, &c->retry_scid) == XQC_OK)
+                {
+                    XQC_CONN_ERR(c, TRA_INVALID_TOKEN);
+                    return -XQC_EPROTO;
+                }
+                return -XQC_EIGNORE_PKT;
             } else {
                 if (c->transport_cbs.conn_retry_packet_condition_check) {
                     if (c->transport_cbs.conn_retry_packet_condition_check(
@@ -4914,11 +4927,25 @@ xqc_conn_add_path_cid_sets(xqc_connection_t *conn, uint32_t start, uint32_t end)
 void
 xqc_conn_try_to_enable_pmtud(xqc_connection_t *conn)
 {
-    uint64_t pmtud_check_bit = conn->conn_type == XQC_CONN_TYPE_SERVER ? 0x2 : 0x1;
+    uint64_t pmtud_check_bit = conn->conn_type == XQC_CONN_TYPE_SERVER
+                               ? XQC_PMTUD_ENABLE_SERVER
+                               : XQC_PMTUD_ENABLE_CLIENT;
     xqc_usec_t now;
-    if (((conn->remote_settings.enable_pmtud & conn->local_settings.enable_pmtud) &
-         pmtud_check_bit) != 0) {
+    if ((conn->local_settings.enable_pmtud & XQC_PMTUD_FORCE_ENABLE)
+        || ((conn->remote_settings.enable_pmtud
+             & conn->local_settings.enable_pmtud
+             & pmtud_check_bit) != 0))
+    {
         conn->enable_pmtud = 1;
+
+        /*
+         * RFC 9000 Section 14.3.1 starts QUIC DPLPMTUD after the
+         * handshake completes. Transport parameters can arrive earlier.
+         */
+        if (!(conn->conn_flag & XQC_CONN_FLAG_HANDSHAKE_COMPLETED)) {
+            return;
+        }
+
         now = xqc_monotonic_timestamp();
         if (conn->enable_multipath) {
             xqc_timer_set(&conn->conn_timer_manager, XQC_TIMER_PMTUD_PROBING, now,
@@ -5047,6 +5074,8 @@ xqc_conn_handshake_complete(xqc_connection_t *conn)
             xqc_conn_early_data_accept(conn);
         }
     }
+
+    xqc_conn_try_to_enable_pmtud(conn);
 
     return XQC_OK;
 }
@@ -5716,9 +5745,12 @@ xqc_conn_process_packet(xqc_connection_t *c, const unsigned char *packet_in_buf,
     const unsigned char *end = packet_in_buf + packet_in_size; /* end of udp datagram */
     xqc_packet_in_t packet;
     unsigned char decrypt_payload[XQC_MAX_PACKET_IN_LEN];
+    xqc_cid_t first_dcid;
+    xqc_bool_t dcid_mismatch;
 
     /* process all QUIC packets in UDP datagram */
     while (pos < end) {
+        dcid_mismatch = XQC_FALSE;
         last_pos = pos;
 
         /* init packet in */
@@ -5726,20 +5758,39 @@ xqc_conn_process_packet(xqc_connection_t *c, const unsigned char *packet_in_buf,
         memset(packet_in, 0, sizeof(*packet_in));
         xqc_packet_in_init(packet_in, pos, end - pos, decrypt_payload,
                            XQC_MAX_PACKET_IN_LEN, recv_time);
+        packet_in->datagram_size = packet_in_size;
 
         packet_in->pi_path_id = XQC_UNKNOWN_PATH_ID;
 
         /* packet_in->pos will update inside */
-        ret = xqc_packet_process_single(c, packet_in);
+        ret = xqc_packet_process_single(
+            c, packet_in, pos == packet_in_buf ? NULL : &first_dcid,
+            &dcid_mismatch);
+        if (ret == XQC_OK && pos == packet_in_buf) {
+            xqc_cid_copy(&first_dcid, &packet_in->pi_pkt.pkt_dcid);
+        }
 
         xqc_conn_log_recvd_packet(c, packet_in, packet_in_size, ret, recv_time);
 
         if (ret == XQC_OK) {
             ret = xqc_conn_on_pkt_processed(c, packet_in, recv_time);
 
+        } else if (dcid_mismatch) {
+            xqc_log(c->log, XQC_LOG_INFO,
+                    "|ignore coalesced packet with different DCID|skip:%uz|",
+                    (size_t)(packet_in->last - packet_in->buf));
+            pos = packet_in->last;
+            ret = XQC_OK;
+            continue;
+
         } else if (xqc_conn_tolerant_error(ret)) {
-            /* ignore the remain bytes */
-            xqc_log(c->log, XQC_LOG_INFO, "|ignore err|%d|", ret);
+            /* ignore the remain bytes. -XQC_EIGNORE_PKT drops are a handled
+             * per-packet condition (e.g. reassembly-cap backpressure) that
+             * can occur once per rejected packet under sustained pressure —
+             * keep them at DEBUG so INFO deployments are not flooded. */
+            xqc_log_level_t lvl =
+                (ret == -XQC_EIGNORE_PKT) ? XQC_LOG_DEBUG : XQC_LOG_INFO;
+            xqc_log(c->log, lvl, "|ignore err|%d|", ret);
             packet_in->pos = packet_in->last;
             ret = XQC_OK;
             goto end;
@@ -6078,28 +6129,13 @@ xqc_conn_ptmud_probing(xqc_connection_t *conn)
     if (conn->conn_state >= XQC_CONN_STATE_CLOSING) {
         xqc_log(conn->log, XQC_LOG_INFO, "|conn closing, cannot send PMTUD probing|");
     }
-    /* probing can only be sent in 0RTT/1RTT packets */
-
-    xqc_pkt_type_t pkt_type = XQC_PTYPE_SHORT_HEADER;
-    if (!(conn->conn_flag & XQC_CONN_FLAG_CAN_SEND_1RTT)) {
-        /* Consulted only here. It used to be computed before this branch, so
-         * every probing round on an established connection made a TLS call
-         * whose answer it then discarded. */
-        int support_0rtt = xqc_conn_is_ready_to_send_early_data(conn);
-        if ((conn->conn_type == XQC_CONN_TYPE_CLIENT) &&
-            (conn->conn_state == XQC_CONN_STATE_CLIENT_INITIAL_SENT) && support_0rtt) {
-            pkt_type = XQC_PTYPE_0RTT;
-            conn->conn_flag |= XQC_CONN_FLAG_HAS_0RTT;
-
-        } else {
-            return;
-        }
-    }
-
-    if (pkt_type == XQC_PTYPE_0RTT && conn->zero_rtt_count >= XQC_PACKET_0RTT_MAX_COUNT) {
+    if (!(conn->conn_flag & XQC_CONN_FLAG_HANDSHAKE_COMPLETED)
+        || !(conn->conn_flag & XQC_CONN_FLAG_CAN_SEND_1RTT))
+    {
         return;
     }
 
+    xqc_pkt_type_t pkt_type = XQC_PTYPE_SHORT_HEADER;
     xqc_list_head_t *pos, *next;
     xqc_path_ctx_t *path;
     xqc_int_t ret = XQC_OK;
@@ -6530,8 +6566,12 @@ xqc_conn_on_recv_retry(xqc_connection_t *conn, xqc_cid_t *retry_scid)
     /* RFC 9000 §7.3: save Retry SCID for later retry_source_connection_id validation */
     xqc_cid_copy(&conn->retry_scid, retry_scid);
 
-    /* change the DCID it uses for sending packets in response to Retry packet. */
+    /*
+     * RFC 9000 Section 17.2.5.1: subsequent packets use the Retry SCID
+     * as their DCID. The final send path reads the per-path DCID.
+     */
     xqc_cid_copy(&conn->dcid_set.current_dcid, retry_scid);
+    xqc_cid_copy(&conn->conn_initial_path->path_dcid, retry_scid);
     xqc_datagram_record_mss(conn);
     /* reset initial keys */
     ret = xqc_tls_reset_initial(conn->tls, conn->version, retry_scid);
@@ -6710,7 +6750,8 @@ xqc_conn_get_local_transport_params(xqc_connection_t *conn,
     params->multipath_version = settings->multipath_version;
     params->init_max_path_id = settings->init_max_path_id;
     params->max_datagram_frame_size = settings->max_datagram_frame_size;
-    params->enable_pmtud = settings->enable_pmtud;
+    /* XQC_PMTUD_FORCE_ENABLE is a local-only sender policy. */
+    params->enable_pmtud = settings->enable_pmtud & XQC_PMTUD_ENABLE_MASK;
 
     params->close_dgram_redundancy = settings->close_dgram_redundancy;
 
@@ -7069,7 +7110,7 @@ xqc_conn_tls_transport_params_cb(const uint8_t *tp, size_t len, void *user_data)
                 "remembered:%ui|new:%ui|",
                 conn->remote_settings.max_datagram_frame_size,
                 params.max_datagram_frame_size);
-        XQC_CONN_ERR(conn, TRA_0RTT_TRANS_PARAMS_ERROR);
+        XQC_CONN_ERR(conn, TRA_0RTT_DGRAM_PARAMS_ERROR);
         return;
     }
 
@@ -7083,7 +7124,7 @@ xqc_conn_tls_transport_params_cb(const uint8_t *tp, size_t len, void *user_data)
     }
 
     xqc_log(conn->log, XQC_LOG_DEBUG,
-            "|1RTT_transport_params|max_datagram_frame_size:%ud|",
+            "|1RTT_transport_params|max_datagram_frame_size:%ui|",
             conn->remote_settings.max_datagram_frame_size);
 
     if ((conn->local_settings.extended_ack_features & XQC_ACK_EXT_FEATURE_BIT_RECV_TS) &&
@@ -7387,6 +7428,10 @@ xqc_conn_tls_cert_verify_cb(const unsigned char *certs[], const size_t cert_len[
                             size_t certs_len, void *user_data)
 {
     xqc_connection_t *conn = (xqc_connection_t *)user_data;
+    if (conn->transport_cbs.cert_verify_cb == NULL) {
+        xqc_log(conn->log, XQC_LOG_ERROR, "|cert verify requested without cert_verify_cb|");
+        return -XQC_TLS_INTERNAL;
+    }
     return conn->transport_cbs.cert_verify_cb(certs, cert_len, certs_len,
                                               conn->user_data);
 }
@@ -7420,6 +7465,16 @@ xqc_conn_tls_error_cb(xqc_int_t tls_err, void *user_data)
     xqc_connection_t *conn = (xqc_connection_t *)user_data;
     xqc_log(conn->log, XQC_LOG_ERROR, "|tls error|0x%xi|", tls_err);
     XQC_CONN_ERR(conn, (tls_err | TRA_CRYPTO_ERROR_BASE));
+}
+
+
+static void
+xqc_conn_tls_transport_error_cb(xqc_int_t transport_err, void *user_data)
+{
+    xqc_connection_t *conn = (xqc_connection_t *)user_data;
+    xqc_log(conn->log, XQC_LOG_ERROR, "|transport error from tls|0x%xi|",
+            transport_err);
+    XQC_CONN_ERR(conn, transport_err);
 }
 
 
@@ -7480,6 +7535,7 @@ const xqc_tls_callbacks_t xqc_conn_tls_cbs = {
     .session_cb = xqc_conn_tls_session_cb,
     .keylog_cb = xqc_conn_tls_keylog_cb,
     .error_cb = xqc_conn_tls_error_cb,
+    .transport_error_cb = xqc_conn_tls_transport_error_cb,
     .hsk_completed_cb = xqc_conn_tls_handshake_completed_cb,
     .cert_cb = xqc_conn_tls_cert_cb,
     .msg_cb = xqc_conn_tls_msg_cb,
@@ -7833,7 +7889,8 @@ xqc_conn_closing_notify(xqc_connection_t *conn)
         if (!(conn->conn_flag & XQC_CONN_FLAG_CLOSING_NOTIFIED)) {
             conn->conn_flag |= XQC_CONN_FLAG_CLOSING_NOTIFIED;
             conn->transport_cbs.conn_closing(conn, &conn->scid_set.user_scid,
-                                             conn->conn_err, conn->user_data);
+                                             XQC_CONN_ERR_CODE(conn->conn_err),
+                                             conn->user_data);
         }
     }
 }
@@ -8039,7 +8096,9 @@ xqc_conn_destroy_ping_notification_list(xqc_connection_t *conn)
 xqc_bool_t
 xqc_conn_should_clear_0rtt_ticket(xqc_int_t conn_err)
 {
-    if (conn_err == TRA_0RTT_TRANS_PARAMS_ERROR) {
+    if (conn_err == TRA_0RTT_TRANS_PARAMS_ERROR
+        || conn_err == TRA_0RTT_DGRAM_PARAMS_ERROR)
+    {
         return XQC_TRUE;
     }
     return XQC_FALSE;

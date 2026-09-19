@@ -22,6 +22,19 @@
 #include "src/tls/xqc_tls.h"
 
 
+/*
+ * Whether stream_id denotes a locally initiated bidirectional stream that has
+ * never been created. xqc_gen_stream_id() post-increments the local stream
+ * counter, so indexes below it have already existed.
+ */
+static inline xqc_int_t
+xqc_stream_local_bidi_uncreated(xqc_connection_t *conn,
+                                xqc_stream_id_t stream_id)
+{
+    return (stream_id >> 2) >= conn->cur_stream_id_bidi_local;
+}
+
+
 static const char *const frame_type_2_str[XQC_FRAME_NUM] = {
     [XQC_FRAME_PADDING] = "PADDING",
     [XQC_FRAME_PING] = "PING",
@@ -110,18 +123,46 @@ xqc_int_t
 xqc_insert_stream_frame(xqc_connection_t *conn, xqc_stream_t *stream,
                         xqc_stream_frame_t *new_frame)
 {
-    /*
-     * CWE-770 mitigation: reject if buffered frame count exceeds cap
-     * (RFC 9000 §21.7). -XQC_ELIMIT is a tolerant error, so the caller drops
-     * the packet WITHOUT acknowledging it and the peer retransmits when there
-     * is room again — backpressure, not data loss, and not a connection close.
-     */
-    if (stream->stream_data_in.buffered_frame_count >= XQC_MAX_STREAM_FRAME_BUFFERED_COUNT) {
-        xqc_log(conn->log, XQC_LOG_WARN,
-                "|stream frame buffered count exceed|stream_id:%ui|count:%ui|limit:%d|",
-                stream->stream_id, stream->stream_data_in.buffered_frame_count,
-                XQC_MAX_STREAM_FRAME_BUFFERED_COUNT);
-        return -XQC_ELIMIT;
+    /* CWE-770 mitigation (RFC 9000 §21.7 stream fragmentation attacks):
+     * bound the number of buffered out-of-order frame nodes per stream,
+     * with one slot held in reserve for a frame that extends the
+     * contiguous prefix (data_offset <= merged_offset_end < data_offset +
+     * data_length). Rejecting prefix-extending retransmissions at the cap
+     * would make the leftmost reassembly hole unfillable — the buffered
+     * beyond-hole frames could never merge or become readable and the
+     * stream would livelock. Beyond-hole frames therefore stop at
+     * (cap - 1) so they cannot consume the reserved slot, and
+     * prefix-extending frames stop at the cap, keeping the hard bound.
+     * The reserved slot cannot be farmed: frames entirely below
+     * merged_offset_end never reach this function (the caller drops them
+     * as already received), zero-length FIN-only frames never qualify as
+     * prefix-extenders (the caller's stream_determined gate stops the
+     * at-final-offset repeats; beyond-hole FIN duplicates stay under the
+     * beyond-hole bound), and every admitted prefix-extender advances
+     * merged_offset_end, making buffered data
+     * readable so the application can drain it. The caller converts the
+     * rejection into a whole-packet unacked drop, not a connection
+     * error. First rejection of an episode logs at WARN, the rest at
+     * DEBUG (a single episode can span thousands of packets). */
+    {
+        uint64_t cap = conn->conn_settings.max_stream_frame_buffered_cnt > 0
+                           ? conn->conn_settings.max_stream_frame_buffered_cnt
+                           : XQC_MAX_STREAM_FRAME_BUFFERED_COUNT;
+        uint64_t buffered = stream->stream_data_in.buffered_frame_count;
+        int extends_prefix =
+            new_frame->data_offset <= stream->stream_data_in.merged_offset_end
+            && new_frame->data_offset + new_frame->data_length
+                > stream->stream_data_in.merged_offset_end;
+
+        if (buffered + (extends_prefix ? 0 : 1) >= cap) {
+            xqc_log_level_t lvl = stream->stream_data_in.cap_reject_logged
+                                      ? XQC_LOG_DEBUG : XQC_LOG_WARN;
+            xqc_log(conn->log, lvl,
+                    "|stream frame buffered count exceed|stream_id:%ui|count:%ui|limit:%ui|",
+                    stream->stream_id, buffered, cap);
+            stream->stream_data_in.cap_reject_logged = 1;
+            return -XQC_ELIMIT;
+        }
     }
 
     /* insert xqc_stream_frame_t into stream->stream_data_in.frames_tailq in order of
@@ -210,6 +251,7 @@ xqc_insert_stream_frame(xqc_connection_t *conn, xqc_stream_t *stream,
 
     /* update buffered resource counter */
     stream->stream_data_in.buffered_frame_count++;
+    stream->stream_data_in.cap_reject_logged = 0;
 
     return XQC_OK;
 }
@@ -360,6 +402,15 @@ xqc_process_frames(xqc_connection_t *conn, xqc_packet_in_t *packet_in)
 {
     xqc_int_t ret;
     unsigned char *last_pos = NULL;
+#ifdef XQC_PING_ATTACK_PROTECT
+    xqc_bool_t first_server_initial;
+
+    first_server_initial =
+        conn->conn_type == XQC_CONN_TYPE_SERVER
+        && conn->conn_state == XQC_CONN_STATE_SERVER_INIT
+        && packet_in->pi_pkt.pkt_type == XQC_PTYPE_INIT
+        && !(conn->conn_flag & XQC_CONN_FLAG_INIT_RECVD);
+#endif
 
     while (packet_in->pos < packet_in->last) {
         last_pos = packet_in->pos;
@@ -530,7 +581,11 @@ xqc_process_frames(xqc_connection_t *conn, xqc_packet_in_t *packet_in)
         }
 
         if (ret != XQC_OK) {
-            xqc_log(conn->log, XQC_LOG_ERROR, "|process frame error|%d|", ret);
+            /* tolerant drops (-XQC_EIGNORE_PKT) are handled conditions,
+             * not errors — keep them out of the ERROR log */
+            xqc_log_level_t lvl =
+                (ret == -XQC_EIGNORE_PKT) ? XQC_LOG_DEBUG : XQC_LOG_ERROR;
+            xqc_log(conn->log, lvl, "|process frame error|%d|", ret);
             return ret;
         }
 
@@ -539,6 +594,22 @@ xqc_process_frames(xqc_connection_t *conn, xqc_packet_in_t *packet_in)
             return -XQC_ESYS;
         }
     }
+
+#ifdef XQC_PING_ATTACK_PROTECT
+    /*
+     * RFC 9000 Section 17.2.2 permits PING in Initial packets and requires
+     * the first client Initial to include CRYPTO.  Check the complete packet
+     * so acceptance does not depend on the relative order of those frames.
+     */
+    if (first_server_initial
+        && (packet_in->pi_frame_types & XQC_FRAME_BIT_PING)
+        && !(packet_in->pi_frame_types & XQC_FRAME_BIT_CRYPTO))
+    {
+        xqc_log(conn->log, XQC_LOG_ERROR,
+                "|first client Initial contains PING without CRYPTO|");
+        return XQC_ERROR;
+    }
+#endif
 
     /*
      * An endpoint MUST treat receipt of a packet containing no frames as a
@@ -628,6 +699,21 @@ xqc_process_stream_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_in)
                 goto free;
             }
 
+        } else if (xqc_stream_local_bidi_uncreated(conn, stream_id)) {
+            /*
+             * RFC 9000 19.8: receiving a STREAM frame for a locally initiated
+             * stream that has not yet been created MUST be treated as a
+             * connection error of type STREAM_STATE_ERROR.  A stream index
+             * below the local counter was created earlier and has since been
+             * closed, so a retransmitted frame for it is still tolerated below.
+             */
+            xqc_log(conn->log, XQC_LOG_ERROR,
+                    "|STREAM frame on locally initiated uncreated stream|stream_id:%ui|",
+                    stream_id);
+            XQC_CONN_ERR(conn, TRA_STREAM_STATE_ERROR);
+            ret = -XQC_EPROTO;
+            goto error;
+
         } else {
             xqc_log(conn->log, XQC_LOG_WARN, "|cannot find stream|stream_id:%ui|",
                     stream_id);
@@ -678,8 +764,40 @@ xqc_process_stream_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_in)
     stream->stream_stats.final_packet_time = xqc_monotonic_timestamp();
     if (stream_frame->data_offset + stream_frame->data_length <=
         stream->stream_data_in.merged_offset_end) {
+        /* Exception: the first FIN-only frame of an empty stream must still
+         * be processed below to record the final size. Gate on
+         * stream_determined, not stream_length == 0: once the final size is
+         * known, a retransmitted FIN-only frame carries no new information,
+         * and admitting it repeatedly would accumulate zero-length frame
+         * nodes without consuming any flow-control credit (unbounded
+         * allocation, CWE-770). */
         if (!(stream_frame->fin && stream_frame->data_length == 0 &&
-              stream->stream_data_in.stream_length == 0)) {
+              !stream->stream_data_in.stream_determined)) {
+            /* A duplicate can arrive while the stream is complete but still
+             * SIZE_KNOWN: the frame that finalized the size may have had
+             * its node rejected by the reassembly cap (final-size state is
+             * recorded before admission), so the post-insert completion
+             * below never ran — and since that packet was dropped unacked,
+             * the peer retransmits into this path. Re-check completion
+             * here so the retransmission repairs the state and wakes the
+             * reader instead of being swallowed as a duplicate. DISCARDED
+             * streams are excluded: stream_create_notify failed, so no
+             * user context exists and the stream must not be re-queued
+             * for reading. This mirrors the post-insert completion block
+             * below, including the FEC timing bookkeeping. */
+            if (stream->stream_data_in.stream_determined
+                && stream->stream_data_in.stream_length ==
+                       stream->stream_data_in.merged_offset_end
+                && stream->stream_state_recv == XQC_RECV_STREAM_ST_SIZE_KNOWN
+                && !(stream->stream_flag & XQC_STREAM_FLAG_DISCARDED))
+            {
+                xqc_stream_recv_state_update(stream, XQC_RECV_STREAM_ST_DATA_RECVD);
+                if (stream->stream_stats.recov_pkt_cnt != 0) {
+                    stream->stream_stats.recv_time_with_fec = xqc_monotonic_timestamp();
+                }
+                stream->stream_stats.stream_recv_time = xqc_monotonic_timestamp();
+                xqc_stream_ready_to_read(stream);
+            }
             xqc_log(
                 conn->log, XQC_LOG_DEBUG,
                 "|already recvd|data_offset:%ui|data_length:%ud|merged_offset_end:%ui|",
@@ -737,10 +855,71 @@ xqc_process_stream_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_in)
         goto free;
     }
 
+    /* Mandatory flow-control validation must run BEFORE the
+     * resource-pressure rejection inside xqc_insert_stream_frame: a frame
+     * past the advertised stream or connection limit is a
+     * FLOW_CONTROL_ERROR connection error (RFC 9000 §4.1) even while the
+     * reassembly buffer is at its cap, and must not be masked by the
+     * tolerant packet drop below. Prospective checks only — the
+     * accounting update after a successful insert is unchanged. */
+    if (stream_frame->data_offset + stream_frame->data_length >
+        stream->stream_flow_ctl.fc_max_stream_data_can_recv)
+    {
+        xqc_log(conn->log, XQC_LOG_ERROR,
+                "|exceed stream flow "
+                "control|stream_max_recv_offset:%ui|fc_max_stream_data_can_recv:%ui|",
+                stream_frame->data_offset + stream_frame->data_length,
+                stream->stream_flow_ctl.fc_max_stream_data_can_recv);
+        XQC_CONN_ERR(conn, TRA_FLOW_CONTROL_ERROR);
+        ret = -XQC_EPROTO;
+        goto error;
+    }
+
+    if (stream_frame->data_offset + stream_frame->data_length >
+            stream->stream_max_recv_offset
+        && conn->conn_flow_ctl.fc_data_recved
+                + (stream_frame->data_offset + stream_frame->data_length
+                   - stream->stream_max_recv_offset)
+            > conn->conn_flow_ctl.fc_max_data_can_recv)
+    {
+        xqc_log(conn->log, XQC_LOG_ERROR,
+                "|exceed conn flow control|fc_data_recved:%ui|fc_max_data_can_recv:%ui|",
+                conn->conn_flow_ctl.fc_data_recved,
+                conn->conn_flow_ctl.fc_max_data_can_recv);
+        XQC_CONN_ERR(conn, TRA_FLOW_CONTROL_ERROR);
+        ret = -XQC_EPROTO;
+        goto error;
+    }
+
     ret = xqc_insert_stream_frame(conn, stream, stream_frame);
     if (ret == -XQC_EDUP_FRAME) {
         ret = XQC_OK;
         goto free;
+
+    } else if (ret == -XQC_ELIMIT
+               && packet_in->pi_pkt.pkt_type == XQC_PTYPE_SHORT_HEADER)
+    {
+        /* Reassembly buffer at capacity and this frame does not extend the
+         * contiguous prefix (see xqc_insert_stream_frame). Treat the whole
+         * packet as if it were lost instead of tearing down the
+         * connection: returning a tolerant error makes
+         * xqc_conn_process_packet skip xqc_conn_on_pkt_processed, so the
+         * packet is never acknowledged — required by RFC 9000 §13.1 (a
+         * packet must not be acked until its STREAM data has been
+         * enqueued) — and the peer retransmits it later, by which time
+         * the buffer has drained via prefix-extending frames. This is a
+         * §21.7 resource-exhaustion mitigation; the previous escalation
+         * closed healthy multipath connections with a bogus
+         * FRAME_ENCODING_ERROR (generic engine error path) under
+         * cross-path reordering. Restricted to short-header packets: they
+         * are always last in a UDP datagram, so the tolerant
+         * skip-rest-of-datagram handling cannot drop coalesced follow-up
+         * packets (RFC 9000 §12.2). An over-cap long-header (0-RTT)
+         * STREAM frame keeps the generic error path, as before. */
+        xqc_log(conn->log, XQC_LOG_DEBUG,
+                "|reassembly buffer full, drop packet unacked|stream_id:%ui|", stream_id);
+        ret = -XQC_EIGNORE_PKT;
+        goto error;
 
     } else if (ret) {
         xqc_log(conn->log, XQC_LOG_ERROR, "|xqc_insert_stream_frame error|stream_id:%ui|",
@@ -832,6 +1011,34 @@ xqc_check_crypto_frame_data_buffer_exceed(xqc_stream_t *stream,
 
     return XQC_OK;
 }
+
+
+xqc_int_t
+xqc_check_crypto_frame_level(xqc_connection_t *conn, xqc_stream_t *stream,
+    xqc_stream_frame_t *stream_frame, xqc_encrypt_level_t current_level)
+{
+    uint64_t frame_end;
+
+    if (stream_frame->data_length == 0
+        || stream->stream_encrypt_level >= current_level)
+    {
+        return XQC_OK;
+    }
+
+    frame_end = stream_frame->data_offset + stream_frame->data_length;
+    if (frame_end <= stream->stream_max_recv_offset) {
+        return XQC_OK;
+    }
+
+    xqc_log(conn->log, XQC_LOG_ERROR,
+            "|CRYPTO data extends previous encryption level|level:%d|"
+            "current_level:%d|frame_end:%ui|received_end:%ui|",
+            stream->stream_encrypt_level, current_level, frame_end,
+            stream->stream_max_recv_offset);
+    XQC_CONN_ERR(conn, TRA_PROTOCOL_VIOLATION);
+    return -XQC_EPROTO;
+}
+
 
 xqc_int_t
 xqc_insert_crypto_frame(xqc_connection_t *conn, xqc_stream_t *stream,
@@ -954,6 +1161,18 @@ xqc_process_crypto_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_in)
     xqc_log(conn->log, XQC_LOG_DEBUG, "|level:%d|", encrypt_level);
 
     xqc_stream_t *stream = conn->crypto_stream[encrypt_level];
+    xqc_encrypt_level_t current_level = xqc_tls_get_read_level(conn->tls);
+
+    /*
+     * RFC 9001 Section 4.1.3: data received at a previously installed
+     * encryption level cannot extend that level's CRYPTO flow.
+     */
+    ret = xqc_check_crypto_frame_level(conn, stream, stream_frame,
+                                       current_level);
+    if (ret != XQC_OK) {
+        xqc_destroy_stream_frame(stream_frame);
+        return ret;
+    }
 
     ret = xqc_insert_crypto_frame(conn, stream, stream_frame);
     if (ret != XQC_OK) {
@@ -961,6 +1180,10 @@ xqc_process_crypto_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_in)
         xqc_destroy_stream_frame(stream_frame);
         return ret;
     }
+
+    stream->stream_max_recv_offset =
+        xqc_max(stream->stream_max_recv_offset,
+                stream_frame->data_offset + stream_frame->data_length);
 
     ret = xqc_read_crypto_stream(stream);
     if (ret < 0) {
@@ -1067,17 +1290,6 @@ xqc_int_t
 xqc_process_ping_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_in)
 {
     xqc_int_t ret;
-#ifdef XQC_PING_ATTACK_PROTECT
-    /* ping frame should not be the first frame in the first initial packet */
-    if (conn->conn_state == XQC_CONN_STATE_SERVER_INIT &&
-        !(conn->conn_flag & XQC_CONN_FLAG_INIT_RECVD)) {
-        xqc_log(
-            conn->log, XQC_LOG_ERROR,
-            "|xqc_process_ping_frame error: ping frame shoud not be the first frame|");
-        return XQC_ERROR;
-    }
-#endif
-
     ret = xqc_parse_ping_frame(packet_in, conn);
     if (ret != XQC_OK) {
         xqc_log(conn->log, XQC_LOG_ERROR, "|xqc_parse_ping_frame error|");
@@ -1323,6 +1535,22 @@ xqc_process_conn_close_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_in)
     xqc_int_t ret;
     uint64_t err_code;
 
+    /*
+     * RFC 9000 Section 12.5: an application CONNECTION_CLOSE frame (0x1d)
+     * MUST only appear in the application data packet number space.
+     */
+    if (packet_in->pos[0] == 0x1d
+        && (packet_in->pi_pkt.pkt_type == XQC_PTYPE_INIT
+            || packet_in->pi_pkt.pkt_type == XQC_PTYPE_HSK))
+    {
+        xqc_log(conn->log, XQC_LOG_ERROR,
+                "|illegal application CONNECTION_CLOSE in %s packet, close "
+                "with PROTOCOL_VIOLATION|",
+                xqc_pkt_type_2_str(packet_in->pi_pkt.pkt_type));
+        XQC_CONN_ERR(conn, TRA_PROTOCOL_VIOLATION);
+        return -XQC_EPROTO;
+    }
+
     ret = xqc_parse_conn_close_frame(packet_in, &err_code, conn);
     if (ret != XQC_OK) {
         xqc_log(conn->log, XQC_LOG_ERROR, "|xqc_parse_conn_close_frame error|");
@@ -1336,7 +1564,12 @@ xqc_process_conn_close_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_in)
     if (err_code) {
         xqc_log(conn->log, XQC_LOG_ERROR, "|with err:0x%xi|", err_code);
         XQC_CONN_CLOSE_MSG(conn, "remote error");
-        XQC_CONN_ERR(conn, err_code);
+        if (conn->conn_err_type == XQC_CONN_ERR_TYPE_APPLICATION) {
+            XQC_CONN_APP_ERR(conn, err_code);
+
+        } else {
+            XQC_CONN_ERR(conn, err_code);
+        }
     } else {
         XQC_CONN_CLOSE_MSG(conn, "remote close");
     }
@@ -1392,6 +1625,22 @@ xqc_process_reset_stream_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_i
             return XQC_OK;
         }
     }
+
+    /*
+     * RFC 9000 Section 4.5: the final size cannot be smaller than the
+     * largest offset of stream data already received.
+     */
+    if (stream->stream_state_recv < XQC_RECV_STREAM_ST_RESET_RECVD
+        && final_size < stream->stream_max_recv_offset)
+    {
+        xqc_log(conn->log, XQC_LOG_ERROR,
+                "|RESET_STREAM final size too small|stream_id:%ui|"
+                "final_size:%ui|max_recv_offset:%ui|",
+                stream_id, final_size, stream->stream_max_recv_offset);
+        XQC_CONN_ERR(conn, TRA_FINAL_SIZE_ERROR);
+        return -XQC_EPROTO;
+    }
+
     stream->stream_err = err_code;
 
     XQC_STREAM_CLOSE_MSG(stream, "remote reset");
@@ -1402,7 +1651,10 @@ xqc_process_reset_stream_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_i
 
     xqc_stream_closing(stream, err_code);
 
-    if (stream->stream_state_send < XQC_SEND_STREAM_ST_RESET_SENT) {
+    /* RFC 9000 Section 3.3: only the sender sends RESET_STREAM. */
+    if (!xqc_stream_is_recv_only(conn->conn_type, stream_id)
+        && stream->stream_state_send < XQC_SEND_STREAM_ST_RESET_SENT)
+    {
         xqc_send_queue_drop_stream_frame_packets(conn, stream_id);
         xqc_write_reset_stream_to_packet(conn, stream, err_code,
                                          stream->stream_send_offset);
@@ -1495,8 +1747,8 @@ xqc_process_data_blocked_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_i
         return XQC_OK;
     }
 
-    new_limit =
-        conn->conn_flow_ctl.fc_data_read + conn->conn_flow_ctl.fc_recv_windows_size;
+    new_limit = xqc_clamp_to_max_flow_ctl(
+        conn->conn_flow_ctl.fc_data_read + conn->conn_flow_ctl.fc_recv_windows_size);
 
     if (new_limit > conn->conn_flow_ctl.fc_max_data_can_recv) {
         conn->conn_flow_ctl.fc_max_data_can_recv = new_limit;
@@ -1562,8 +1814,9 @@ xqc_process_stream_data_blocked_frame(xqc_connection_t *conn, xqc_packet_in_t *p
         return XQC_OK;
     }
 
-    new_limit = stream->stream_data_in.next_read_offset +
-                stream->stream_flow_ctl.fc_stream_recv_window_size;
+    new_limit = xqc_clamp_to_max_flow_ctl(
+        stream->stream_data_in.next_read_offset +
+        stream->stream_flow_ctl.fc_stream_recv_window_size);
 
     if (new_limit > stream->stream_flow_ctl.fc_max_stream_data_can_recv) {
         stream->stream_flow_ctl.fc_max_stream_data_can_recv = new_limit;
@@ -1774,6 +2027,18 @@ xqc_process_new_token_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_in)
 xqc_int_t
 xqc_process_datagram_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_in)
 {
+    /* RFC 9221 Section 5 permits DATAGRAM only with 0-RTT or 1-RTT keys. */
+    if (packet_in->pi_pkt.pkt_type != XQC_PTYPE_0RTT
+        && packet_in->pi_pkt.pkt_type != XQC_PTYPE_SHORT_HEADER)
+    {
+        xqc_log(conn->log, XQC_LOG_ERROR,
+                "|illegal DATAGRAM frame in %s packet, close with "
+                "PROTOCOL_VIOLATION|",
+                xqc_pkt_type_2_str(packet_in->pi_pkt.pkt_type));
+        XQC_CONN_ERR(conn, TRA_PROTOCOL_VIOLATION);
+        return -XQC_EPROTO;
+    }
+
     /* does not support datagram */
     if (conn->local_settings.max_datagram_frame_size == 0) {
         xqc_log(conn->log, XQC_LOG_ERROR,
@@ -1787,12 +2052,11 @@ xqc_process_datagram_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_in)
 
     xqc_int_t ret = xqc_parse_datagram_frame(packet_in, conn, &data_buffer, &data_len);
     if (ret == -XQC_EPROTO) {
-        xqc_log(
-            conn->log, XQC_LOG_ERROR,
-            "|the endpoint receives a DATAGRAM frame larger than max_datagram_frame_size|"
-            "max_datagram_frame_size:%ud|frame_size:%ud|",
-            conn->local_settings.max_datagram_frame_size,
-            data_len + XQC_DATAGRAM_HEADER_BYTES);
+        xqc_log(conn->log, XQC_LOG_ERROR,
+                "|the endpoint receives a DATAGRAM frame larger than max_datagram_frame_size|"
+                "max_datagram_frame_size:%ui|frame_size:%uz|",
+                conn->local_settings.max_datagram_frame_size,
+                data_len + XQC_DATAGRAM_HEADER_BYTES);
         XQC_CONN_ERR(conn, TRA_PROTOCOL_VIOLATION);
         return ret;
     }
