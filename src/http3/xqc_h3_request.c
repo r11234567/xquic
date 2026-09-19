@@ -743,6 +743,12 @@ xqc_h3_request_set_write_notify(xqc_h3_request_t *h3_request, uint8_t enabled)
 
     } else {
         h3_request->h3_stream->flags &= ~XQC_HTTP3_STREAM_NEED_WRITE_NOTIFY;
+        /* Application notifications share writable-list membership with
+         * H3's buffered-frame retries. Remove an otherwise idle stream, but
+         * retain scheduling while H3 still has data to flush. */
+        if (xqc_list_empty(&h3_request->h3_stream->send_buf)) {
+            xqc_stream_shutdown_write(h3_request->h3_stream->stream);
+        }
     }
 
     return XQC_OK;

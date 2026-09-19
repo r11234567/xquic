@@ -997,7 +997,9 @@ xqc_int_t xqc_h3_request_set_write_notify(xqc_h3_request_t *h3_request,
 ```
 Enable or disable application write notifications for a request. Enabling also
 schedules a notification, allowing a paused producer to re-check its low-water
-mark as acknowledgements release queued packets.
+mark as acknowledgements release queued packets. Disabling removes an otherwise
+idle transport stream from writable scheduling; H3-internal buffered-frame
+retries remain scheduled.
 
 #### xqc_h3_request_recv_headers
 ```

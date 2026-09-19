@@ -2999,6 +2999,7 @@ xqc_test_h3_backpressure_api()
     xqc_h3_request_t h3r = {0};
     h3s.stream = stream;
     h3r.h3_stream = &h3s;
+    xqc_init_list_head(&h3s.send_buf);
 
     uint64_t saved_used = conn->conn_send_queue->sndq_packets_used;
     size_t saved_size = conn->pkt_out_size;
@@ -3017,6 +3018,16 @@ xqc_test_h3_backpressure_api()
     CU_ASSERT(stream->stream_flag & XQC_STREAM_FLAG_READY_TO_WRITE);
     CU_ASSERT_EQUAL(xqc_h3_request_set_write_notify(&h3r, 0), XQC_OK);
     CU_ASSERT((h3s.flags & XQC_HTTP3_STREAM_NEED_WRITE_NOTIFY) == 0);
+    CU_ASSERT((stream->stream_flag & XQC_STREAM_FLAG_READY_TO_WRITE) == 0);
+
+    xqc_list_head_t pending_h3_buf;
+    xqc_init_list_head(&pending_h3_buf);
+    xqc_list_add_tail(&pending_h3_buf, &h3s.send_buf);
+    CU_ASSERT_EQUAL(xqc_h3_request_set_write_notify(&h3r, 1), XQC_OK);
+    CU_ASSERT_EQUAL(xqc_h3_request_set_write_notify(&h3r, 0), XQC_OK);
+    CU_ASSERT(stream->stream_flag & XQC_STREAM_FLAG_READY_TO_WRITE);
+    xqc_list_del_init(&pending_h3_buf);
+    xqc_stream_shutdown_write(stream);
 
     conn->conn_send_queue->sndq_packets_used = saved_used;
     conn->pkt_out_size = saved_size;
