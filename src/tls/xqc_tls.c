@@ -1295,11 +1295,21 @@ xqc_tls_check_mp_aead_nonce_len(xqc_tls_t *tls, uint8_t multipath_enabled)
     if (!multipath_enabled) {
         return XQC_OK;
     }
-    if (tls == NULL || tls->crypto[XQC_ENC_LEV_1RTT] == NULL) {
-        if (tls != NULL) {
-            xqc_log(tls->log, XQC_LOG_ERROR,
-                    "|mp21|1RTT crypto not installed when nonce-len check requested|");
-        }
+    if (tls == NULL) {
+        return -XQC_TLS_INTERNAL;
+    }
+
+    /* The no-crypto transport parameter selects NID_undef for the test/demo
+     * packet-inspection mode, so there is no AEAD nonce to constrain. Real
+     * cipher suites still take the strict draft-21 check below. */
+    if (tls->no_crypto) {
+        return XQC_OK;
+    }
+
+    if (tls->crypto[XQC_ENC_LEV_1RTT] == NULL) {
+        xqc_log(tls->log, XQC_LOG_ERROR,
+                "|mp21|1RTT crypto not installed when nonce-len check "
+                "requested|");
         return -XQC_TLS_INTERNAL;
     }
     size_t noncelen = tls->crypto[XQC_ENC_LEV_1RTT]->pp_aead.noncelen;

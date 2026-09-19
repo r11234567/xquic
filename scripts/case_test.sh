@@ -500,9 +500,15 @@ clear_log
 echo -e "Reset stream when receiving...\c"
 ${CLIENT_BIN} -s 1024000 -l d -t 1 -E -x 21 > stdlog
 result=`grep "xqc_send_queue_drop_stream_frame_packets" slog`
-flag=`grep "send_state:5|recv_state:5" clog`
+flag=`grep -E "send_state:(3|5)\|recv_state:5" clog`
+acked=`grep "send_state:3|recv_state:5" clog`
 errlog=`grep_err_log|grep -v stream`
-if [ -n "$flag" ] && [ -z "$errlog" ] && [ -n "$result" ]; then
+# The request data can be acknowledged before the response callback runs. In
+# that state RFC 9000 forbids RESET_STREAM, so no queued STREAM frame is
+# dropped; before that transition the original RESET_STREAM path remains legal.
+if [ -n "$flag" ] && [ -z "$errlog" ] \
+    && { { [ -n "$acked" ] && [ -z "$result" ]; } \
+         || { [ -z "$acked" ] && [ -n "$result" ]; }; }; then
     echo ">>>>>>>> pass:1"
     case_print_result "reset_stream_when_receiving" "pass"
 else
@@ -516,7 +522,7 @@ clear_log
 echo -e "Send header after reset stream...\c"
 ${CLIENT_BIN} -s 1024000 -l d -t 1 -E -x 28 > stdlog
 result=`grep "xqc_conn_destroy.*err:0x0" clog`
-flag=`grep "send_state:5|recv_state:5" clog`
+flag=`grep -E "send_state:(3|5)\|recv_state:5" clog`
 errlog=`grep_err_log|grep -v stream`
 if [ -n "$flag" ] && [ -z "$errlog" ] && [ -n "$result" ]; then
     echo ">>>>>>>> pass:1"

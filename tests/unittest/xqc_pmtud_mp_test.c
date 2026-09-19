@@ -291,7 +291,8 @@ xqc_test_pmtud_probing_stays_armed_when_nothing_probed(void)
     CU_ASSERT_PTR_NOT_NULL_FATAL(conn);
 
     /* Reach the probe loop: without this the function returns before it. */
-    conn->conn_flag |= XQC_CONN_FLAG_CAN_SEND_1RTT;
+    conn->conn_flag |= XQC_CONN_FLAG_HANDSHAKE_COMPLETED
+                       | XQC_CONN_FLAG_CAN_SEND_1RTT;
 
     /* Validating, not active: no probe is written, so the fixture needs no
      * send queue. */
@@ -455,7 +456,8 @@ xqc_test_pmtud_convergence_arms_raise_timer(void)
 {
     xqc_connection_t *conn = pmtud_test_conn();
     CU_ASSERT_PTR_NOT_NULL_FATAL(conn);
-    conn->conn_flag |= XQC_CONN_FLAG_CAN_SEND_1RTT;
+    conn->conn_flag |= XQC_CONN_FLAG_HANDSHAKE_COMPLETED
+                       | XQC_CONN_FLAG_CAN_SEND_1RTT;
 
     /* Converged: the remaining range is under the 10B search granularity. A
      * VALIDATING path would be skipped entirely, so this one is active but has
@@ -542,7 +544,8 @@ xqc_test_pmtud_raise_skips_path_at_ceiling(void)
 {
     xqc_connection_t *conn = pmtud_test_conn();
     CU_ASSERT_PTR_NOT_NULL_FATAL(conn);
-    conn->conn_flag |= XQC_CONN_FLAG_CAN_SEND_1RTT;
+    conn->conn_flag |= XQC_CONN_FLAG_HANDSHAKE_COMPLETED
+                       | XQC_CONN_FLAG_CAN_SEND_1RTT;
 
     xqc_path_ctx_t *path = pmtud_test_path(conn, 0, XQC_TEST_PMTU_CEILING,
                                            XQC_TEST_PMTU_CEILING, 1);
