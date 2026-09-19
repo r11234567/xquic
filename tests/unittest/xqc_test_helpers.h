@@ -69,8 +69,8 @@ void xqc_test_helper_path_destroy(struct xqc_path_ctx_s *path);
 
 /* L5d send-side test helpers (PR7).
  *
- * Walk conn->conn_send_queue->sndq_send_packets_high_pri AND
- * sndq_send_packets looking for a queued xqc_packet_out_t whose
+ * Walk the connection's high-priority, urgent, and normal send queues looking
+ * for a queued xqc_packet_out_t whose
  * po_frame_types intersects `frame_bit`. find_ returns the first such
  * packet (or NULL); count_ returns the total count across both queues.
  *

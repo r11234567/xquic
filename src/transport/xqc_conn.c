@@ -2859,8 +2859,16 @@ xqc_conn_send_packets_batch(xqc_connection_t *conn)
                                     XQC_SEND_TYPE_NORMAL_HIGH_PRI);
     }
 
-    head = &conn->conn_send_queue->sndq_send_packets;
+    head = &conn->conn_send_queue->sndq_send_packets_urgent;
     congest = 1;
+    xqc_list_for_each_safe(pos, next, &conn->conn_paths_list)
+    {
+        path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
+        xqc_path_send_packets_batch(conn, path, head, congest,
+                                    XQC_SEND_TYPE_NORMAL_URGENT);
+    }
+
+    head = &conn->conn_send_queue->sndq_send_packets;
     xqc_list_for_each_safe(pos, next, &conn->conn_paths_list)
     {
         path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
@@ -2965,6 +2973,13 @@ xqc_conn_send_packets(xqc_connection_t *conn)
     }
 
     congest = 1;
+    head = &conn->conn_send_queue->sndq_send_packets_urgent;
+    xqc_list_for_each_safe(pos, next, &conn->conn_paths_list)
+    {
+        path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
+        xqc_path_send_packets(conn, path, head, congest, XQC_SEND_TYPE_NORMAL_URGENT);
+    }
+
     head = &conn->conn_send_queue->sndq_send_packets;
     xqc_list_for_each_safe(pos, next, &conn->conn_paths_list)
     {
@@ -3343,6 +3358,9 @@ xqc_conn_schedule_packets_to_paths(xqc_connection_t *conn)
 
     head = &conn->conn_send_queue->sndq_send_packets_high_pri;
     xqc_conn_schedule_packets(conn, head, XQC_FALSE, XQC_SEND_TYPE_NORMAL_HIGH_PRI);
+
+    head = &conn->conn_send_queue->sndq_send_packets_urgent;
+    xqc_conn_schedule_packets(conn, head, XQC_TRUE, XQC_SEND_TYPE_NORMAL_URGENT);
 
     /* try to reinject unacked packets if paths still have cwnd */
     if (conn->conn_settings.mp_enable_reinjection & XQC_REINJ_UNACK_BEFORE_SCHED) {
@@ -6450,7 +6468,8 @@ xqc_need_reassemble_packet(xqc_packet_out_t *packet_out)
 }
 
 static xqc_int_t
-xqc_conn_reassemble_packet(xqc_connection_t *conn, xqc_packet_out_t *ori_po)
+xqc_conn_reassemble_packet(xqc_connection_t *conn, xqc_packet_out_t *ori_po,
+                           xqc_stream_priority_t priority)
 {
     xqc_packet_out_t *new_po = xqc_write_new_packet(conn, ori_po->po_pkt.pkt_type);
     if (new_po == NULL) {
@@ -6501,8 +6520,13 @@ xqc_conn_reassemble_packet(xqc_connection_t *conn, xqc_packet_out_t *ori_po)
     /* set RESEND flag */
     new_po->po_flag |= XQC_POF_RESEND;
 
-    if (new_po->po_frame_types & XQC_FRAME_BIT_CRYPTO) {
+    if ((new_po->po_frame_types & XQC_FRAME_BIT_CRYPTO)
+        || priority == XQC_STREAM_PRI_HIGH)
+    {
         xqc_send_queue_move_to_high_pri(&new_po->po_list, conn->conn_send_queue);
+
+    } else if (priority == XQC_STREAM_PRI_URGENT) {
+        xqc_send_queue_move_to_urgent(&new_po->po_list, conn->conn_send_queue);
     }
 
     xqc_log(conn->log, XQC_LOG_DEBUG, "|pkt_num:%ui|ptype:%d|frames:%s|",
@@ -6513,23 +6537,15 @@ xqc_conn_reassemble_packet(xqc_connection_t *conn, xqc_packet_out_t *ori_po)
 }
 
 static xqc_int_t
-xqc_conn_resend_packets(xqc_connection_t *conn)
+xqc_conn_resend_packets_from_list(xqc_connection_t *conn, xqc_list_head_t *head,
+                                  xqc_stream_priority_t priority)
 {
-    /*
-     * Generate new header and reassemble packet for Initial and 0-RTT packets
-     * that need to be resent, and drop all old packets with the original header.
-     *
-     * TODO: Refactoring packet generation: generate packet header before sent.
-     * Then we don't have to reassemble the packets.
-     */
-
     xqc_int_t ret;
     xqc_send_queue_t *send_queue = conn->conn_send_queue;
-
     xqc_list_head_t *pos, *next;
     xqc_packet_out_t *packet_out;
 
-    xqc_list_for_each_safe(pos, next, &send_queue->sndq_send_packets)
+    xqc_list_for_each_safe(pos, next, head)
     {
         packet_out = xqc_list_entry(pos, xqc_packet_out_t, po_list);
 
@@ -6539,7 +6555,7 @@ xqc_conn_resend_packets(xqc_connection_t *conn)
 
         /* reassemble new packet with updated header and insert to send queue */
         if (xqc_need_reassemble_packet(packet_out)) {
-            ret = xqc_conn_reassemble_packet(conn, packet_out);
+            ret = xqc_conn_reassemble_packet(conn, packet_out, priority);
             if (ret != XQC_OK) {
                 xqc_log(conn->log, XQC_LOG_ERROR,
                         "|xqc_conn_reassemble_packet error|ret:%d|", ret);
@@ -6554,6 +6570,33 @@ xqc_conn_resend_packets(xqc_connection_t *conn)
     }
 
     return XQC_OK;
+}
+
+static xqc_int_t
+xqc_conn_resend_packets(xqc_connection_t *conn)
+{
+    /*
+     * Generate new header and reassemble packet for Initial and 0-RTT packets
+     * that need to be resent, and drop all old packets with the original header.
+     *
+     * TODO: Refactoring packet generation: generate packet header before sent.
+     * Then we don't have to reassemble the packets.
+     */
+    xqc_send_queue_t *send_queue = conn->conn_send_queue;
+    xqc_int_t ret = xqc_conn_resend_packets_from_list(
+        conn, &send_queue->sndq_send_packets_high_pri, XQC_STREAM_PRI_HIGH);
+    if (ret != XQC_OK) {
+        return ret;
+    }
+
+    ret = xqc_conn_resend_packets_from_list(
+        conn, &send_queue->sndq_send_packets_urgent, XQC_STREAM_PRI_URGENT);
+    if (ret != XQC_OK) {
+        return ret;
+    }
+
+    return xqc_conn_resend_packets_from_list(
+        conn, &send_queue->sndq_send_packets, XQC_STREAM_PRI_NORMAL);
 }
 
 xqc_int_t

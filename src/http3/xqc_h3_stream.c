@@ -2513,6 +2513,9 @@ xqc_h3_stream_set_priority(xqc_h3_stream_t *h3s, xqc_h3_priority_t *prio)
 
         if (h3s->priority.fastpath) {
             xqc_stream_set_priority(h3s->stream, XQC_STREAM_PRI_HIGH);
+
+        } else if (h3s->priority.urgency <= 1) {
+            xqc_stream_set_priority(h3s->stream, XQC_STREAM_PRI_URGENT);
         }
         xqc_stream_set_multipath_usage(h3s->stream, h3s->priority.schedule,
                                        h3s->priority.reinject);

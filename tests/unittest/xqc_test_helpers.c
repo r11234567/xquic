@@ -215,6 +215,11 @@ xqc_test_find_packet_with_frame(xqc_connection_t *conn, uint64_t frame_bit)
     if (hit) {
         return hit;
     }
+    hit = xqc_test_scan_list_for_frame(
+        &conn->conn_send_queue->sndq_send_packets_urgent, frame_bit, NULL);
+    if (hit) {
+        return hit;
+    }
     return xqc_test_scan_list_for_frame(&conn->conn_send_queue->sndq_send_packets,
                                         frame_bit, NULL);
 }
@@ -227,6 +232,8 @@ xqc_test_count_packets_with_frame(xqc_connection_t *conn, uint64_t frame_bit)
         return 0;
     }
     (void)xqc_test_scan_list_for_frame(&conn->conn_send_queue->sndq_send_packets_high_pri,
+                                       frame_bit, &n);
+    (void)xqc_test_scan_list_for_frame(&conn->conn_send_queue->sndq_send_packets_urgent,
                                        frame_bit, &n);
     (void)xqc_test_scan_list_for_frame(&conn->conn_send_queue->sndq_send_packets,
                                        frame_bit, &n);

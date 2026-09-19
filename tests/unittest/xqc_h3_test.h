@@ -82,5 +82,8 @@ void xqc_test_h3_uppercase_field_name_stream_rejected();
 /* RFC 9114 §4.3 pseudo-header field ordering */
 void xqc_test_h3_pseudo_header_order_accepted();
 void xqc_test_h3_pseudo_header_after_regular_rejected();
+void xqc_test_h3_priority_bounded_parse();
+void xqc_test_h3_priority_queue_class();
+void xqc_test_h3_backpressure_api();
 
 #endif // XQUIC_XQC_H3_TEST_H

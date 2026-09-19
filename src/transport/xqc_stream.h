@@ -67,6 +67,9 @@ typedef enum {
     XQC_STREAM_PRI_DEFAULT = 0,
     XQC_STREAM_PRI_HIGH = 1,
     XQC_STREAM_PRI_NORMAL = 2,
+    /* RFC 9218 urgency class. Scheduled before normal application data, but
+     * unlike HIGH/fastpath it remains subject to congestion control and pacing. */
+    XQC_STREAM_PRI_URGENT = 3,
 } xqc_stream_priority_t;
 
 typedef struct {

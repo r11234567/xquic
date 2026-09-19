@@ -41,6 +41,7 @@ typedef enum {
 typedef enum {
     XQC_SEND_TYPE_NORMAL,
     XQC_SEND_TYPE_NORMAL_HIGH_PRI,
+    XQC_SEND_TYPE_NORMAL_URGENT,
     XQC_SEND_TYPE_RETRANS,
     XQC_SEND_TYPE_PTO_PROBE,
     XQC_SEND_TYPE_N,
@@ -377,5 +378,4 @@ double xqc_path_recent_loss_rate(xqc_path_ctx_t *path);
 double xqc_conn_recent_loss_rate(xqc_connection_t *conn);
 
 #endif /* XQC_MULTIPATH_H */
-
 
