@@ -27,7 +27,6 @@ void xqc_test_wlb_soft_pin_no_repin_on_block(void);
 /* I2 Symmetric multi-flow: flows distribute across paths (no convergence
  *    to paths[0]). */
 void xqc_test_wlb_sym_multiflow_distributes(void);
-void xqc_test_wlb_asym_pin_follows_weight_ratio(void);
 
 /* Recovery-prefer must NOT fire when the secondary path simply appears for
  * the first time (initial 2nd-path setup is not a recovery event). */
@@ -59,30 +58,47 @@ void xqc_test_wlb_new_path_detected_without_expire_throttle(void);
  * flow whose replica's po_path_id equals the pinned path. */
 void xqc_test_wlb_reinject_bypasses_pin(void);
 
-/* A pinned flow's packets must consume WRR quantum. The flow-hit fast path
- * used to return before touching deficit, so on a fully-pinned tunnel the
- * deficits described only the unpinned minority and the weighted ratio was
- * applied to a rounding error. */
-void xqc_test_wlb_pinned_traffic_consumes_deficit(void);
-
-/* ...and the debt one burst can run up is clamped, so the correction stays
- * proportional to the imbalance rather than to how long it went unobserved. */
-void xqc_test_wlb_deficit_debt_is_bounded(void);
-void xqc_test_wlb_debt_floor_preserves_imbalance(void);
-
-/* LATE weights must track live path state. They used to be recomputed only at
- * a WRR round boundary, which a fully-pinned tunnel never reaches, freezing
- * them at the cwnd skew of the connection's first few packets. */
-void xqc_test_wlb_weights_refresh_off_the_round_boundary(void);
-
-/* The consecutive-PTO guard is a preference between paths, not an absolute
- * exclusion: it must never refuse the last usable path. ctl_pto_count is
- * cleared only by an incoming ACK, so a path nothing is sent on can never
- * clear it, and excluding the sole survivor deadlocks the connection. */
+/* Hybrid TCP lane bytes are QUIC STREAM data with po_flow_hash == 0, and
+ * they take the MinRTT fallback, not WRR. One ordered byte sequence has
+ * nothing to gain from a second estimator on top of cwnd, and every packet
+ * placed on a higher-RTT path is a reassembly hole with no deadline layer
+ * under it. MinRTT still aggregates: the cwnd gate spills once the near path
+ * is full. See xqc_wlb_scheduler_get_path for the measurements. */
+void xqc_test_wlb_stream_data_prefers_lowest_srtt(void);
+void xqc_test_wlb_stream_data_spills_when_primary_is_full(void);
+void xqc_test_wlb_path_replacement_refreshes_cache(void);
+void xqc_test_wlb_control_packets_use_minrtt(void);
+void xqc_test_wlb_evicted_path_gets_recovery_probe(void);
+void xqc_test_wlb_evicted_probe_rotates_past_blocked_path(void);
+void xqc_test_wlb_stream_data_never_rides_a_blackholed_path(void);
+void xqc_test_wlb_blackholed_path_does_not_stall_rounds(void);
+void xqc_test_wlb_unpinned_blackhole_refreshes_topology(void);
+void xqc_test_wlb_routine_path_event_preserves_round(void);
+void xqc_test_wlb_measured_goodput_ignores_loss_penalty(void);
+void xqc_test_wlb_idle_path_goodput_decays(void);
+void xqc_test_wlb_warmed_zero_goodput_ignores_stale_estimate(void);
+void xqc_test_wlb_equal_goodput_is_balanced(void);
+void xqc_test_wlb_bloated_path_sheds_weight(void);
+void xqc_test_wlb_four_to_one_goodput_after_acked_warmup(void);
+void xqc_test_wlb_new_path_gets_warmup_floor(void);
+void xqc_test_wlb_steady_path_gets_exploration_floor(void);
+void xqc_test_wlb_active_time_ends_warmup(void);
+void xqc_test_wlb_idle_time_does_not_end_warmup(void);
+void xqc_test_wlb_app_limited_path_is_weighted_by_capacity(void);
+void xqc_test_wlb_goodput_sample_ignores_sub_interval_burst(void);
+void xqc_test_wlb_path_stats_snapshot(void);
+void xqc_test_wlb_pinned_flow_refreshes_delivery_sample(void);
+void xqc_test_wlb_warmup_time_only_credits_selected_path(void);
+void xqc_test_wlb_topology_refresh_clears_packet_deficit(void);
+void xqc_test_wlb_topology_refresh_clears_pin_deficit(void);
+void xqc_test_wlb_ewma_uses_exact_seven_eighths_history(void);
+void xqc_test_wlb_loss_above_two_percent_downweights_path(void);
+void xqc_test_wlb_control_delivery_does_not_advance_learning(void);
+void xqc_test_wlb_application_delivery_advances_learning(void);
+void xqc_test_wlb_rejected_0rtt_does_not_advance_learning(void);
+void xqc_test_wlb_duplicate_ack_counts_application_once(void);
+void xqc_test_wlb_asym_pin_follows_weight_ratio(void);
 void xqc_test_wlb_last_path_over_pto_still_schedules(void);
-
-/* ...while still steering away from an apparently-blackholed path whenever a
- * healthy one is available. */
 void xqc_test_wlb_prefers_healthy_path_over_pto_blocked(void);
 
 #endif /* XQC_WLB_TEST_H_INCLUDED */

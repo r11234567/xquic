@@ -5990,7 +5990,8 @@ wrong_direction_stream_case 708 "stream_frame_on_local_uncreated_stream" \
 killall test_server 2> /dev/null
 
 # QUIC transport stream-reassembly cap. IDs 727/728 avoid the existing
-# 705/706 wrong-direction stream allocations.
+# 705/706 wrong-direction stream allocations. The happy path uses the
+# two-tier default and must complete without a cap rejection.
 killall test_server 2> /dev/null
 ${SERVER_BIN} -l d -e > /dev/null &
 sleep 1
@@ -6006,6 +6007,9 @@ else
     case_print_result "stream_reassembly_cap_happy" "fail"
 fi
 
+# The abnormal path shrinks the reassembly cap to 16. Client-side drops force
+# cap rejections; the transfer must still complete byte-identically and the
+# server engine must not report a packet processing failure.
 killall test_server 2> /dev/null
 ${SERVER_BIN} -l d -e -x 728 > /dev/null &
 sleep 1

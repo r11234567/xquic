@@ -17,12 +17,16 @@ This is the **r11234567/xquic** fork of [alibaba/xquic](https://github.com/aliba
   hits are rate-limited in logs, and FIN repair prevents a rejected frame from
   leaving the receive state incomplete. The packet remains unacknowledged so
   normal QUIC retransmission supplies backpressure without closing the
-  connection. Index: the public setting and its `16384` default are documented
-  in `include/xquic/xquic.h`; the default is defined by
-  `XQC_MAX_STREAM_FRAME_BUFFERED_COUNT` in `src/transport/xqc_defs.h`; and
-  `src/transport/xqc_frame.c` has a compile-time assertion that the default
-  frame budget, at the minimum STREAM-frame payload, covers the advertised
-  16 MiB receive window.
+  connection. The default is now two-tiered: 8192 nodes is the sparse-frame
+  threshold, frames above it must average at least 256 bytes per node, and
+  32768 nodes is the absolute ceiling. This preserves a full 16 MiB receive
+  window for ordinary packet-sized frames without reopening the sparse-node
+  amplification. Index: `include/xquic/xquic.h` documents the public setting;
+  `src/transport/xqc_defs.h` defines both tiers and the density floor;
+  `src/transport/xqc_frame.c` enforces them and reserves the prefix slot; and
+  `tests/unittest/xqc_stream_frame_test.c` covers dense-window admission,
+  sparse rejection, prefix liveness, the hard ceiling, FIN repair, and an
+  explicit per-connection override.
 
 ## HTTP/3 proxy backpressure and urgency
 
@@ -187,7 +191,33 @@ review; no throughput measurement backs them yet. Read a weekly netsim run
 before treating the aggregation numbers in mqvpn's
 `docs/network_emulation_matrix.md` as changed.
 
-## WLB: the PTO guard could exclude the last path
+## WLB flow affinity, fairness, and silent-blackhole recovery
+
+~~The fork's earlier WLB implementation weighted paths from instantaneous
+LATE/cwnd state and shared one deficit model between flow placement and packet
+scheduling.~~ **Replaced by the reviewed `mp0rta/xquic` scheduler series:** TCP
+datagram flows are assigned with a separate smooth weighted deficit, packet
+scheduling has its own deficit, and weights learn acknowledged application
+goodput over wall-clock samples. Warm-up and steady exploration floors keep a
+new or underfed path observable; idle, lossy, and bufferbloated paths decay
+without double-charging losses already reflected in goodput.
+
+An ACTIVE path that repeatedly reaches PTO is removed from weights and flow
+pins. A bounded DATAGRAM probe rotates across evicted paths so a silent path
+can prove recovery without putting reliable STREAM data behind a reassembly
+hole. Reliable STREAM and control packets remain on the MinRTT fallback, which
+spills only when the lower-RTT path reaches its congestion-window limit.
+
+Index: `src/transport/scheduler/xqc_scheduler_wlb.c` owns flow affinity,
+weight learning, topology refresh, probing, and MinRTT fallback;
+`src/transport/xqc_send_ctl.c` reports first-confirmed application payload
+ACKs through the scheduler callback in `include/xquic/xquic.h`; and
+`tests/unittest/xqc_wlb_test.c` covers flow-table collisions, weighted pinning,
+ACK sampling, topology changes, blackhole eviction and recovery, probe
+rotation, and STREAM routing. The standalone WLB runner registers the same
+cases in `tests/unittest/xqc_wlb_test_main.c`.
+
+### Last-path PTO fallback
 
 Separate defect, found while tracing the same two-path report as above.
 
@@ -208,12 +238,11 @@ tunnel was dead for three minutes with the tethered path `ACTIVE` the whole
 time, and recovered within seconds of WiFi being reconnected — which read as
 "availability follows WiFi" and is really "the survivor was locked out".
 
-The guard is now conditional on a healthier path actually existing
-(`wlb_any_path_pto_healthy()`), decided once per scheduling decision so every
-branch agrees. With an alternative available the behaviour is unchanged; with
-none, the apparently-blackholed path is used rather than nothing. Flow-table
-eviction still honours the guard unconditionally, since unpinning a flow only
-changes where it is re-pinned and cannot stall a send.
+The MinRTT guard is now conditional on a healthier path actually existing
+(`wlb_any_path_responsive()`). With an alternative available the behaviour is
+unchanged; with none, the apparently-blackholed path is used rather than
+nothing. Flow-table eviction still honours the guard unconditionally, since
+unpinning a flow only changes where it is re-pinned and cannot stall a send.
 
 Also fixed there: the flow-hit branch dereferenced `path->path_send_ctl`
 without the NULL check its own helper applies.
