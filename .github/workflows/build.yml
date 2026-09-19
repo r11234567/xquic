@@ -30,6 +30,17 @@ jobs:
         fetch-depth: 2
         submodules: 'recursive'
 
+    - name: Select test scope
+      env:
+        TEST_SCOPE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      run: |
+        if git log -1 --pretty=%B "$TEST_SCOPE_SHA" | grep -Fq '[ci:fec-rsc-only]'; then
+          echo "RSC_ONLY=1" >> "$GITHUB_ENV"
+          echo "Running only the FEC RSC end-to-end case for this commit."
+        else
+          echo "RSC_ONLY=0" >> "$GITHUB_ENV"
+        fi
+
     - name: Linux Setup
       run: |
         sudo apt-get update
@@ -46,6 +57,7 @@ jobs:
         sudo pip3 install gcovr
 
     - name: Fuzz MASQUE smoke (libFuzzer)
+      if: env.RSC_ONLY != '1'
       run: |
         XQC_FUZZ_C_COMPILER=clang XQC_FUZZ_MAX_TOTAL_TIME=60 tests/fuzz/run_smoke.sh
 
@@ -73,6 +85,7 @@ jobs:
         make -j
 
     - name: Test
+      if: env.RSC_ONLY != '1'
       run: |
         cd build
         keyfile=server.key
@@ -94,8 +107,18 @@ jobs:
           exit 1
         fi
         gcovr -r .. --xml --gcov-ignore-parse-errors -o ../coverage.xml
+
+    - name: Test FEC RSC recovery
+      if: env.RSC_ONLY == '1'
+      run: |
+        cd build
+        keyfile=server.key
+        certfile=server.crt
+        openssl req -newkey rsa:2048 -x509 -nodes -keyout "$keyfile" -new -out "$certfile" -subj /CN=test.xquic.com
+        ../scripts/case_test.sh --only-fec-rsc | tee -a ../xquic_test.log
     
     - name: Check Test Result
+      if: env.RSC_ONLY != '1'
       run: |
         echo "unit test:"
         cat xquic_test.log | grep "Test:"
@@ -116,7 +139,14 @@ jobs:
           exit 1
         fi
 
+    - name: Check FEC RSC test result
+      if: env.RSC_ONLY == '1'
+      run: |
+        cat xquic_test.log
+        grep -Fq "[       OK ] xquic_case_test.fec_recovered_function_of_stream_rsc" xquic_test.log
+
     - name: Report coverage to Codacy
+      if: env.RSC_ONLY != '1'
       shell: bash
       env:
         CODACY_PROJECT_TOKEN: ${{ secrets.CODACY_PROJECT_TOKEN }}

@@ -47,27 +47,28 @@
 #define XQC_MAX_CRYPTO_FRAME_BUFFERED_BYTES     (1*1024*1024)  /* max buffered data bytes per crypto stream (1MB), accommodates large cert chains under reordering */
 
 /*
- * CWE-770 mitigation: limit buffered out-of-order STREAM frame nodes.
- * Prevents sparse 1-byte fragment attacks that exploit per-node metadata overhead
- * to achieve ~56x memory amplification within flow control budget (RFC 9000 §21.7).
+ * CWE-770 mitigation for buffered STREAM frame nodes (RFC 9000 §21.7).
  *
- * The value must stay consistent with the receive window we advertise, or a
- * CONFORMING peer trips it. A stream may hold XQC_MAX_RECV_WINDOW bytes of
- * unread data, and a reorder hole keeps every frame after it buffered, so the
- * node count a legitimate bulk sender reaches is window / frame_payload. At
- * 16 MiB and ~1400-byte packets that is ~12k nodes: the previous 8192 was
- * BELOW it, so a peer obeying flow control could be rejected for exceeding a
- * limit it was never told about. Sized at window/1KB instead, which covers any
- * sender whose frames carry >=1KB, and enforced against the window by a
- * _Static_assert in xqc_frame.c so the two cannot drift apart.
+ * 8192 remains the sparse-fragment threshold: beyond it, a stream must carry
+ * enough payload per node to avoid metadata amplification.  A separate hard
+ * ceiling still bounds dense packet-sized nodes.  The hard ceiling covers a
+ * full 16 MiB receive window even when ordinary QUIC/H3 framing leaves less
+ * than one MSS of application payload in each packet.
  *
- * Sparse-fragment attacks are still bounded: the cap is on nodes, so the worst
- * case is COUNT * sizeof(xqc_stream_frame_t) (~56 B) of metadata, under 1 MiB
- * per stream. Reaching it is also no longer fatal — xqc_conn_tolerant_error()
- * treats -XQC_ELIMIT as a drop-without-ack, which throttles the sender by
- * withholding acknowledgement rather than by killing the connection.
+ * The receive window bounds the hard ceiling only while the buffered ranges
+ * are disjoint.  The density budget charges each node its own data_length,
+ * but stream flow control charges the highest offset reached, so a peer that
+ * resends one range at one-byte offset steps pays the density tier in full
+ * with almost no flow-control credit: measured, 1 KB frames stepped by one
+ * byte reach the hard ceiling holding ~32 MB behind an unfilled hole for
+ * ~33 KB of stream offset.  That is a memory ceiling, not an amplifier --
+ * the sender still puts every held byte on the wire -- and the previous flat
+ * 8192-node cap had the same shape at ~8 MB.  Raising the ceiling raises that
+ * worst case with it; it does not open a path the old cap closed.
  */
-#define XQC_MAX_STREAM_FRAME_BUFFERED_COUNT     16384   /* max buffered frame nodes per stream */
+#define XQC_MAX_STREAM_FRAME_BUFFERED_COUNT          8192
+#define XQC_MAX_STREAM_FRAME_BUFFERED_COUNT_HARD     32768
+#define XQC_MIN_STREAM_BUFFERED_BYTES_PER_FRAME      256
 
 
 /* xquic will not send stateless reset to packets which are smaller than

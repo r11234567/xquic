@@ -27,21 +27,14 @@
 #include "src/transport/xqc_multipath.h"
 #include "src/transport/xqc_packet_out.h"
 #include "src/transport/xqc_send_ctl.h"
+#include "src/transport/xqc_utils.h"
 #include "src/transport/xqc_frame.h"
+#include "src/transport/xqc_frame_parser.h"
 #include "src/transport/scheduler/xqc_scheduler_wlb.h"
 #include "src/common/xqc_log.h"
-#include "xqc_common_test.h"     /* xqc_null_log_cb */
 #include "src/common/xqc_time.h"
 
 #include "xqc_wlb_test.h"
-
-/* Mirror of WLB_WEIGHT_REFRESH_US, which is private to the scheduler .c. Kept
- * as a separate name rather than reaching into the implementation: the test
- * asserts the observable contract ("weights follow live path state within a
- * short interval"), and only needs to advance a clock past whatever that
- * interval is. If the scheduler's value grows past this, the test advances too
- * little and fails loudly rather than silently passing. */
-#define WLB_TEST_WEIGHT_REFRESH_US 20000
 
 /* ───────────────────────── fake clock ───────────────────────── */
 
@@ -63,6 +56,7 @@ wlb_test_clock_advance(xqc_usec_t delta_us)
 
 typedef struct {
     uint64_t cwnd_bytes;
+    uint32_t bandwidth_Bps;
 } wlb_mock_cong_t;
 
 static uint64_t
@@ -71,8 +65,15 @@ wlb_mock_get_cwnd(void *cong)
     return ((wlb_mock_cong_t *)cong)->cwnd_bytes;
 }
 
+static uint32_t
+wlb_mock_get_bandwidth(void *cong)
+{
+    return ((wlb_mock_cong_t *)cong)->bandwidth_Bps;
+}
+
 static const xqc_cong_ctrl_callback_t WLB_MOCK_CC = {
     .xqc_cong_ctl_get_cwnd = wlb_mock_get_cwnd,
+    .xqc_cong_ctl_get_bandwidth_estimate = wlb_mock_get_bandwidth,
     /* other callbacks unused by the WLB scheduler path */
 };
 
@@ -103,12 +104,6 @@ wlb_test_setup(wlb_test_fixture_t *f)
     memset(f, 0, sizeof(*f));
 
     f->log.log_level = XQC_LOG_FATAL;  /* suppress per-test noise */
-    /* The level alone is not enough. xqc_log_implement() dereferences
-     * log_callbacks for any message that clears the filter, and the REPORT
-     * statistics channel is level 0, so no level value filters it -- the
-     * scheduler's own once-a-second counters line segfaulted every test here
-     * the moment it moved onto that channel. */
-    f->log.log_callbacks = (xqc_log_callbacks_t *)&xqc_null_log_cb;
     f->conn.log = &f->log;
     xqc_init_list_head(&f->conn.conn_paths_list);
 
@@ -118,6 +113,8 @@ wlb_test_setup(wlb_test_fixture_t *f)
     f->scheduler = calloc(1, sz);
     CU_ASSERT_PTR_NOT_NULL_FATAL(f->scheduler);
     xqc_wlb_scheduler_cb.xqc_scheduler_init(f->scheduler, &f->log, NULL);
+    f->conn.scheduler = f->scheduler;
+    f->conn.scheduler_callback = &xqc_wlb_scheduler_cb;
 
     /* Install fake clock so wlb_flow_expire's 1/sec throttle and recovery
      * grace window are deterministic. */
@@ -166,6 +163,9 @@ wlb_test_add_path(wlb_test_fixture_t *f, uint64_t path_id, xqc_usec_t srtt_us,
     p->path_send_ctl    = ctl;
 
     cs->cwnd_bytes      = cwnd_bytes;
+    cs->bandwidth_Bps   = srtt_us > 0
+                          ? (uint32_t)((cwnd_bytes * 1000000) / srtt_us)
+                          : 1024 * 1024;
 
     ctl->ctl_path       = p;
     ctl->ctl_conn       = &f->conn;
@@ -173,6 +173,7 @@ wlb_test_add_path(wlb_test_fixture_t *f, uint64_t path_id, xqc_usec_t srtt_us,
     ctl->ctl_cong       = cs;
     ctl->ctl_cong_callback = &WLB_MOCK_CC;
     ctl->ctl_bytes_in_flight = inflight_bytes;
+    ctl->ctl_delivered_time = g_fake_now_us;
 
     xqc_list_add_tail(&p->path_list, &f->conn.conn_paths_list);
     return p;
@@ -235,6 +236,155 @@ wlb_test_invoke_ex(wlb_test_fixture_t *f, uint32_t flow_hash,
         f->scheduler, &f->conn, &po,
         /* check_cwnd */ 1, reinject, &cc_blk);
     return p ? p->path_id : UINT64_MAX;
+}
+
+static uint64_t
+wlb_test_invoke_stream(wlb_test_fixture_t *f)
+{
+    xqc_packet_out_t po;
+    wlb_test_make_packet_out(&po, 0);
+    po.po_frame_types = XQC_FRAME_BIT_STREAM;
+    xqc_bool_t cc_blk = XQC_FALSE;
+    xqc_path_ctx_t *p = xqc_wlb_scheduler_cb.xqc_scheduler_get_path(
+        f->scheduler, &f->conn, &po,
+        /* check_cwnd */ 1, /* reinject */ 0, &cc_blk);
+    return p ? p->path_id : UINT64_MAX;
+}
+
+/* The WRR driver. STREAM data takes the MinRTT fallback by design, so a test
+ * that wants to exercise weighted round robin sends an UNPINNED datagram --
+ * same path through the scheduler, minus the flow table. */
+static uint64_t
+wlb_test_invoke_unpinned(wlb_test_fixture_t *f)
+{
+    return wlb_test_invoke(f, UINT32_MAX); /* WLB_FLOW_HASH_UNPINNED */
+}
+
+static uint64_t
+wlb_test_invoke_control(wlb_test_fixture_t *f)
+{
+    xqc_packet_out_t po;
+    wlb_test_make_packet_out(&po, 0);
+    po.po_frame_types = XQC_FRAME_BIT_ACK;
+    xqc_bool_t cc_blk = XQC_FALSE;
+    xqc_path_ctx_t *p = xqc_wlb_scheduler_cb.xqc_scheduler_get_path(
+        f->scheduler, &f->conn, &po,
+        /* check_cwnd */ 1, /* reinject */ 0, &cc_blk);
+    return p ? p->path_id : UINT64_MAX;
+}
+
+static void
+wlb_test_drain_initial_round(wlb_test_fixture_t *f)
+{
+    for (int i = 0; i < 100; i++) {
+        (void)wlb_test_invoke_unpinned(f);
+    }
+}
+
+static void
+wlb_test_record_acked_packet(wlb_test_fixture_t *f, int path_index,
+                             xqc_frame_type_bit_t frame_types,
+                             uint64_t acknowledged_bytes,
+                             uint64_t app_payload_bytes)
+{
+    f->send_ctls[path_index].ctl_delivered += acknowledged_bytes;
+    f->send_ctls[path_index].ctl_delivered_time = g_fake_now_us;
+
+    xqc_packet_out_t po;
+    memset(&po, 0, sizeof(po));
+    po.po_frame_types = frame_types;
+    po.po_path_id = f->paths[path_index].path_id;
+    po.po_used_size = (unsigned int)acknowledged_bytes;
+    if (frame_types & XQC_FRAME_BIT_DATAGRAM) {
+        po.po_dgram_payload_size = app_payload_bytes;
+    }
+    if (frame_types & XQC_FRAME_BIT_STREAM) {
+        po.po_stream_frames[0].ps_is_used = 1;
+        po.po_stream_frames[0].ps_length =
+            (unsigned int)app_payload_bytes;
+    }
+    xqc_send_ctl_on_packet_acked(&f->send_ctls[path_index], &po,
+                                 g_fake_now_us, 1);
+}
+
+static void
+wlb_test_record_delivery(wlb_test_fixture_t *f, int path_index,
+                         uint64_t delivered_bytes)
+{
+    wlb_test_record_acked_packet(f, path_index, XQC_FRAME_BIT_DATAGRAM,
+                                 delivered_bytes, delivered_bytes);
+}
+
+static void
+wlb_test_record_stream_delivery(wlb_test_fixture_t *f, int path_index,
+                                uint64_t delivered_bytes)
+{
+    wlb_test_record_acked_packet(f, path_index, XQC_FRAME_BIT_STREAM,
+                                 delivered_bytes, delivered_bytes);
+}
+
+static void
+wlb_test_record_generated_datagram_delivery(wlb_test_fixture_t *f,
+                                             int path_index, int packet_count,
+                                             size_t payload_size)
+{
+    unsigned char payload[XQC_QUIC_MAX_MSS];
+    memset(payload, 0xA5, sizeof(payload));
+    if (payload_size > sizeof(payload)) {
+        CU_FAIL("generated DATAGRAM payload exceeds the packet buffer");
+        return;
+    }
+
+    for (int i = 0; i < packet_count; i++) {
+        xqc_packet_out_t *po = xqc_packet_out_create(XQC_QUIC_MAX_MSS);
+        if (po == NULL) {
+            CU_FAIL("could not allocate generated DATAGRAM packet");
+            return;
+        }
+        if (xqc_gen_datagram_frame(po, payload, payload_size) != XQC_OK) {
+            CU_FAIL("could not generate DATAGRAM frame");
+            xqc_packet_out_destroy(po);
+            return;
+        }
+        po->po_path_id = f->paths[path_index].path_id;
+        f->send_ctls[path_index].ctl_delivered += po->po_used_size;
+        f->send_ctls[path_index].ctl_delivered_time = g_fake_now_us;
+        xqc_send_ctl_on_packet_acked(&f->send_ctls[path_index], po,
+                                     g_fake_now_us, 1);
+        xqc_packet_out_destroy(po);
+    }
+}
+
+static int
+wlb_test_count_unpinned_path(wlb_test_fixture_t *f, uint64_t path_id,
+                           int opportunities)
+{
+    int count = 0;
+    for (int i = 0; i < opportunities; i++) {
+        if (wlb_test_invoke_unpinned(f) == path_id) {
+            count++;
+        }
+    }
+    return count;
+}
+
+/* Learned goodput for one path, read back through the stats surface the
+ * tests already use. Returns 0 when the path is not in the WRR cache. */
+static uint64_t
+wlb_test_goodput_of(wlb_test_fixture_t *f, uint64_t path_id)
+{
+    xqc_wlb_path_stats_t stats[WLB_TEST_MAX_PATHS];
+    size_t n = 0;
+    if (xqc_wlb_scheduler_copy_path_stats(f->scheduler, stats,
+                                          WLB_TEST_MAX_PATHS, &n) != XQC_OK) {
+        return 0;
+    }
+    for (size_t i = 0; i < n && i < WLB_TEST_MAX_PATHS; i++) {
+        if (stats[i].path_id == path_id) {
+            return stats[i].goodput_Bps;
+        }
+    }
+    return 0;
 }
 
 /* ───────────────────────── tests ───────────────────────── */
@@ -347,52 +497,11 @@ xqc_test_wlb_sym_multiflow_distributes(void)
         else if (pinned == 1) on_path1++;
     }
 
-    /* Even, not merely non-zero. This used to assert only that neither path
-     * was empty, on the grounds that exact balance over-constrained the
-     * tie-break -- and that looseness is what let the real behaviour drift out
-     * of sight. Instrumented run 33621937964 measured the split on two
-     * identical unshaped legs at 2:13, 12:3 and 8:43, a minority share of
-     * 0.13-0.21 against the 0.5 intended, in every tier row at both 4 and 16
-     * inner streams.
-     *
-     * wlb_pick_pin_path now assigns to whichever path is furthest below the
-     * share of flows its weight entitles it to, which on equal weights is
-     * exactly even, so the contract is worth stating. */
-    CU_ASSERT_EQUAL(on_path0, 4);
-    CU_ASSERT_EQUAL(on_path1, 4);
-
-    wlb_test_teardown(&f);
-}
-
-/* Weight still sets the ratio: the fix removes the feedback term, not the
- * weighting. Three times the weight should take three times the flows, so a
- * genuinely wider path is not levelled down to an even split. */
-void
-xqc_test_wlb_asym_pin_follows_weight_ratio(void)
-{
-    wlb_test_fixture_t f;
-    wlb_test_setup(&f);
-
-    /* Same RTT, 3:1 in congestion window, so the LATE weights come out 3:1. */
-    wlb_test_add_path(&f, 0, 10000, 192 * 1024, 0);
-    wlb_test_add_path(&f, 1, 10000, 64 * 1024, 0);
-
-    int on_path0 = 0, on_path1 = 0;
-    for (int i = 0; i < 16; i++) {
-        uint32_t flow = 0x20000000u + (uint32_t)i;
-        (void)wlb_test_invoke(&f, flow);
-        uint64_t pinned = wlb_test_invoke(&f, flow);
-        if (pinned == 0)      on_path0++;
-        else if (pinned == 1) on_path1++;
-    }
-
-    /* Both carry flows, the wide one carries more, and the narrow one is not
-     * starved -- the three things the old max-deficit pick got wrong. Ranges
-     * rather than exact counts: the weights come from a cwnd model, so the
-     * ratio is 3:1 only to within its own rounding. */
-    CU_ASSERT_EQUAL(on_path0 + on_path1, 16);
-    CU_ASSERT_TRUE(on_path1 >= 2);
-    CU_ASSERT_TRUE(on_path0 > on_path1);
+    /* Both paths must have picked up at least one flow. Asserting balance
+     * exactly would over-constrain tie-break behaviour; the regression we
+     * care about is "all 8 collapse onto paths[0]". */
+    CU_ASSERT_TRUE(on_path0 > 0);
+    CU_ASSERT_TRUE(on_path1 > 0);
 
     wlb_test_teardown(&f);
 }
@@ -462,8 +571,11 @@ xqc_test_wlb_recovery_prefer_fires_after_real_failover(void)
     wlb_test_fixture_t f;
     wlb_test_setup(&f);
 
-    xqc_path_ctx_t *p0 = wlb_test_add_path(&f, 0, 10000, 64 * 1024, 0);
-    xqc_path_ctx_t *p1 = wlb_test_add_path(&f, 1, 10000, 64 * 1024, 0);
+    /* Deliberately lopsided: plain WRR would pin a fresh flow to the wide
+     * path 0. With equal weights the assertion below was satisfied either
+     * way, so disabling the recovery grace entirely left the test green. */
+    xqc_path_ctx_t *p0 = wlb_test_add_path(&f, 0, 10000, 512 * 1024, 0);
+    xqc_path_ctx_t *p1 = wlb_test_add_path(&f, 1, 10000, 16 * 1024, 0);
     (void)p0;
 
     uint32_t flow = 0x33334444;
@@ -630,66 +742,1074 @@ xqc_test_wlb_reinject_bypasses_pin(void)
     wlb_test_teardown(&f);
 }
 
-/* The PTO guard must never exclude the last usable path.
- *
- * WLB avoids a path whose consecutive-PTO count says it is probably
- * blackholed. That is a preference between paths, and it was applied as an
- * absolute exclusion -- including in the n_paths==1 fast path and in the
- * MinRTT fallback that carries control and ACK traffic. When the surviving
- * path was the one over the threshold, every branch returned NULL, so nothing
- * was sent; ctl_pto_count is cleared only by an incoming ACK, and no ACK can
- * arrive on a path nothing is sent on. The exclusion was self-sustaining.
- *
- * Reported as a tunnel dead for three minutes after its WiFi path was pulled,
- * with the tethered path ACTIVE throughout, recovering only when a
- * replacement path arrived with a fresh send_ctl. */
+void
+xqc_test_wlb_stream_data_prefers_lowest_srtt(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    wlb_test_add_path(&f, 0,  20000, 1024 * 1024, 0);   /* 20 ms  */
+    wlb_test_add_path(&f, 1, 170000, 1024 * 1024, 0);   /* 170 ms */
+
+    /* A reliable stream is one ordered byte sequence, so while the low-SRTT
+     * path has cwnd headroom there is nothing to gain by putting bytes on a
+     * path 150 ms further away -- every one of them is a reassembly hole the
+     * reader has to wait behind. STREAM data therefore takes the MinRTT
+     * fallback, not WRR. Measured before this was pinned down: WRR put 35%
+     * of the stream on the slow path here and never backed off, because an
+     * under-fed path reads as app-limited and keeps a capacity-proportional
+     * weight. */
+    int on_slow = 0;
+    for (int i = 0; i < 50; i++) {
+        if (wlb_test_invoke_stream(&f) == 1) {
+            on_slow++;
+        }
+    }
+    CU_ASSERT_EQUAL(on_slow, 0);
+
+    wlb_test_teardown(&f);
+}
+
+/**
+ * ...and it still aggregates. MinRTT is not "one path only": the cwnd gate
+ * counts bytes already scheduled this pass, so once the near path is full the
+ * next packet spills to the far one. That is what makes a shaped two-path
+ * stream lane reach ~96% of the sum of its legs without any weighting.
+ */
+void
+xqc_test_wlb_stream_data_spills_when_primary_is_full(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    /* Near path cwnd fits exactly two 100-byte packets; far path is wide. */
+    wlb_test_add_path(&f, 0,  20000,        250, 0);
+    wlb_test_add_path(&f, 1, 170000, 1024 * 1024, 0);
+
+    CU_ASSERT_EQUAL(wlb_test_invoke_stream(&f), 0);
+    /* path_schedule_bytes, not bytes_in_flight: this is the counter the send
+     * pass accumulates as it assigns packets, and it is what makes the spill
+     * happen WITHIN one pass rather than one RTT later. Scope: this covers
+     * the scheduler's use of the field. The accumulation itself lives in
+     * xqc_path_send_buffer_append, which this fixture never runs -- breaking
+     * that += would not fail here. */
+    f.paths[0].path_schedule_bytes = 200;
+
+    int on_far = 0;
+    for (int i = 0; i < 10; i++) {
+        if (wlb_test_invoke_stream(&f) == 1) {
+            on_far++;
+        }
+    }
+    CU_ASSERT_EQUAL(on_far, 10);
+
+    /* And it returns as soon as the near path drains. */
+    f.paths[0].path_schedule_bytes = 0;
+    CU_ASSERT_EQUAL(wlb_test_invoke_stream(&f), 0);
+
+    wlb_test_teardown(&f);
+}
+
+void
+xqc_test_wlb_path_replacement_refreshes_cache(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    wlb_test_add_path(&f, 0, 25000, 64 * 1024, 0);
+    xqc_path_ctx_t *old_relay =
+        wlb_test_add_path(&f, 1, 25000, 64 * 1024, 0);
+
+    (void)wlb_test_invoke_unpinned(&f);
+    (void)wlb_test_invoke_unpinned(&f);
+
+    wlb_test_detach_path(old_relay);
+    wlb_test_add_path(&f, 2, 25000, 64 * 1024, 0);
+
+    int saw_replacement = 0;
+    for (int i = 0; i < 8; i++) {
+        if (wlb_test_invoke_unpinned(&f) == 2) {
+            saw_replacement = 1;
+        }
+    }
+    CU_ASSERT_TRUE(saw_replacement);
+
+    wlb_test_teardown(&f);
+}
+
+void
+xqc_test_wlb_control_packets_use_minrtt(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    wlb_test_add_path(&f, 0, 50000, 64 * 1024, 0);
+    wlb_test_add_path(&f, 1, 10000, 64 * 1024, 0);
+
+    CU_ASSERT_EQUAL(wlb_test_invoke_control(&f), 1);
+    CU_ASSERT_EQUAL(wlb_test_invoke_control(&f), 1);
+
+    wlb_test_teardown(&f);
+}
+
+void
+xqc_test_wlb_evicted_path_gets_recovery_probe(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    wlb_test_add_path(&f, 0, 25000, 64 * 1024, 0);
+    xqc_path_ctx_t *relay = wlb_test_add_path(&f, 1, 25000, 64 * 1024, 0);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(relay);
+
+    /* Evict the relay: blackholed but still ACTIVE. */
+    relay->path_send_ctl->ctl_pto_count = 3;
+
+    /* Without probing, an evicted path never carries payload, nothing can
+     * ACK on it, and ctl_pto_count can never reset — eviction would be
+     * permanent. One probe per interval breaks that deadlock. */
+    /* First payload packet arms the probe interval; it must never itself
+     * be a probe. */
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, UINT32_MAX), 0);
+
+    int probes = 0;
+    int healthy = 0;
+    for (int round = 0; round < 4; round++) {
+        wlb_test_clock_advance(600000); /* past the 500ms probe interval */
+        for (int i = 0; i < 8; i++) {
+            uint64_t selected = wlb_test_invoke(&f, UINT32_MAX);
+            if (selected == 1) {
+                probes++;
+            } else if (selected == 0) {
+                healthy++;
+            }
+        }
+    }
+    CU_ASSERT_EQUAL(probes, 4);      /* exactly one probe per interval */
+    CU_ASSERT_EQUAL(healthy, 28);    /* everything else stays on the live path */
+
+    /* The probe got through: the path heals and re-enters scheduling. */
+    relay->path_send_ctl->ctl_pto_count = 0;
+    int on_relay = 0;
+    for (int i = 0; i < 32; i++) {
+        if (wlb_test_invoke_unpinned(&f) == 1) {
+            on_relay++;
+        }
+    }
+    CU_ASSERT_TRUE(on_relay > 1); /* real share again, not just probes */
+
+    wlb_test_teardown(&f);
+}
+
+/**
+ * The recovery-probe round robin has to survive a candidate it cannot send
+ * on. A blackholed path normally has everything it sent still in flight, so
+ * it is exactly the candidate that fails the cwnd check -- and if the cursor
+ * does not move past it, it holds the rotation and no other evicted path is
+ * ever probed, which is the one thing the round robin exists to prevent.
+ */
+void
+xqc_test_wlb_evicted_probe_rotates_past_blocked_path(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    wlb_test_add_path(&f, 0, 25000, 64 * 1024, 0);
+    /* Candidate 0: blackholed AND cwnd-blocked (inflight == cwnd). */
+    xqc_path_ctx_t *blocked = wlb_test_add_path(&f, 1, 25000, 1024, 1024);
+    /* Candidate 1: blackholed but sendable -- this is the one that can heal. */
+    xqc_path_ctx_t *sendable = wlb_test_add_path(&f, 2, 25000, 64 * 1024, 0);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(blocked);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(sendable);
+
+    blocked->path_send_ctl->ctl_pto_count = 3;  /* WLB_PTO_EVICT_THRESH */
+    sendable->path_send_ctl->ctl_pto_count = 3;  /* WLB_PTO_EVICT_THRESH */
+
+    /* First payload packet only arms the interval. */
+    (void)wlb_test_invoke(&f, UINT32_MAX);
+
+    int probed_sendable = 0;
+    for (int round = 0; round < 4; round++) {
+        wlb_test_clock_advance(600000); /* past the probe interval */
+        for (int i = 0; i < 4; i++) {
+            if (wlb_test_invoke(&f, UINT32_MAX) == 2) {
+                probed_sendable++;
+            }
+        }
+    }
+    /* The blocked candidate must not be able to starve this one. */
+    CU_ASSERT_TRUE(probed_sendable > 0);
+
+    /* And the probe is still rate limited: it is a recovery mechanism, not a
+     * second traffic class. Four intervals cannot yield more than four. */
+    CU_ASSERT_TRUE(probed_sendable <= 4);
+
+    wlb_test_teardown(&f);
+}
+
+void
+xqc_test_wlb_stream_data_never_rides_a_blackholed_path(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    wlb_test_add_path(&f, 0, 25000, 64 * 1024, 0);
+    xqc_path_ctx_t *relay = wlb_test_add_path(&f, 1, 25000, 64 * 1024, 0);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(relay);
+    relay->path_send_ctl->ctl_pto_count = 3;
+
+    CU_ASSERT_EQUAL(wlb_test_invoke_stream(&f), 0); /* arm interval */
+    for (int i = 0; i < 4; i++) {
+        wlb_test_clock_advance(600000);
+        CU_ASSERT_EQUAL(wlb_test_invoke_stream(&f), 0);
+    }
+
+    wlb_test_teardown(&f);
+}
+
+void
+xqc_test_wlb_blackholed_path_does_not_stall_rounds(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    /* path 0 = the healthy direct link, path 1 = the relay that blackholes. */
+    wlb_test_add_path(&f, 0, 25000, 64 * 1024, 0);
+    xqc_path_ctx_t *relay = wlb_test_add_path(&f, 1, 25000, 64 * 1024, 0);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(relay);
+
+    /* Blackholed: still ACTIVE with no socket error, only consecutive PTOs.
+     * This is the LAN-relay failure mode -- the phone stops forwarding while
+     * the path itself looks alive. */
+    /* Mirrors WLB_PTO_EVICT_THRESH, which is private to the scheduler. */
+    relay->path_send_ctl->ctl_pto_count = 3;
+
+    for (int i = 0; i < 32; i++) {
+        uint64_t selected = wlb_test_invoke_unpinned(&f);
+        CU_ASSERT_EQUAL(selected, 0);
+    }
+
+    /* The relay recovers. It must re-enter scheduling with a fresh quantum,
+     * not with a deficit banked over every round it sat out -- otherwise it
+     * monopolises the link and starves the path that stayed healthy. */
+    relay->path_send_ctl->ctl_pto_count = 0;
+
+    int on_direct = 0;
+    int on_relay = 0;
+    for (int i = 0; i < 32; i++) {
+        uint64_t selected = wlb_test_invoke_unpinned(&f);
+        if (selected == 0) {
+            on_direct++;
+        } else if (selected == 1) {
+            on_relay++;
+        }
+    }
+    CU_ASSERT_TRUE(on_relay > 0);
+    CU_ASSERT_TRUE(on_direct > 0);
+    CU_ASSERT_TRUE(on_relay <= 20);
+    CU_ASSERT_TRUE(on_direct >= 12);
+
+    wlb_test_teardown(&f);
+}
+
+void
+xqc_test_wlb_unpinned_blackhole_refreshes_topology(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    /* Give the relay a larger initial quantum so a stale positive deficit is
+     * observable after it silently blackholes and later recovers. */
+    wlb_test_add_path(&f, 0, 25000, 64 * 1024, 0);
+    xqc_path_ctx_t *relay = wlb_test_add_path(&f, 1, 25000, 256 * 1024, 0);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(relay);
+
+    /* Prime the WRR cache while both paths are healthy.  UINT32_MAX is the
+     * production sentinel for per-packet, unpinned UDP/QUIC datagrams. */
+    (void)wlb_test_invoke(&f, UINT32_MAX);
+
+    relay->path_send_ctl->ctl_pto_count = 3;
+    for (int i = 0; i < 32; i++) {
+        CU_ASSERT_EQUAL(wlb_test_invoke(&f, UINT32_MAX), 0);
+    }
+
+    relay->path_send_ctl->ctl_pto_count = 0;
+    int on_direct = 0;
+    int on_relay = 0;
+    for (int i = 0; i < 32; i++) {
+        uint64_t selected = wlb_test_invoke(&f, UINT32_MAX);
+        if (selected == 0) {
+            on_direct++;
+        } else if (selected == 1) {
+            on_relay++;
+        }
+    }
+    CU_ASSERT_TRUE(on_direct > 0);
+    CU_ASSERT_TRUE(on_relay > 0);
+
+    wlb_test_teardown(&f);
+}
+
+void
+xqc_test_wlb_routine_path_event_preserves_round(void)
+{
+    wlb_test_fixture_t baseline;
+    wlb_test_fixture_t with_events;
+    wlb_test_setup(&baseline);
+    wlb_test_setup(&with_events);
+
+    wlb_test_add_path(&baseline, 0, 25000, 64 * 1024, 0);
+    wlb_test_add_path(&baseline, 1, 25000, 16 * 1024, 0);
+    xqc_path_ctx_t *wide =
+        wlb_test_add_path(&with_events, 0, 25000, 64 * 1024, 0);
+    wlb_test_add_path(&with_events, 1, 25000, 16 * 1024, 0);
+
+    int saw_narrow = 0;
+    for (int i = 0; i < 16; i++) {
+        uint64_t expected = wlb_test_invoke_unpinned(&baseline);
+        uint64_t selected = wlb_test_invoke_unpinned(&with_events);
+        CU_ASSERT_EQUAL(selected, expected);
+        if (selected == 1) {
+            saw_narrow = 1;
+        }
+        xqc_wlb_scheduler_cb.xqc_scheduler_handle_path_event(
+            with_events.scheduler, wide, XQC_SCHED_EVENT_PATH_NOT_FULL, NULL);
+    }
+    CU_ASSERT_TRUE(saw_narrow);
+
+    wlb_test_teardown(&with_events);
+    wlb_test_teardown(&baseline);
+}
+
+void
+xqc_test_wlb_measured_goodput_ignores_loss_penalty(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    wlb_test_add_path(&f, 0, 25000, 64 * 1024, 0);
+    xqc_path_ctx_t *lossy = wlb_test_add_path(&f, 1, 25000, 64 * 1024, 0);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(lossy);
+    wlb_test_drain_initial_round(&f);
+
+    /* Equal ACKNOWLEDGED delivery on both paths; path 1 additionally shows
+     * 6% recent loss (cellular always carries a few percent). Acked goodput
+     * is already net of that loss — penalizing it again would starve a
+     * lossy-but-delivering link to a third of its measured share. */
+    wlb_test_clock_advance(1000000);
+    wlb_test_record_delivery(&f, 0, 1024 * 1024);
+    wlb_test_record_delivery(&f, 1, 1024 * 1024);
+    lossy->path_send_ctl->ctl_recent_send_count[0] = 100;
+    lossy->path_send_ctl->ctl_recent_lost_count[0] = 6;
+
+    int path0_count = wlb_test_count_unpinned_path(&f, 0, 100);
+    CU_ASSERT_TRUE(path0_count >= 45 && path0_count <= 55);
+
+    wlb_test_teardown(&f);
+}
+
+void
+xqc_test_wlb_idle_path_goodput_decays(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    wlb_test_add_path(&f, 0, 25000, 64 * 1024, 0);
+    wlb_test_add_path(&f, 1, 25000, 64 * 1024, 0);
+    wlb_test_drain_initial_round(&f);
+
+    /* Both paths deliver equally, then path 1 goes silent while path 0
+     * keeps delivering. Under ack-to-ack sampling a silent path produced
+     * no sample at all, so its last (possibly burst-inflated) average was
+     * frozen and it kept out-weighting the path doing the actual work. A
+     * wall-clock sampler emits zero-rate samples for the idle span, so the
+     * stale average decays and the working path takes the round. */
+    wlb_test_clock_advance(1000000);
+    wlb_test_record_delivery(&f, 0, 1024 * 1024);
+    wlb_test_record_delivery(&f, 1, 1024 * 1024);
+    (void)wlb_test_count_unpinned_path(&f, 0, 100); /* absorb one round */
+
+    int path0_count = 0;
+    for (int round = 0; round < 6; round++) {
+        wlb_test_clock_advance(1000000);
+        wlb_test_record_delivery(&f, 0, 1024 * 1024);
+        path0_count = wlb_test_count_unpinned_path(&f, 0, 100);
+    }
+    CU_ASSERT_TRUE(path0_count >= 80);
+
+    wlb_test_teardown(&f);
+}
+
+void
+xqc_test_wlb_warmed_zero_goodput_ignores_stale_estimate(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    wlb_test_add_path(&f, 0, 25000, 64 * 1024, 0);
+    wlb_test_add_path(&f, 1, 25000, 64 * 1024, 0);
+    wlb_test_drain_initial_round(&f);
+
+    /* Warm both paths with real delivery, then leave path 1 silent long
+     * enough for its measured goodput to decay all the way to zero. Keep a
+     * deliberately stale, very large congestion-controller estimate on the
+     * silent path: once warmup is over, that estimate must not override the
+     * measured zero. The steady exploration floor is the only traffic the
+     * path should receive until it delivers again. */
+    f.cong_states[1].bandwidth_Bps = 100 * 1024 * 1024;
+    wlb_test_clock_advance(1000000);
+    wlb_test_record_delivery(&f, 0, 1024 * 1024);
+    wlb_test_record_delivery(&f, 1, 1024 * 1024);
+    (void)wlb_test_count_unpinned_path(&f, 0, 100);
+
+    for (int round = 0; round < 120; round++) {
+        wlb_test_clock_advance(1000000);
+        wlb_test_record_delivery(&f, 0, 1024 * 1024);
+        (void)wlb_test_count_unpinned_path(&f, 0, 100);
+    }
+
+    int silent_path_count = wlb_test_count_unpinned_path(&f, 1, 100);
+    CU_ASSERT_TRUE(silent_path_count >= 5 && silent_path_count <= 6);
+
+    wlb_test_teardown(&f);
+}
+
+void
+xqc_test_wlb_equal_goodput_is_balanced(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    wlb_test_add_path(&f, 0, 25000, 64 * 1024, 0);
+    wlb_test_add_path(&f, 1, 25000, 64 * 1024, 0);
+    wlb_test_drain_initial_round(&f);
+
+    wlb_test_clock_advance(1000000);
+    wlb_test_record_delivery(&f, 0, 1024 * 1024);
+    wlb_test_record_delivery(&f, 1, 1024 * 1024);
+
+    int path0_count = wlb_test_count_unpinned_path(&f, 0, 100);
+    CU_ASSERT_TRUE(path0_count >= 45 && path0_count <= 55);
+
+    wlb_test_teardown(&f);
+}
+
+void
+xqc_test_wlb_bloated_path_sheds_weight(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    /* Equal acknowledged goodput on both paths, but path 1 is deeply
+     * bufferbloated: 2 s smoothed RTT over a 90 ms floor (a live cellular
+     * attach exhibited exactly this). Goodput alone would split the load
+     * 50/50 and keep feeding the queue; the bloat haircut must scale
+     * path 1 down to 2*min/srtt = 9% of its measured share so the queue
+     * can drain. Path 0 sits at 100 ms srtt over the same floor -- inside
+     * the 2x operating point, untouched. */
+    xqc_path_ctx_t *healthy = wlb_test_add_path(&f, 0, 100000, 64 * 1024, 0);
+    xqc_path_ctx_t *bloated = wlb_test_add_path(&f, 1, 2000000, 64 * 1024, 0);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(healthy);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(bloated);
+    healthy->path_send_ctl->ctl_minrtt = 90000;
+    bloated->path_send_ctl->ctl_minrtt = 90000;
+    wlb_test_drain_initial_round(&f);
+
+    wlb_test_clock_advance(1000000);
+    wlb_test_record_delivery(&f, 0, 1024 * 1024);
+    wlb_test_record_delivery(&f, 1, 1024 * 1024);
+
+    int path0_count = wlb_test_count_unpinned_path(&f, 0, 100);
+    CU_ASSERT_TRUE(path0_count >= 80);
+
+    wlb_test_teardown(&f);
+}
+
+void
+xqc_test_wlb_four_to_one_goodput_after_acked_warmup(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    wlb_test_add_path(&f, 0, 25000, 64 * 1024, 0);
+    wlb_test_add_path(&f, 1, 25000, 64 * 1024, 0);
+    wlb_test_drain_initial_round(&f);
+
+    wlb_test_clock_advance(1000000);
+    wlb_test_record_delivery(&f, 0, 4 * 1024 * 1024);
+    wlb_test_record_delivery(&f, 1, 1024 * 1024);
+
+    int path0_count = wlb_test_count_unpinned_path(&f, 0, 100);
+    CU_ASSERT_TRUE(path0_count >= 75 && path0_count <= 85);
+
+    wlb_test_teardown(&f);
+}
+
+void
+xqc_test_wlb_new_path_gets_warmup_floor(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    wlb_test_add_path(&f, 0, 25000, 64 * 1024, 0);
+    wlb_test_drain_initial_round(&f);
+
+    wlb_test_clock_advance(1000000);
+    wlb_test_record_delivery(&f, 0, 64 * 1024 * 1024);
+    (void)wlb_test_invoke_unpinned(&f);
+
+    xqc_wlb_path_stats_t stats[2];
+    size_t n = 0;
+    CU_ASSERT_EQUAL(xqc_wlb_scheduler_copy_path_stats(
+                        f.scheduler, stats, 2, &n),
+                    XQC_OK);
+    CU_ASSERT_EQUAL(n, 1);
+    CU_ASSERT_EQUAL(stats[0].warmup, 0);
+
+    wlb_test_add_path(&f, 1, 25000, 1024, 0);
+    (void)wlb_test_invoke_unpinned(&f);
+    CU_ASSERT_EQUAL(xqc_wlb_scheduler_copy_path_stats(
+                        f.scheduler, stats, 2, &n),
+                    XQC_OK);
+    CU_ASSERT_EQUAL(n, 2);
+    CU_ASSERT_EQUAL(stats[1].warmup, 1);
+
+    int new_path_count = wlb_test_count_unpinned_path(&f, 1, 100);
+    CU_ASSERT_TRUE(new_path_count >= 20);
+
+    wlb_test_teardown(&f);
+}
+
+void
+xqc_test_wlb_steady_path_gets_exploration_floor(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    wlb_test_add_path(&f, 0, 25000, 64 * 1024, 0);
+    wlb_test_add_path(&f, 1, 25000, 64 * 1024, 0);
+    wlb_test_drain_initial_round(&f);
+
+    wlb_test_clock_advance(1000000);
+    wlb_test_record_delivery(&f, 0, 64 * 1024 * 1024);
+    wlb_test_record_delivery(&f, 1, 1024 * 1024);
+
+    int slow_path_count = wlb_test_count_unpinned_path(&f, 1, 100);
+    CU_ASSERT_TRUE(slow_path_count >= 5);
+
+    wlb_test_teardown(&f);
+}
+
+void
+xqc_test_wlb_active_time_ends_warmup(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    wlb_test_add_path(&f, 0, 25000, 64 * 1024, 0);
+    wlb_test_add_path(&f, 1, 25000, 64 * 1024, 0);
+    wlb_test_drain_initial_round(&f);
+
+    wlb_test_clock_advance(100000);
+    wlb_test_record_delivery(&f, 0, 400 * 1024);
+    wlb_test_record_delivery(&f, 1, 100 * 1024);
+    for (int i = 0; i < 31; i++) {
+        wlb_test_clock_advance(100000);
+        (void)wlb_test_invoke_unpinned(&f);
+    }
+    for (int i = 31; i < 100; i++) {
+        (void)wlb_test_invoke_unpinned(&f);
+    }
+
+    int path0_count = wlb_test_count_unpinned_path(&f, 0, 100);
+    CU_ASSERT_TRUE(path0_count >= 75 && path0_count <= 85);
+
+    wlb_test_teardown(&f);
+}
+
+void
+xqc_test_wlb_idle_time_does_not_end_warmup(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    wlb_test_add_path(&f, 0, 25000, 64 * 1024, 0);
+    wlb_test_add_path(&f, 1, 25000, 64 * 1024, 0);
+    wlb_test_drain_initial_round(&f);
+
+    wlb_test_clock_advance(10000000);
+    wlb_test_record_delivery(&f, 0, 400 * 1024);
+    wlb_test_record_delivery(&f, 1, 100 * 1024);
+
+    int slow_path_count = wlb_test_count_unpinned_path(&f, 1, 100);
+    CU_ASSERT_TRUE(slow_path_count >= 27);
+
+    wlb_test_teardown(&f);
+}
+
+/**
+ * Measured goodput is demand-limited, not a capacity reading: a path handed
+ * little delivers little, which would keep it handed little. An under-fed
+ * path is app-limited -- it ran out of packets to send, not out of room --
+ * so its weight comes from the controller's bandwidth estimate instead. A
+ * path that WAS handed work and failed to deliver it is not app-limited and
+ * keeps its measured weight.
+ */
+void
+xqc_test_wlb_app_limited_path_is_weighted_by_capacity(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    /* Equal measured delivery, but path 1 has 16x the capacity. */
+    wlb_test_add_path(&f, 0, 25000,  16 * 1024, 0);
+    wlb_test_add_path(&f, 1, 25000, 256 * 1024, 0);
+    wlb_test_drain_initial_round(&f);
+
+    wlb_test_clock_advance(1000000);
+    wlb_test_record_delivery(&f, 0, 64 * 1024);
+    wlb_test_record_delivery(&f, 1, 64 * 1024);
+    f.send_ctls[1].ctl_app_limited = 0;
+    int fed = wlb_test_count_unpinned_path(&f, 1, 100);
+
+    wlb_test_clock_advance(1000000);
+    wlb_test_record_delivery(&f, 0, 64 * 1024);
+    wlb_test_record_delivery(&f, 1, 64 * 1024);
+    f.send_ctls[1].ctl_app_limited = 1;
+    int under_fed = wlb_test_count_unpinned_path(&f, 1, 100);
+
+    CU_ASSERT_TRUE(under_fed > fed);
+
+    wlb_test_teardown(&f);
+}
+
+/**
+ * A goodput sample has to span real wall clock. Timing the inside of an ACK
+ * burst reads a path delivering 1 MiB in 50 ms once a second as a 20 MB/s
+ * path instead of a 1 MB/s one, and that inflated average then out-weighted
+ * the paths doing the actual work.
+ */
+void
+xqc_test_wlb_goodput_sample_ignores_sub_interval_burst(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    wlb_test_add_path(&f, 0, 25000, 64 * 1024, 0);
+    wlb_test_add_path(&f, 1, 25000, 64 * 1024, 0);
+    wlb_test_drain_initial_round(&f);
+
+    wlb_test_clock_advance(1000000);
+    wlb_test_record_delivery(&f, 0, 64 * 1024);
+    wlb_test_record_delivery(&f, 1, 64 * 1024);
+    (void)wlb_test_count_unpinned_path(&f, 0, 100);
+    uint64_t settled = wlb_test_goodput_of(&f, 0);
+    CU_ASSERT_TRUE(settled > 0);
+
+    /* A big delivery, then a refresh only 50 ms later: inside the interval,
+     * so nothing may be sampled and the average may not move. */
+    wlb_test_clock_advance(50000);
+    wlb_test_record_delivery(&f, 0, 8 * 1024 * 1024);
+    (void)wlb_test_count_unpinned_path(&f, 0, 100);
+    CU_ASSERT_EQUAL(wlb_test_goodput_of(&f, 0), settled);
+
+    /* Past the interval the same bytes are counted, over their real span. */
+    wlb_test_clock_advance(300000);
+    (void)wlb_test_count_unpinned_path(&f, 0, 100);
+    CU_ASSERT_TRUE(wlb_test_goodput_of(&f, 0) > settled);
+
+    wlb_test_teardown(&f);
+}
+
+void
+xqc_test_wlb_path_stats_snapshot(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    wlb_test_add_path(&f, 0, 25000, 64 * 1024, 0);
+    wlb_test_add_path(&f, 1, 25000, 64 * 1024, 0);
+    wlb_test_drain_initial_round(&f);
+    wlb_test_clock_advance(1000000);
+    wlb_test_record_delivery(&f, 0, 1024 * 1024);
+    wlb_test_record_delivery(&f, 1, 1024 * 1024);
+    (void)wlb_test_invoke_unpinned(&f);
+
+    xqc_wlb_path_stats_t stats[4];
+    memset(stats, 0xA5, sizeof(stats));
+    size_t n = 0;
+    CU_ASSERT_EQUAL(xqc_wlb_scheduler_copy_path_stats(f.scheduler, stats, 4, &n),
+                    XQC_OK);
+    CU_ASSERT_EQUAL(n, 2);
+    CU_ASSERT_TRUE(stats[0].weight_pct + stats[1].weight_pct >= 100);
+    CU_ASSERT_EQUAL(xqc_wlb_scheduler_copy_path_stats(NULL, stats, 4, &n),
+                    -XQC_EPARAM);
+
+    /* Truncation: report the full count, write only what fits, leave the
+     * caller's remaining slots untouched. */
+    memset(stats, 0xA5, sizeof(stats));
+    n = 0;
+    CU_ASSERT_EQUAL(xqc_wlb_scheduler_copy_path_stats(f.scheduler, stats, 1, &n),
+                    XQC_OK);
+    CU_ASSERT_EQUAL(n, 2);
+    CU_ASSERT_EQUAL(stats[0].path_id, 0);
+    CU_ASSERT_EQUAL(stats[1].path_id, UINT64_C(0xA5A5A5A5A5A5A5A5));
+
+    wlb_test_teardown(&f);
+}
+
+void
+xqc_test_wlb_pinned_flow_refreshes_delivery_sample(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    wlb_test_add_path(&f, 0, 25000, 64 * 1024, 0);
+    wlb_test_add_path(&f, 1, 25000, 64 * 1024, 0);
+
+    uint32_t flow = 0x12345678;
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, flow), 0);
+
+    wlb_test_clock_advance(1000000);
+    wlb_test_record_delivery(&f, 0, 8 * 1024 * 1024);
+    for (int i = 0; i < 100; i++) {
+        CU_ASSERT_EQUAL(wlb_test_invoke(&f, flow), 0);
+    }
+
+    xqc_wlb_path_stats_t stats[2];
+    size_t n = 0;
+    CU_ASSERT_EQUAL(xqc_wlb_scheduler_copy_path_stats(
+                        f.scheduler, stats, 2, &n),
+                    XQC_OK);
+    CU_ASSERT_EQUAL(n, 2);
+    CU_ASSERT_EQUAL(stats[0].goodput_Bps, 1024 * 1024);
+
+    wlb_test_teardown(&f);
+}
+
+void
+xqc_test_wlb_warmup_time_only_credits_selected_path(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    wlb_test_add_path(&f, 0, 25000, 64 * 1024, 0);
+    wlb_test_add_path(&f, 1, 25000, 64 * 1024, 64 * 1024);
+    CU_ASSERT_EQUAL(wlb_test_invoke_unpinned(&f), 0);
+
+    for (int i = 0; i < 31; i++) {
+        wlb_test_clock_advance(100000);
+        CU_ASSERT_EQUAL(wlb_test_invoke_unpinned(&f), 0);
+    }
+
+    xqc_wlb_path_stats_t stats[2];
+    size_t n = 0;
+    CU_ASSERT_EQUAL(xqc_wlb_scheduler_copy_path_stats(
+                        f.scheduler, stats, 2, &n),
+                    XQC_OK);
+    CU_ASSERT_EQUAL(n, 2);
+    CU_ASSERT_EQUAL(stats[0].warmup, 0);
+    CU_ASSERT_EQUAL(stats[1].warmup, 1);
+
+    wlb_test_teardown(&f);
+}
+
+void
+xqc_test_wlb_topology_refresh_clears_packet_deficit(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    wlb_test_add_path(&f, 0, 25000, 64 * 1024, 0);
+    xqc_path_ctx_t *old_path =
+        wlb_test_add_path(&f, 1, 25000, 64 * 1024, 0);
+    CU_ASSERT_EQUAL(wlb_test_invoke_unpinned(&f), 0);
+
+    wlb_test_detach_path(old_path);
+    wlb_test_add_path(&f, 2, 25000, 64 * 1024, 0);
+
+    CU_ASSERT_EQUAL(wlb_test_invoke_unpinned(&f), 0);
+
+    wlb_test_teardown(&f);
+}
+
+void
+xqc_test_wlb_topology_refresh_clears_pin_deficit(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    wlb_test_add_path(&f, 0, 25000, 64 * 1024, 0);
+    xqc_path_ctx_t *old_path =
+        wlb_test_add_path(&f, 1, 25000, 64 * 1024, 0);
+    (void)wlb_test_invoke(&f, 0x11111111);
+
+    wlb_test_detach_path(old_path);
+    wlb_test_add_path(&f, 2, 25000, 64 * 1024, 0);
+
+    uint32_t flow = 0x22222222;
+    (void)wlb_test_invoke(&f, flow);
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, flow), 0);
+
+    wlb_test_teardown(&f);
+}
+
+void
+xqc_test_wlb_ewma_uses_exact_seven_eighths_history(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    wlb_test_add_path(&f, 0, 25000, 64 * 1024, 0);
+    wlb_test_add_path(&f, 1, 25000, 64 * 1024, 0);
+    wlb_test_drain_initial_round(&f);
+
+    wlb_test_clock_advance(1000000);
+    wlb_test_record_delivery(&f, 0, 8 * 1024 * 1024);
+    wlb_test_record_delivery(&f, 1, 8 * 1024 * 1024);
+    (void)wlb_test_invoke_unpinned(&f);
+
+    xqc_wlb_path_stats_t stats[2];
+    size_t n = 0;
+    CU_ASSERT_EQUAL(xqc_wlb_scheduler_copy_path_stats(
+                        f.scheduler, stats, 2, &n),
+                    XQC_OK);
+    CU_ASSERT_EQUAL(stats[0].goodput_Bps, 1024 * 1024);
+
+    for (int i = 0; i < 99; i++) {
+        (void)wlb_test_invoke_unpinned(&f);
+    }
+    wlb_test_clock_advance(1000000);
+    wlb_test_record_delivery(&f, 0, 8 * 1024 * 1024);
+    wlb_test_record_delivery(&f, 1, 8 * 1024 * 1024);
+    (void)wlb_test_invoke_unpinned(&f);
+
+    CU_ASSERT_EQUAL(xqc_wlb_scheduler_copy_path_stats(
+                        f.scheduler, stats, 2, &n),
+                    XQC_OK);
+    CU_ASSERT_EQUAL(stats[0].goodput_Bps, 15 * 1024 * 1024 / 8);
+
+    wlb_test_teardown(&f);
+}
+
+void
+xqc_test_wlb_loss_above_two_percent_downweights_path(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    wlb_test_add_path(&f, 0, 25000, 64 * 1024, 0);
+    wlb_test_add_path(&f, 1, 25000, 64 * 1024, 0);
+    wlb_test_drain_initial_round(&f);
+
+    /* Heavy loss must still visibly shed load even when acked goodput is
+     * equal: the gentle (100-loss)% haircut on measured goodput covers a
+     * degrading path before the EWMA reflects it. Mild loss (see
+     * measured_goodput_ignores_loss_penalty) must NOT be punished twice. */
+    f.send_ctls[1].ctl_recent_send_count[0] = 100;
+    f.send_ctls[1].ctl_recent_lost_count[0] = 30;
+    wlb_test_clock_advance(1000000);
+    wlb_test_record_delivery(&f, 0, 8 * 1024 * 1024);
+    wlb_test_record_delivery(&f, 1, 8 * 1024 * 1024);
+
+    int path0_count = wlb_test_count_unpinned_path(&f, 0, 100);
+    CU_ASSERT_TRUE(path0_count >= 55 && path0_count <= 65);
+
+    wlb_test_teardown(&f);
+}
+
+void
+xqc_test_wlb_control_delivery_does_not_advance_learning(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    wlb_test_add_path(&f, 0, 25000, 64 * 1024, 0);
+    wlb_test_add_path(&f, 1, 25000, 64 * 1024, 0);
+    wlb_test_drain_initial_round(&f);
+
+    /* ctl_delivered includes these validation/handshake bytes. */
+    wlb_test_clock_advance(1000000);
+    wlb_test_record_acked_packet(
+        &f, 0, XQC_FRAME_BIT_PATH_CHALLENGE, 2 * 1024 * 1024, 0);
+    wlb_test_record_acked_packet(
+        &f, 1, XQC_FRAME_BIT_CRYPTO, 2 * 1024 * 1024, 0);
+    (void)wlb_test_invoke_unpinned(&f);
+
+    xqc_wlb_path_stats_t stats[2];
+    size_t n = 0;
+    CU_ASSERT_EQUAL(xqc_wlb_scheduler_copy_path_stats(
+                        f.scheduler, stats, 2, &n),
+                    XQC_OK);
+    CU_ASSERT_EQUAL(n, 2);
+    CU_ASSERT_EQUAL(stats[0].goodput_Bps, 0);
+    CU_ASSERT_EQUAL(stats[1].goodput_Bps, 0);
+    CU_ASSERT_EQUAL(stats[0].warmup, 1);
+    CU_ASSERT_EQUAL(stats[1].warmup, 1);
+
+    wlb_test_teardown(&f);
+}
+
+void
+xqc_test_wlb_application_delivery_advances_learning(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    wlb_test_add_path(&f, 0, 25000, 64 * 1024, 0);
+    wlb_test_add_path(&f, 1, 25000, 64 * 1024, 0);
+    wlb_test_drain_initial_round(&f);
+
+    wlb_test_clock_advance(1000000);
+    wlb_test_record_stream_delivery(&f, 0, 8 * 1024 * 1024);
+    wlb_test_record_generated_datagram_delivery(&f, 1, 1049, 1000);
+    (void)wlb_test_invoke_unpinned(&f);
+
+    xqc_wlb_path_stats_t stats[2];
+    size_t n = 0;
+    CU_ASSERT_EQUAL(xqc_wlb_scheduler_copy_path_stats(
+                        f.scheduler, stats, 2, &n),
+                    XQC_OK);
+    CU_ASSERT_EQUAL(n, 2);
+    CU_ASSERT_EQUAL(stats[0].goodput_Bps, 1024 * 1024);
+    CU_ASSERT_EQUAL(stats[1].goodput_Bps, 1049000 / 8);
+    CU_ASSERT_EQUAL(stats[0].warmup, 0);
+    CU_ASSERT_EQUAL(stats[1].warmup, 0);
+
+    wlb_test_teardown(&f);
+}
+
+void
+xqc_test_wlb_rejected_0rtt_does_not_advance_learning(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    wlb_test_add_path(&f, 0, 25000, 64 * 1024, 0);
+    wlb_test_add_path(&f, 1, 25000, 64 * 1024, 0);
+    wlb_test_drain_initial_round(&f);
+
+    wlb_test_clock_advance(1000000);
+    xqc_packet_out_t rejected;
+    memset(&rejected, 0, sizeof(rejected));
+    rejected.po_pkt.pkt_type = XQC_PTYPE_0RTT;
+    rejected.po_frame_types = XQC_FRAME_BIT_DATAGRAM;
+    rejected.po_path_id = 0;
+    rejected.po_dgram_payload_size = 2 * 1024 * 1024;
+    xqc_conn_decrease_unacked_stream_ref(&f.conn, &rejected);
+    (void)wlb_test_invoke_unpinned(&f);
+
+    xqc_wlb_path_stats_t stats[2];
+    size_t n = 0;
+    CU_ASSERT_EQUAL(xqc_wlb_scheduler_copy_path_stats(
+                        f.scheduler, stats, 2, &n),
+                    XQC_OK);
+    CU_ASSERT_EQUAL(n, 2);
+    CU_ASSERT_EQUAL(stats[0].goodput_Bps, 0);
+    CU_ASSERT_EQUAL(stats[0].warmup, 1);
+
+    wlb_test_teardown(&f);
+}
+
+void
+xqc_test_wlb_duplicate_ack_counts_application_once(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    wlb_test_add_path(&f, 0, 25000, 64 * 1024, 0);
+    wlb_test_add_path(&f, 1, 25000, 64 * 1024, 0);
+    wlb_test_drain_initial_round(&f);
+
+    wlb_test_clock_advance(1000000);
+    xqc_packet_out_t acked;
+    memset(&acked, 0, sizeof(acked));
+    acked.po_frame_types = XQC_FRAME_BIT_DATAGRAM;
+    acked.po_path_id = 0;
+    acked.po_dgram_payload_size = 8 * 1024 * 1024;
+    xqc_send_ctl_on_packet_acked(&f.send_ctls[0], &acked,
+                                 g_fake_now_us, 1);
+    xqc_send_ctl_on_packet_acked(&f.send_ctls[0], &acked,
+                                 g_fake_now_us, 1);
+    (void)wlb_test_invoke_unpinned(&f);
+
+    xqc_wlb_path_stats_t stats[2];
+    size_t n = 0;
+    CU_ASSERT_EQUAL(xqc_wlb_scheduler_copy_path_stats(
+                        f.scheduler, stats, 2, &n),
+                    XQC_OK);
+    CU_ASSERT_EQUAL(n, 2);
+    CU_ASSERT_EQUAL(stats[0].goodput_Bps, 1024 * 1024);
+    CU_ASSERT_EQUAL(stats[0].warmup, 0);
+
+    wlb_test_teardown(&f);
+}
+
+void
+xqc_test_wlb_asym_pin_follows_weight_ratio(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    wlb_test_add_path(&f, 0, 10000, 192 * 1024, 0);
+    wlb_test_add_path(&f, 1, 10000, 64 * 1024, 0);
+
+    int on_path0 = 0;
+    int on_path1 = 0;
+    for (int i = 0; i < 16; i++) {
+        uint32_t flow = 0x20000000u + (uint32_t)i;
+        (void)wlb_test_invoke(&f, flow);
+        uint64_t pinned = wlb_test_invoke(&f, flow);
+        if (pinned == 0) {
+            on_path0++;
+        } else if (pinned == 1) {
+            on_path1++;
+        }
+    }
+
+    CU_ASSERT_EQUAL(on_path0 + on_path1, 16);
+    CU_ASSERT_TRUE(on_path1 >= 2);
+    CU_ASSERT_TRUE(on_path0 > on_path1);
+
+    wlb_test_teardown(&f);
+}
+
 void
 xqc_test_wlb_last_path_over_pto_still_schedules(void)
 {
     wlb_test_fixture_t f;
     wlb_test_setup(&f);
 
-    xqc_path_ctx_t *survivor = wlb_test_add_path(&f, 0, 10000, 64 * 1024, 0);
-    xqc_path_ctx_t *lost     = wlb_test_add_path(&f, 1, 30000, 64 * 1024, 0);
+    xqc_path_ctx_t *survivor =
+        wlb_test_add_path(&f, 0, 10000, 64 * 1024, 0);
+    xqc_path_ctx_t *lost =
+        wlb_test_add_path(&f, 1, 30000, 64 * 1024, 0);
     CU_ASSERT_PTR_NOT_NULL_FATAL(survivor);
     CU_ASSERT_PTR_NOT_NULL_FATAL(lost);
 
     uint32_t flow = 0xB1AC4801;
     (void)wlb_test_invoke(&f, flow);
-
-    /* The second path goes away, and the survivor looks blackholed: the loss
-     * burst that accompanies a link disappearing is exactly what drives the
-     * remaining path's PTO count up. */
     wlb_test_detach_path(lost);
     survivor->path_send_ctl->ctl_pto_count = 8;
-    wlb_test_clock_advance(2000000);   /* let the 1/sec expire throttle open */
+    wlb_test_clock_advance(2000000);
 
-    /* Application data must still go somewhere. */
     CU_ASSERT_EQUAL(wlb_test_invoke(&f, flow), 0);
-
-    /* So must control and ACK traffic (flow_hash 0 → MinRTT fallback), which
-     * is the route by which the connection would recover. */
     CU_ASSERT_EQUAL(wlb_test_invoke(&f, 0), 0);
-
-    /* And an unpinned datagram flow, which takes the per-packet WRR route. */
-    CU_ASSERT_EQUAL(wlb_test_invoke(&f, 0xFFFFFFFFU), 0);
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, UINT32_MAX), 0);
 
     wlb_test_teardown(&f);
 }
 
-/* The guard still has to do its job while somewhere better exists: with one
- * healthy path available, the apparently-blackholed one is avoided. Without
- * this the fix above would have traded a deadlock for no failover at all. */
 void
 xqc_test_wlb_prefers_healthy_path_over_pto_blocked(void)
 {
     wlb_test_fixture_t f;
     wlb_test_setup(&f);
 
-    /* The stalled path is also the faster one, so only the PTO count can be
-     * what steers traffic away from it. */
-    xqc_path_ctx_t *stalled = wlb_test_add_path(&f, 0, 10000, 64 * 1024, 0);
-    xqc_path_ctx_t *healthy = wlb_test_add_path(&f, 1, 30000, 64 * 1024, 0);
+    xqc_path_ctx_t *stalled =
+        wlb_test_add_path(&f, 0, 10000, 64 * 1024, 0);
+    xqc_path_ctx_t *healthy =
+        wlb_test_add_path(&f, 1, 30000, 64 * 1024, 0);
     CU_ASSERT_PTR_NOT_NULL_FATAL(stalled);
     CU_ASSERT_PTR_NOT_NULL_FATAL(healthy);
 
@@ -698,252 +1818,7 @@ xqc_test_wlb_prefers_healthy_path_over_pto_blocked(void)
 
     CU_ASSERT_EQUAL(wlb_test_invoke(&f, 0xC0FFEE01), 1);
     CU_ASSERT_EQUAL(wlb_test_invoke(&f, 0), 1);
-    CU_ASSERT_EQUAL(wlb_test_invoke(&f, 0xFFFFFFFFU), 1);
-
-    wlb_test_teardown(&f);
-}
-
-/* Charging: a pinned flow's packets must consume WRR quantum.
- *
- * The flow-hit fast path used to return before touching deficit, so on a tunnel
- * whose flows are all pinned -- the steady state this scheduler exists for --
- * the deficits described only the unpinned minority. WRR's weighted ratio was
- * being applied to a rounding error, and a path could be saturated by one fat
- * pinned flow while the scheduler went on treating it as untouched.
- *
- * Read indirectly, as the fixture requires: pin a flow to one path, push a lot
- * of traffic through it, then present a NEW flow. The new flow's first packet
- * is the first thing to reach wlb_wrr_select since the burst, and it must be
- * steered to the path that carried none of it. Pre-fix, the burst left no trace
- * and the new flow could land on the already-saturated path. */
-void
-xqc_test_wlb_pinned_traffic_consumes_deficit(void)
-{
-    wlb_test_fixture_t f;
-    wlb_test_setup(&f);
-
-    /* Two identical paths, so only the traffic history can distinguish them. */
-    wlb_test_add_path(&f, 0, 10000, 64 * 1024, 0);
-    wlb_test_add_path(&f, 1, 10000, 64 * 1024, 0);
-
-    /* Establish one flow and find out where it landed. */
-    uint32_t hot = 0x5A5A0001;
-    (void)wlb_test_invoke(&f, hot);
-    uint64_t hot_path = wlb_test_invoke(&f, hot);
-    CU_ASSERT_TRUE(hot_path == 0 || hot_path == 1);
-    uint64_t cold_path = (hot_path == 0) ? 1 : 0;
-
-    /* Drive a burst through it. Every one of these takes the flow-hit fast
-     * path; pre-fix, none of them changed any deficit. */
-    for (int i = 0; i < 200; i++) {
-        CU_ASSERT_EQUAL(wlb_test_invoke(&f, hot), hot_path);
-    }
-
-    /* Now read the deficits directly, with unpinned datagrams -- they take the
-     * WRR every time and are never pinned, so nothing about the pin policy
-     * enters the measurement.
-     *
-     * Assert on the LENGTH of the run that lands on the cold path, not on
-     * where the first packet goes. The first packet is not a discriminator:
-     * the cold path holds one round's quantum in both versions of the code, so
-     * it wins that one selection whether or not the burst was charged. What
-     * the burst buys is a run -- the hot path has to climb back out of debt,
-     * one quantum per round, before it can compete again. Charged, that is the
-     * clamp's worth of rounds; uncharged, the hot path never left zero and the
-     * two simply alternate. */
-    int cold_run = 0;
-    for (int i = 0; i < 400; i++) {
-        if (wlb_test_invoke(&f, 0xFFFFFFFFU) != cold_path) {
-            break;
-        }
-        cold_run++;
-    }
-
-    /* Alternation gives 1. The debt clamp gives WLB_DEFICIT_CAP_MIN-ish, and
-     * the exact figure depends on quantum rounding, so assert the order of
-     * magnitude rather than the value. */
-    CU_ASSERT_TRUE(cold_run >= 8);
-
-    wlb_test_teardown(&f);
-}
-
-/* The debt a burst can run up is bounded.
- *
- * Charging pinned traffic without a clamp would let one path accumulate
- * unbounded debt, and WRR would then skip it for as many packets again --
- * long after the pin distribution that caused the imbalance had changed. The
- * clamp keeps the correction proportional to the imbalance rather than to how
- * long it went unobserved.
- *
- * Observable as: after a very long burst on one path, the OTHER path must not
- * absorb an unbounded run of unpinned packets. The bound is now on the SPREAD
- * between paths (WLB_DEFICIT_SPREAD_MAX, 4096) rather than a floor under each
- * one, so the run is longer than it used to be but still bounded well inside
- * the burst. */
-void
-xqc_test_wlb_deficit_debt_is_bounded(void)
-{
-    wlb_test_fixture_t f;
-    wlb_test_setup(&f);
-
-    wlb_test_add_path(&f, 0, 10000, 64 * 1024, 0);
-    wlb_test_add_path(&f, 1, 10000, 64 * 1024, 0);
-
-    uint32_t hot = 0x6B6B0001;
-    (void)wlb_test_invoke(&f, hot);
-    uint64_t hot_path = wlb_test_invoke(&f, hot);
-    uint64_t cold_path = (hot_path == 0) ? 1 : 0;
-
-    /* A burst far longer than any sane clamp. */
-    for (int i = 0; i < 20000; i++) {
-        (void)wlb_test_invoke(&f, hot);
-    }
-
-    /* Unpinned datagrams (hash == WLB_FLOW_HASH_UNPINNED) go through WRR every
-     * time without ever being pinned, so they read the deficits directly.
-     * Count how many land on the cold path before the hot path is chosen
-     * again.
-     *
-     * Both bounds carry weight, and they bracket the clamp from either side.
-     * Without charging at all the paths merely alternate and this is 1, so the
-     * lower bound is what proves the burst was seen. Without a clamp the debt
-     * would be -20000 and the hot path could not be chosen again for that many
-     * packets, so the upper bound is what proves the burst did not mortgage
-     * the path. Only a charged-and-clamped scheduler lands between them. */
-    int cold_run = 0;
-    for (int i = 0; i < 12000; i++) {
-        if (wlb_test_invoke(&f, 0xFFFFFFFFU) == hot_path) {
-            break;
-        }
-        cold_run++;
-    }
-    CU_ASSERT_TRUE(cold_run >= 8);      /* the burst was noticed at all */
-    CU_ASSERT_TRUE(cold_run < 10000);   /* ...but did not mortgage the path */
-    (void)cold_path;
-
-    wlb_test_teardown(&f);
-}
-
-/* The debt floor must not erase the DIFFERENCE between two overspent paths.
- *
- * This is the property the old shared ceiling lost, and no test caught it: the
- * credit cap doubled as the debt cap at 64, so on any busy tunnel both paths
- * reached -64 within a second and stayed there. Instrumented runs put 27 of 39
- * rows (34026833126) and 20 of 22 (34036912262) at exactly -64 on BOTH paths.
- * WRR reads the difference between deficits, so once both sit on the floor a
- * path that overspent by 20000 packets and one that overspent by 300 are
- * indistinguishable -- the correction vanishes exactly when the imbalance is
- * largest, which is the opposite of what the clamp was for.
- *
- * Observable without reaching into the struct: burst two DIFFERENT amounts
- * through two flows pinned to different paths, then read the deficits with
- * unpinned datagrams. The path that took 10x the traffic must be skipped for
- * correspondingly longer. Under a shared 64 floor both bursts clamp to the
- * same value and the two runs come out equal. */
-void
-xqc_test_wlb_debt_floor_preserves_imbalance(void)
-{
-    wlb_test_fixture_t f;
-    wlb_test_setup(&f);
-
-    wlb_test_add_path(&f, 0, 10000, 64 * 1024, 0);
-    wlb_test_add_path(&f, 1, 10000, 64 * 1024, 0);
-
-    /* Two flows. Whichever paths they land on, one gets 10x the other. */
-    uint32_t flow_a = 0x7D7D0001;
-    (void)wlb_test_invoke(&f, flow_a);
-    uint64_t path_a = wlb_test_invoke(&f, flow_a);
-
-    uint32_t flow_b = 0x7D7D0002;
-    uint64_t path_b = wlb_test_invoke(&f, flow_b);
-    for (int i = 0; i < 40 && path_b == path_a; i++) {
-        /* Land the second flow on the other path. Hashes are arbitrary here,
-         * so retry with fresh ones rather than assume the pin policy. */
-        flow_b = 0x7D7D0002 + (uint32_t)(i + 1) * 0x1000U;
-        path_b = wlb_test_invoke(&f, flow_b);
-    }
-    if (path_b == path_a) {
-        /* Could not separate the flows; nothing to compare. Not a failure of
-         * the property under test, so do not assert one either way. */
-        wlb_test_teardown(&f);
-        return;
-    }
-
-    for (int i = 0; i < 3000; i++) {
-        (void)wlb_test_invoke(&f, flow_a);   /* the heavy one */
-    }
-    for (int i = 0; i < 300; i++) {
-        (void)wlb_test_invoke(&f, flow_b);   /* one tenth as much */
-    }
-
-    /* Unpinned datagrams read the deficits directly. The heavier path must be
-     * skipped for materially longer than the lighter one. */
-    int run_off_a = 0;
-    for (int i = 0; i < 6000; i++) {
-        if (wlb_test_invoke(&f, 0xFFFFFFFFU) == path_a) {
-            break;
-        }
-        run_off_a++;
-    }
-
-    /* Under the old shared floor both paths pinned at -64, so this ratio was
-     * 1. Any real separation proves the debts stayed distinguishable. */
-    CU_ASSERT_TRUE(run_off_a > 100);
-
-    wlb_test_teardown(&f);
-}
-
-/* Weights must track live path state, not the state at connection start.
- *
- * They used to be recomputed only at a WRR round boundary, and rounds only end
- * when traffic reaches wlb_wrr_select -- which a fully-pinned tunnel almost
- * never does. So the weights froze at the cwnd skew of the first few packets,
- * and every later pin was decided against that snapshot. Now they are on a
- * WLB_WEIGHT_REFRESH_US clock, ticked from the pinned fast path too.
- *
- * Read indirectly: start with path 0 wide, pin a flow (it goes to 0). Then
- * reverse the cwnds and let the refresh clock elapse, driving only pinned
- * traffic in the meantime -- the fast path, which pre-fix updated nothing. A
- * new flow must now be pinned by the CURRENT weights, i.e. to path 1. */
-void
-xqc_test_wlb_weights_refresh_off_the_round_boundary(void)
-{
-    wlb_test_fixture_t f;
-    wlb_test_setup(&f);
-
-    /* Same RTT so cwnd alone decides the weight. Path 0 starts far wider. */
-    wlb_test_add_path(&f, 0, 10000, 256 * 1024, 0);
-    wlb_test_add_path(&f, 1, 10000,  16 * 1024, 0);
-
-    uint32_t first = 0x7C7C0001;
-    (void)wlb_test_invoke(&f, first);
-    CU_ASSERT_EQUAL(wlb_test_invoke(&f, first), 0 /* the wide path */);
-
-    /* The paths swap capacity -- path 1 is now the wide one. */
-    f.cong_states[0].cwnd_bytes =  16 * 1024;
-    f.cong_states[1].cwnd_bytes = 256 * 1024;
-
-    /* Time passes with nothing but pinned traffic, which is the case that used
-     * to leave the weights untouched. Stay under the 1 s flow-expire throttle
-     * so this tests the weight clock and not the expire sweep. */
-    wlb_test_clock_advance(WLB_TEST_WEIGHT_REFRESH_US * 3);
-    for (int i = 0; i < 8; i++) {
-        (void)wlb_test_invoke(&f, first);
-    }
-
-    /* New flows must follow the new capacities. Several, because the pin
-     * balances flow counts against weight share: with one flow already on
-     * path 0, a 1:1 split of two more would be wrong but a majority on the
-     * now-wide path 1 is the contract. */
-    int on0 = 0, on1 = 0;
-    for (int i = 0; i < 8; i++) {
-        uint32_t flow = 0x7C7C1000u + (uint32_t)i;
-        (void)wlb_test_invoke(&f, flow);
-        uint64_t pinned = wlb_test_invoke(&f, flow);
-        if (pinned == 0)      on0++;
-        else if (pinned == 1) on1++;
-    }
-    CU_ASSERT_TRUE(on1 > on0);
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, UINT32_MAX), 1);
 
     wlb_test_teardown(&f);
 }

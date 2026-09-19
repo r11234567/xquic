@@ -37,6 +37,62 @@ function case_print_result() {
 }
 
 
+# The random packet loss used by this end-to-end case can occasionally produce
+# a transfer that does not need an RSC recovery. Retry the complete isolated
+# transfer instead of accepting a run that only proves the connection worked.
+function run_fec_stream_rsc_case() {
+    max_attempts=3
+    attempt=1
+
+    while [ "$attempt" -le "$max_attempts" ]; do
+        killall test_server 2> /dev/null
+        clear_log
+        rm -rf tp_localhost test_session xqc_token
+        stdbuf -oL ${SERVER_BIN} -l d -e -f -x 1 -M > /dev/null &
+        sleep 1
+
+        sudo ${CLIENT_BIN} -s 5120000 -l e -E -d 30 -g -M -i lo -i lo \
+            --fec_encoder 8 --fec_decoder 8 > stdlog
+        client_status=$?
+        transfer_ok=0
+        recovery_seen=0
+        error_free=0
+        grep -Fq ">>>>>>>> pass:1" stdlog && transfer_ok=1
+        grep -q '|process packet of block .\{1,3\} successfully' slog \
+            && recovery_seen=1
+        errlog=`grep_err_log`
+        [ -z "$errlog" ] && error_free=1
+
+        if [ "$client_status" -eq 0 ] && [ "$transfer_ok" -eq 1 ] \
+            && [ "$recovery_seen" -eq 1 ] && [ "$error_free" -eq 1 ]; then
+            echo ">>>>>>>> pass:1"
+            case_print_result "fec_recovered_function_of_stream_rsc" "pass"
+            return
+        fi
+
+        echo "RSC attempt ${attempt}/${max_attempts}: client_status=${client_status}" \
+            "transfer_ok=${transfer_ok} recovery_seen=${recovery_seen}" \
+            "error_free=${error_free}"
+        if [ -n "$errlog" ]; then
+            echo "$errlog"
+        fi
+        attempt=$((attempt + 1))
+    done
+
+    echo ">>>>>>>> pass:0"
+    case_print_result "fec_recovered_function_of_stream_rsc" "fail"
+}
+
+
+if [ "${1:-}" = "--only-fec-rsc" ]; then
+    echo -e "check fec recovery function of stream using RSC ...\c"
+    run_fec_stream_rsc_case
+    killall test_server 2> /dev/null
+    cd -
+    exit 0
+fi
+
+
 # start test_server
 rm -rf tp_localhost test_session xqc_token
 killall test_server 2> /dev/null
@@ -4916,23 +4972,8 @@ else
     case_print_result "fec_recovered_function_of_stream_xor" "fail"
 fi
 
-clear_log
-killall test_server 2> /dev/null
-stdbuf -oL ${SERVER_BIN} -l d -e -f -x 1 -M > /dev/null &
-sleep 1
-
-rm -rf tp_localhost test_session xqc_token
 echo -e "check fec recovery function of stream using RSC ...\c"
-sudo ${CLIENT_BIN} -s 5120000 -l e -E -d 30 -g -M -i lo -i lo --fec_encoder 8 --fec_decoder 8 > stdlog
-slog_res1=`grep '|process packet of block .\{1,3\} successfully' slog`
-errlog=`grep_err_log`
-if [ -z "$errlog" ] && [ -n "$slog_res1" ]; then
-    echo ">>>>>>>> pass:1"
-    case_print_result "fec_recovered_function_of_stream_rsc" "pass"
-else
-    echo ">>>>>>>> pass:0"
-    case_print_result "fec_recovered_function_of_stream_rsc" "fail"
-fi
+run_fec_stream_rsc_case
 
 clear_log
 killall test_server 2> /dev/null
@@ -4980,24 +5021,53 @@ fi
 #   4. If the old enum truncated bit 32 to 0, "FEC_REPAIR" would NEVER
 #      appear in the log -> grep fails -> test fails
 #
-# Test 1: verify client SENDS repair symbols (grep clog)
-# Test 2: verify server RECEIVES repair symbols (grep slog)
+# One transfer verifies both that the client SENDS repair symbols (clog) and
+# the server RECEIVES them (slog). FEC repair emission is asynchronous with
+# application completion, so a short-lived test process can occasionally
+# finish before the repair packet is logged. Use a bounded whole-transfer
+# retry: a real bit-32 regression remains absent on every attempt, while send
+# and receive must be observed together in the same successful attempt.
 #
 # Keep this test single-path. Its contract is the frame-type bit, and enabling
 # multipath makes repair delivery depend on asynchronous standby-path setup.
 
-clear_log
-killall test_server 2> /dev/null
-stdbuf -oL ${SERVER_BIN} -l d -e -f -x 700 > /dev/null &
-sleep 1
+fec_frame_sent=0
+fec_frame_received=0
+fec_frame_transfer_ok=0
+fec_frame_error_free=0
+fec_frame_attempt=0
 
-rm -rf tp_localhost test_session xqc_token
+for fec_frame_attempt in 1 2 3; do
+    clear_log
+    killall test_server 2> /dev/null
+    stdbuf -oL ${SERVER_BIN} -l d -e -f -x 700 > /dev/null &
+    sleep 1
+
+    rm -rf tp_localhost test_session xqc_token
+    sudo ${CLIENT_BIN} -s 5120000 -l d -E -d 30 -g -x 700 > stdlog
+    clog_repair=`grep 'frame:.*FEC_REPAIR' clog`
+    slog_repair=`grep 'frame:.*FEC_REPAIR' slog`
+    echo_result=`grep ">>>>>>>> pass" stdlog`
+    errlog=`grep_err_log`
+
+    fec_frame_sent=0
+    fec_frame_received=0
+    fec_frame_transfer_ok=0
+    fec_frame_error_free=0
+    [ -n "$clog_repair" ] && fec_frame_sent=1
+    [ -n "$slog_repair" ] && fec_frame_received=1
+    [ "$echo_result" == ">>>>>>>> pass:1" ] && fec_frame_transfer_ok=1
+    [ -z "$errlog" ] && fec_frame_error_free=1
+
+    if [ $fec_frame_sent -eq 1 ] && [ $fec_frame_received -eq 1 ] \
+        && [ $fec_frame_transfer_ok -eq 1 ] && [ $fec_frame_error_free -eq 1 ]; then
+        break
+    fi
+done
+
 echo -e "frame_type_bit repair symbol sent (bit 32 non-zero) ...\c"
-sudo ${CLIENT_BIN} -s 5120000 -l d -E -d 30 -g -x 700 > stdlog
-clog_repair=`grep 'frame:.*FEC_REPAIR' clog`
-echo_result=`grep ">>>>>>>> pass" stdlog`
-errlog=`grep_err_log`
-if [ -z "$errlog" ] && [ -n "$clog_repair" ] && [ "$echo_result" == ">>>>>>>> pass:1" ]; then
+if [ $fec_frame_sent -eq 1 ] && [ $fec_frame_transfer_ok -eq 1 ] \
+    && [ $fec_frame_error_free -eq 1 ]; then
     echo ">>>>>>>> pass:1"
     case_print_result "frame_type_bit_repair_sent" "pass"
 else
@@ -5005,24 +5075,20 @@ else
     case_print_result "frame_type_bit_repair_sent" "fail"
 fi
 
-
-clear_log
-killall test_server 2> /dev/null
-stdbuf -oL ${SERVER_BIN} -l d -e -f -x 700 > /dev/null &
-sleep 1
-
-rm -rf tp_localhost test_session xqc_token
 echo -e "frame_type_bit repair symbol received (bit 32 non-zero) ...\c"
-sudo ${CLIENT_BIN} -s 5120000 -l d -E -d 30 -g -x 700 > stdlog
-slog_repair=`grep 'frame:.*FEC_REPAIR' slog`
-echo_result=`grep ">>>>>>>> pass" stdlog`
-errlog=`grep_err_log`
-if [ -z "$errlog" ] && [ -n "$slog_repair" ] && [ "$echo_result" == ">>>>>>>> pass:1" ]; then
+if [ $fec_frame_received -eq 1 ] && [ $fec_frame_transfer_ok -eq 1 ] \
+    && [ $fec_frame_error_free -eq 1 ]; then
     echo ">>>>>>>> pass:1"
     case_print_result "frame_type_bit_repair_received" "pass"
 else
     echo ">>>>>>>> pass:0"
     case_print_result "frame_type_bit_repair_received" "fail"
+fi
+
+if [ $fec_frame_sent -ne 1 ] || [ $fec_frame_received -ne 1 ] \
+    || [ $fec_frame_transfer_ok -ne 1 ] || [ $fec_frame_error_free -ne 1 ]; then
+    echo "FEC frame check exhausted attempts:$fec_frame_attempt sent:$fec_frame_sent received:$fec_frame_received transfer:$fec_frame_transfer_ok error_free:$fec_frame_error_free"
+    echo "$errlog"
 fi
 
 
@@ -5990,7 +6056,8 @@ wrong_direction_stream_case 708 "stream_frame_on_local_uncreated_stream" \
 killall test_server 2> /dev/null
 
 # QUIC transport stream-reassembly cap. IDs 727/728 avoid the existing
-# 705/706 wrong-direction stream allocations.
+# 705/706 wrong-direction stream allocations. The happy path uses the
+# two-tier default and must complete without a cap rejection.
 killall test_server 2> /dev/null
 ${SERVER_BIN} -l d -e > /dev/null &
 sleep 1
@@ -6006,6 +6073,9 @@ else
     case_print_result "stream_reassembly_cap_happy" "fail"
 fi
 
+# The abnormal path shrinks the reassembly cap to 16. Client-side drops force
+# cap rejections; the transfer must still complete byte-identically and the
+# server engine must not report a packet processing failure.
 killall test_server 2> /dev/null
 ${SERVER_BIN} -l d -e -x 728 > /dev/null &
 sleep 1

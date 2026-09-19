@@ -1614,6 +1614,11 @@ xqc_stream_recv(xqc_stream_t *stream, unsigned char *recv_buf, size_t recv_buf_s
             if (stream->stream_data_in.buffered_frame_count > 0) {
                 stream->stream_data_in.buffered_frame_count--;
             }
+            if (stream->stream_data_in.buffered_data_bytes >= stream_frame->data_length) {
+                stream->stream_data_in.buffered_data_bytes -= stream_frame->data_length;
+            } else {
+                stream->stream_data_in.buffered_data_bytes = 0;
+            }
             xqc_free(stream_frame->data);
             xqc_free(stream_frame);
             continue;
@@ -1642,6 +1647,11 @@ xqc_stream_recv(xqc_stream_t *stream, unsigned char *recv_buf, size_t recv_buf_s
             xqc_list_del_init(&stream_frame->sf_list);
             if (stream->stream_data_in.buffered_frame_count > 0) {
                 stream->stream_data_in.buffered_frame_count--;
+            }
+            if (stream->stream_data_in.buffered_data_bytes >= stream_frame->data_length) {
+                stream->stream_data_in.buffered_data_bytes -= stream_frame->data_length;
+            } else {
+                stream->stream_data_in.buffered_data_bytes = 0;
             }
             xqc_free(stream_frame->data);
             xqc_free(stream_frame);
