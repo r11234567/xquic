@@ -217,6 +217,12 @@ ACK sampling, topology changes, blackhole eviction and recovery, probe
 rotation, and STREAM routing. The standalone WLB runner registers the same
 cases in `tests/unittest/xqc_wlb_test_main.c`.
 
+The 100-opportunity scheduling round is deliberately separate from the
+200 ms acknowledged-goodput sampling clock. A routine round rollover updates
+deficits without rebuilding the path cache or allocating memory; only a real
+topology change migrates cached path state. This keeps the scheduler out of the
+per-packet allocator hot path while preserving timely path-change handling.
+
 ### Last-path PTO fallback
 
 Separate defect, found while tracing the same two-path report as above.

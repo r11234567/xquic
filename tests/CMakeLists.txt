@@ -187,6 +187,18 @@ if(HAVE_CUNIT)
         ${CUTEST_DEPEND_LIBS}
     )
 
+    add_executable(wlb_tests
+        ${UNIT_TEST_DIR}/xqc_wlb_test_main.c
+        ${UNIT_TEST_DIR}/xqc_wlb_test.c
+    )
+    target_include_directories(wlb_tests
+        PRIVATE
+        ${INCLUDE_DIRECTORIES}
+        ${CUNIT_INCLUDE_DIRS})
+    target_link_libraries(wlb_tests
+        ${CUTEST_DEPEND_LIBS}
+    )
+
     add_test(NAME run_tests COMMAND run_tests)
     set_tests_properties(run_tests PROPERTIES
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR})

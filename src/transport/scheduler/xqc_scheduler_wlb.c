@@ -121,6 +121,7 @@ typedef struct {
     wlb_path_weight_t   paths[WLB_MAX_PATHS];
     int                  n_paths;
     int                  round_remaining;
+    uint64_t             last_weight_refresh_us;
     wlb_flow_entry_t     flows[WLB_FLOW_TABLE_SIZE];
     uint64_t             last_expire_ts;  /* throttle expire scans to 1/sec */
     int                  last_healthy_paths; /* for recovery-triggered rebalance */
@@ -750,7 +751,7 @@ wlb_refresh_paths(xqc_wlb_scheduler_t *s, xqc_connection_t *conn)
         memset(&entry, 0, sizeof(entry));
         entry.path_id = path->path_id;
         entry.warmup = XQC_TRUE;
-        entry.prior_delivered_time_us = xqc_monotonic_timestamp();
+        entry.prior_delivered_time_us = now_us;
         for (int j = 0; j < old_n; j++) {
             if (old[j].path_id == path->path_id) {
                 entry = old[j];
@@ -767,10 +768,42 @@ wlb_refresh_paths(xqc_wlb_scheduler_t *s, xqc_connection_t *conn)
     if (n > 0) {
         wlb_normalize_weights(s, raw_weights);
     }
+    s->last_weight_refresh_us = now_us;
 
     if (old != NULL) {
         xqc_free(old);
     }
+}
+
+/* Refresh learned weights without rebuilding the path cache. A scheduling
+ * round is only 100 payload opportunities and can end thousands of times per
+ * second on a fast connection, while a meaningful goodput sample needs at
+ * least WLB_GOODPUT_SAMPLE_MIN_US. Reusing wlb_refresh_paths at every round
+ * used to allocate, copy, and free the full path state on that packet hot
+ * path. Topology changes still use wlb_refresh_paths; routine sampling keeps
+ * both deficit ledgers and performs no allocation. */
+static void
+wlb_refresh_weights(xqc_wlb_scheduler_t *s, xqc_connection_t *conn,
+                    uint64_t now_us)
+{
+    uint64_t raw_weights[WLB_MAX_PATHS];
+
+    for (int i = 0; i < s->n_paths; i++) {
+        xqc_path_ctx_t *path = wlb_find_path_ctx(conn, s->paths[i].path_id);
+        if (path == NULL) {
+            /* The caller checks topology before entering here. If it changed
+             * between the two scans, leave the current weights intact; the
+             * next scheduling opportunity will rebuild the cache. */
+            return;
+        }
+        raw_weights[i] =
+            wlb_compute_goodput_weight(&s->paths[i], path, now_us);
+    }
+
+    if (s->n_paths > 0) {
+        wlb_normalize_weights(s, raw_weights);
+    }
+    s->last_weight_refresh_us = now_us;
 }
 
 /**
@@ -1154,6 +1187,7 @@ xqc_wlb_scheduler_get_path(void *scheduler,
     xqc_bool_t pin_flow = (packet_out->po_flow_hash != WLB_FLOW_HASH_UNPINNED);
 
     uint64_t now_us = xqc_monotonic_timestamp();
+    xqc_bool_t round_started = XQC_FALSE;
 
     /* Recovery probe for evicted paths — see wlb_pick_evicted_probe. Only an
      * unreliable DATAGRAM may be used here. Sending a unique reliable STREAM
@@ -1190,21 +1224,31 @@ xqc_wlb_scheduler_get_path(void *scheduler,
         wlb_flow_expire(s, now_us, conn);
     }
 
-    /* Keep the WRR cache aligned before a pinned flow can take its fast path.
-     * Pinned traffic is still a payload opportunity and must periodically
-     * refresh acknowledged-delivery samples and topology state. */
+    /* Keep the WRR cache aligned before a pinned flow can take its fast path. */
     if (!wlb_active_paths_match_cache(s, conn)) {
         s->force_refresh_paths = 1;
     }
 
-    if (s->force_refresh_paths || wlb_needs_new_round(s)) {
-        if (s->force_refresh_paths) {
-            xqc_log(conn->log, XQC_LOG_INFO,
-                    "|wlb|refresh|reason:recovery|old_n_paths:%d|",
-                    s->n_paths);
-        }
+    if (s->force_refresh_paths) {
+        xqc_log(conn->log, XQC_LOG_INFO,
+                "|wlb|refresh|reason:topology|old_n_paths:%d|",
+                s->n_paths);
         wlb_refresh_paths(s, conn);
         wlb_start_round(s);
+        round_started = XQC_TRUE;
+        s->force_refresh_paths = 0;
+
+    } else if (wlb_needs_new_round(s)) {
+        if (now_us >= s->last_weight_refresh_us
+            && now_us - s->last_weight_refresh_us >= WLB_GOODPUT_SAMPLE_MIN_US)
+        {
+            wlb_refresh_weights(s, conn, now_us);
+        }
+        wlb_start_round(s);
+        round_started = XQC_TRUE;
+    }
+
+    if (round_started) {
         xqc_log(conn->log, XQC_LOG_DEBUG,
                 "|wlb|round_start|n_paths:%d|p0:%ui|d0:%i|p1:%ui|d1:%i|",
                 s->n_paths,
@@ -1212,7 +1256,6 @@ xqc_wlb_scheduler_get_path(void *scheduler,
                 (int64_t)(s->n_paths > 0 ? s->paths[0].deficit : -1),
                 (uint64_t)(s->n_paths > 1 ? s->paths[1].path_id : UINT32_MAX),
                 (int64_t)(s->n_paths > 1 ? s->paths[1].deficit : -1));
-        s->force_refresh_paths = 0;
     }
 
     /* Flow table lookup — reuse existing flow→path pinning (TCP only).
