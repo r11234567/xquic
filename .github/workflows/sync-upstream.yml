@@ -1,93 +1,185 @@
-# Biweekly sync of fork main with upstream alibaba/xquic, then ensure a PR
-# from main → mqvpn-dev exists for human review.
-name: Sync upstream main and ensure PR to mqvpn-dev
+# Biweekly audit of alibaba/xquic commits after the last manually reviewed
+# upstream SHA. Clean commits are staged on a draft PR to this fork's main;
+# conflicts are reported for selective integration instead of modifying main.
+name: Audit and stage Alibaba upstream sync
 
 on:
   schedule:
-    - cron: '0 0 * * 1'      # Every Monday 09:00 JST (00:00 UTC); biweekly via parity gate below
-  workflow_dispatch:          # Manual runs bypass the parity gate
+    - cron: '0 0 * * 1'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: sync-alibaba-upstream
+  cancel-in-progress: false
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
     steps:
-      - name: Biweekly gate (skip odd ISO weeks for scheduled runs)
+      - name: Biweekly gate
         id: parity
         run: |
+          set -euo pipefail
           if [ "${{ github.event_name }}" != "schedule" ]; then
-            echo "Manual run — bypassing parity gate."
+            echo "Manual run: bypassing parity gate."
             echo "skip=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+
           week=$(date -u +%V)
           if [ $((10#$week % 2)) -ne 0 ]; then
-            echo "ISO week $week is odd — biweekly schedule skips this run."
+            echo "ISO week $week is odd: skipping this scheduled run."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
-            echo "ISO week $week is even — proceeding."
+            echo "ISO week $week is even: checking upstream."
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Checkout fork main
         if: steps.parity.outputs.skip != 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: main
           fetch-depth: 0
 
-      - name: Sync fork main with upstream (fast-forward only)
+      - name: Fetch Alibaba upstream
         if: steps.parity.outputs.skip != 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Equivalent to clicking "Sync fork" in the GitHub UI.
-          # The next step still reports the gap if this fails (e.g. non-fast-forward).
-          resp=$(gh api -X POST "repos/${{ github.repository }}/merge-upstream" \
-            -f branch=main 2>&1) || true
-          echo "$resp"
+          set -euo pipefail
+          git remote add alibaba https://github.com/alibaba/xquic.git
+          git fetch --no-tags alibaba main:refs/remotes/alibaba/main
 
-      - name: Check whether main has commits not in mqvpn-dev
+      - name: Resolve unaudited commits
         if: steps.parity.outputs.skip != 'true'
         id: gap
         run: |
-          git fetch origin main mqvpn-dev
-          if git merge-base --is-ancestor origin/main origin/mqvpn-dev; then
+          set -euo pipefail
+          audited=$(tr -d '[:space:]' < .github/upstream-sync-base)
+          if ! printf '%s\n' "$audited" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::.github/upstream-sync-base is not a full commit SHA"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$audited" alibaba/main; then
+            echo "::error::audited SHA $audited is not in alibaba/main"
+            exit 1
+          fi
+
+          upstream=$(git rev-parse alibaba/main)
+          count=$(git rev-list --count --no-merges "$audited"..alibaba/main)
+          echo "audited=$audited" >> "$GITHUB_OUTPUT"
+          echo "upstream=$upstream" >> "$GITHUB_OUTPUT"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          if [ "$count" -eq 0 ]; then
             echo "has_gap=false" >> "$GITHUB_OUTPUT"
-            echo "main is fully contained in mqvpn-dev — nothing to PR."
+            echo "Fork audit marker already matches Alibaba main."
           else
             echo "has_gap=true" >> "$GITHUB_OUTPUT"
+            echo "$count Alibaba commit(s) require review."
           fi
 
-      - name: Ensure a PR main → mqvpn-dev exists
+      - name: Stage clean upstream commits
         if: steps.parity.outputs.skip != 'true' && steps.gap.outputs.has_gap == 'true'
+        id: stage
+        env:
+          AUDITED: ${{ steps.gap.outputs.audited }}
+          UPSTREAM: ${{ steps.gap.outputs.upstream }}
+        run: |
+          set -euo pipefail
+          branch="perf/upstream-sync-${UPSTREAM:0:12}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch" origin/main
+
+          mapfile -t commits < <(git rev-list --reverse --no-merges "$AUDITED"..alibaba/main)
+          for commit in "${commits[@]}"; do
+            if ! git cherry-pick "$commit"; then
+              failed=$(git rev-parse CHERRY_PICK_HEAD)
+              conflicts=$(git diff --name-only --diff-filter=U)
+              git cherry-pick --abort
+              echo "ready=false" >> "$GITHUB_OUTPUT"
+              echo "failed=$failed" >> "$GITHUB_OUTPUT"
+              {
+                echo 'conflicts<<EOF'
+                printf '%s\n' "$conflicts"
+                echo EOF
+              } >> "$GITHUB_OUTPUT"
+              {
+                echo "## Alibaba upstream sync needs manual integration"
+                echo
+                echo "Commit \`$failed\` conflicts with fork \`main\` in:"
+                echo '```text'
+                printf '%s\n' "$conflicts"
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          done
+
+          printf '%s\n' "$UPSTREAM" > .github/upstream-sync-base
+          git add .github/upstream-sync-base
+          git commit -m "[=]: Record audited Alibaba upstream revision"
+          remote_sha=$(git ls-remote --heads origin "$branch" | awk '{print $1}')
+          if [ -n "$remote_sha" ]; then
+            git push --force-with-lease="refs/heads/$branch:$remote_sha" \
+              origin "HEAD:refs/heads/$branch"
+          else
+            git push origin "HEAD:refs/heads/$branch"
+          fi
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Report conflicts for manual selection
+        if: steps.parity.outputs.skip != 'true' && steps.stage.outputs.ready == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FAILED: ${{ steps.stage.outputs.failed }}
+          CONFLICTS: ${{ steps.stage.outputs.conflicts }}
+          UPSTREAM: ${{ steps.gap.outputs.upstream }}
+          COUNT: ${{ steps.gap.outputs.count }}
         run: |
-          # Reuse an existing open PR if any; GitHub auto-updates its diff as main advances.
-          existing=$(gh pr list --base mqvpn-dev --head main --state open \
-                      --json number -q '.[0].number')
+          set -euo pipefail
+          title="Alibaba upstream sync requires manual integration"
+          body=$(printf '%s\n' \
+            "Alibaba main is at \`$UPSTREAM\` with $COUNT unaudited non-merge commit(s)." \
+            "Automatic staging stopped at \`$FAILED\`." \
+            "" \
+            'Conflicting paths:' \
+            '```text' \
+            "$CONFLICTS" \
+            '```' \
+            "Review the commits selectively, then advance \`.github/upstream-sync-base\` in the sync PR.")
+          existing=$(gh issue list --state open --search "in:title $title" \
+                     --json number --jq '.[0].number // empty')
           if [ -n "$existing" ]; then
-            echo "PR #$existing already open — it will refresh automatically as main advances."
-            exit 0
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
           fi
-          gh pr create \
-            --base mqvpn-dev \
-            --head main \
-            --title "chore(upstream): sync main → mqvpn-dev ($(date -u +%Y-%m-%d))" \
-            --body "$(cat <<'BODY'
-          ## Auto upstream sync
 
-          Brings the latest commits from upstream alibaba/xquic (mirrored on `main`)
-          into `mqvpn-dev`. Triggered biweekly on Monday 09:00 JST by
-          `.github/workflows/sync-upstream.yml`.
-
-          ### Review checklist
-          - [ ] Inspect upstream changes for breaking API / frame / transport-param changes
-          - [ ] Resolve conflicts with mqvpn-specific patches (MASQUE / multipath fixes, etc.)
-          - [ ] Run xquic unit / integration tests
-          - [ ] Verify the mqvpn build against this xquic SHA (bump submodule pin to test)
-          BODY
-          )"
+      - name: Ensure a draft sync PR exists
+        if: steps.parity.outputs.skip != 'true' && steps.stage.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ steps.stage.outputs.branch }}
+          COUNT: ${{ steps.gap.outputs.count }}
+          UPSTREAM: ${{ steps.gap.outputs.upstream }}
+        run: |
+          set -euo pipefail
+          existing=$(gh pr list --base main --head "$BRANCH" --state open \
+                     --json number --jq '.[0].number // empty')
+          if [ -z "$existing" ]; then
+            gh pr create \
+              --base main \
+              --head "$BRANCH" \
+              --draft \
+              --title "[~]: Stage Alibaba upstream sync" \
+              --body "Stages $COUNT Alibaba non-merge commit(s) through \`$UPSTREAM\` for fork-specific review. Build and CodeQL are dispatched explicitly."
+          fi
+          gh workflow run build.yml --ref "$BRANCH"
+          gh workflow run codeql-analysis.yml --ref "$BRANCH"

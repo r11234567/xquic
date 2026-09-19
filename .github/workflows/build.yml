@@ -3,9 +3,13 @@ name: Build
 on:
   workflow_dispatch:
   push:
-    branches: [ main, mqvpn-main, mqvpn-dev ]
+    branches: [ main ]
   pull_request:
-    branches: [ mqvpn-main, mqvpn-dev ]
+    branches: [ main ]
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
 
@@ -21,7 +25,7 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v2
+      uses: actions/checkout@v5
       with:
         fetch-depth: 2
         submodules: 'recursive'
