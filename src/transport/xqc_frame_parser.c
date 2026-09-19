@@ -1400,7 +1400,7 @@ xqc_parse_ack_frame(xqc_packet_in_t *packet_in, xqc_connection_t *conn,
    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
  */
 ssize_t
-xqc_gen_conn_close_frame(xqc_packet_out_t *packet_out, 
+xqc_gen_conn_close_frame(xqc_packet_out_t *packet_out,
     uint64_t err_code, int is_app, int frame_type,
     const unsigned char *reason, size_t reason_len)
 {

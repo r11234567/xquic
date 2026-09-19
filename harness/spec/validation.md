@@ -79,7 +79,7 @@ its case is retired so later changes cannot reuse it.
 | Range | New-case namespace | Allocated IDs |
 |-------|--------------------|---------------|
 | `[705, 799]` | QUIC Transport core | `705-728` |
-| `[800, 899]` | Recovery and congestion control | `800` |
+| `[800, 899]` | Recovery and fork MASQUE integration | `800-802` |
 | `[900, 999]` | QUIC-TLS | `902-903` |
 | `[1000, 1099]` | HTTP/3 framing, streams, and settings | `1000-1021` |
 | `[1100, 1149]` | QPACK | None |
@@ -90,6 +90,16 @@ its case is retired so later changes cannot reuse it.
 | `[1500, 1599]` | LOC and MSF application protocols | None |
 | `[1600, 1699]` | FEC and experimental transport extensions | None |
 | `[1700, 1799]` | Common runtime, public API, and test harness | `1702-1703` |
+
+The allocations affected by the fork and upstream synchronization are:
+
+| ID | Behavior contract |
+|----|-------------------|
+| `727` | Stream reassembly stays below the default cap on the normal lossy-transfer path. |
+| `728` | Stream reassembly recovers under a deliberately small cap without closing the connection. |
+| `800` | MASQUE CONNECT-IP datagrams complete over a single QUIC path. |
+| `801` | MASQUE CONNECT-IP datagrams complete over multipath QUIC. |
+| `802` | A lost `PATH_RESPONSE` is retransmitted normally and is never marked for multipath repair. |
 
 Apply these allocation rules before running a new case:
 
