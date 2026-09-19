@@ -788,6 +788,22 @@ XQC_EXPORT_PUBLIC_API
 ssize_t xqc_h3_request_finish(xqc_h3_request_t *h3_request);
 
 /**
+ * @brief Return an upper-bound estimate of bytes retained by the request's QUIC
+ * connection send queue, including packets in flight awaiting acknowledgement.
+ */
+XQC_EXPORT_PUBLIC_API
+uint64_t xqc_h3_request_get_send_queue_bytes(xqc_h3_request_t *h3_request);
+
+/**
+ * @brief Enable or disable application write notifications for a request.
+ * Enabling also schedules a notification so an application can re-check its
+ * own low-water mark after pausing an upstream producer.
+ */
+XQC_EXPORT_PUBLIC_API
+xqc_int_t xqc_h3_request_set_write_notify(xqc_h3_request_t *h3_request,
+    uint8_t enabled);
+
+/**
  * @brief receive headers of a request
  * 
  * @param h3_request handler of http3 request

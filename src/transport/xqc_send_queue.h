@@ -16,6 +16,7 @@ typedef struct xqc_send_queue_s {
     /* send queue for packets, should be in connection level */
     xqc_list_head_t             sndq_send_packets;                  /* xqc_packet_out_t to send */
     xqc_list_head_t             sndq_send_packets_high_pri;         /* xqc_packet_out_t to send with high priority */
+    xqc_list_head_t             sndq_send_packets_urgent;           /* RFC 9218 urgent application data */
     xqc_list_head_t             sndq_unacked_packets[XQC_PNS_N];    /* xqc_packet_out_t */
 
     xqc_list_head_t             sndq_lost_packets;                  /* xqc_packet_out_t */
@@ -86,6 +87,18 @@ void xqc_send_queue_remove_unacked(xqc_packet_out_t *packet_out, xqc_send_queue_
 void xqc_send_queue_move_to_head(xqc_list_head_t *pos, xqc_list_head_t *head);
 void xqc_send_queue_move_to_tail(xqc_list_head_t *pos, xqc_list_head_t *head);
 void xqc_send_queue_move_to_high_pri(xqc_list_head_t *pos, xqc_send_queue_t *send_queue);
+void xqc_send_queue_move_to_urgent(xqc_list_head_t *pos, xqc_send_queue_t *send_queue);
+
+static inline uint64_t
+xqc_send_queue_get_used_bytes(const xqc_send_queue_t *send_queue)
+{
+    uint64_t packet_size = xqc_max(send_queue->sndq_conn->pkt_out_size,
+                                   send_queue->sndq_conn->max_pkt_out_size);
+    if (packet_size != 0 && send_queue->sndq_packets_used > UINT64_MAX / packet_size) {
+        return UINT64_MAX;
+    }
+    return send_queue->sndq_packets_used * packet_size;
+}
 
 void xqc_send_queue_copy_to_lost(xqc_packet_out_t *packet_out, xqc_send_queue_t *send_queue, xqc_bool_t mark_retrans);
 void xqc_send_queue_copy_to_probe(xqc_packet_out_t *packet_out, xqc_send_queue_t *send_queue, xqc_path_ctx_t *path);
@@ -101,7 +114,5 @@ void xqc_send_queue_drop_stream_frame_packets(xqc_connection_t *conn, xqc_stream
 
 
 #endif /* _XQC_SEND_QUEUE_H_INCLUDED_ */
-
-
 
 

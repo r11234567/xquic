@@ -19,6 +19,25 @@ This is the **r11234567/xquic** fork of [alibaba/xquic](https://github.com/aliba
   normal QUIC retransmission supplies backpressure without closing the
   connection.
 
+## HTTP/3 proxy backpressure and urgency
+
+The public request API exposes the connection send-queue estimate through
+`xqc_h3_request_get_send_queue_bytes()` and lets an event-driven proxy retain or
+release write callbacks with `xqc_h3_request_set_write_notify()`. Together they
+allow a proxy to stop reading a fast h2c backend at a high-water mark and resume
+only after QUIC acknowledgements drain the queue below a low-water mark.
+
+RFC 9218 urgency 0 and 1 now use a dedicated urgent packet queue. It is
+scheduled ahead of normal application data but, unlike the fork's private
+`fastpath` priority, remains subject to congestion control and pacing. This
+allows a small late response to precede queued bulk resources without bypassing
+network safety. Retry, 0-RTT discard, connection teardown, and stream-close
+paths all preserve or clean up the new queue.
+
+`xqc_parse_http_priority()` now parses the supplied byte span without assuming
+NUL termination. This removes out-of-bounds reads on HTTP header slices and
+accepts the RFC 9218 incremental forms `i`, `i=?0`, and `i=?1`.
+
 ## Per-path PMTU discovery
 
 Upstream discovers one PMTU per *connection*. On a multipath connection whose

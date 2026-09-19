@@ -12,6 +12,7 @@
 #include "src/http3/xqc_h3_header.h"
 #include "src/http3/qpack/xqc_qpack.h"
 #include "src/transport/xqc_stream.h"
+#include "src/transport/xqc_send_queue.h"
 #include "src/http3/qpack/stable/xqc_stable.h"
 
 #include "xqc_common_test.h"
@@ -2850,4 +2851,175 @@ xqc_test_h3_pseudo_header_after_regular_rejected()
     CU_ASSERT_EQUAL(h3s->h3r->read_flag, 0);
 
     xqc_h3_msgerr_teardown(h3s, h3c, conn);
+}
+
+
+void
+xqc_test_h3_priority_bounded_parse()
+{
+    const uint8_t priority[] = {'u', '=', '1', ',', ' ', 'i', '=', '?', '1'};
+    const uint8_t malformed[] = {'u', '='};
+    const uint8_t overflow[] = {'u', '=', '2', '5', '6'};
+    xqc_h3_priority_t parsed;
+
+    CU_ASSERT_EQUAL(xqc_parse_http_priority(&parsed, priority, sizeof(priority)), XQC_OK);
+    CU_ASSERT_EQUAL(parsed.urgency, 1);
+    CU_ASSERT_EQUAL(parsed.incremental, XQC_TRUE);
+
+    CU_ASSERT_EQUAL(xqc_parse_http_priority(&parsed, malformed, sizeof(malformed)),
+                    -XQC_H3_INVALID_PRIORITY);
+    CU_ASSERT_EQUAL(xqc_parse_http_priority(&parsed, overflow, sizeof(overflow)),
+                    -XQC_H3_INVALID_PRIORITY);
+
+    CU_ASSERT_EQUAL(xqc_parse_http_priority(&parsed, NULL, 0), XQC_OK);
+    CU_ASSERT_EQUAL(parsed.urgency, XQC_DEFAULT_HTTP_PRIORITY_URGENCY);
+    CU_ASSERT_EQUAL(parsed.incremental, XQC_FALSE);
+}
+
+static int xqc_test_h3_schedule_order[2];
+static int xqc_test_h3_schedule_count;
+static int xqc_test_h3_urgent_check_cwnd;
+static int xqc_test_h3_normal_check_cwnd;
+
+static xqc_path_ctx_t *
+xqc_test_h3_priority_get_path(void *scheduler, xqc_connection_t *conn,
+                              xqc_packet_out_t *packet_out, int check_cwnd,
+                              int reinject, xqc_bool_t *cc_blocked)
+{
+    uintptr_t marker = (uintptr_t)packet_out->po_user_data;
+    if (marker == 1) {
+        xqc_test_h3_urgent_check_cwnd = check_cwnd;
+        xqc_test_h3_schedule_order[xqc_test_h3_schedule_count++] = 1;
+
+    } else if (marker == 2) {
+        xqc_test_h3_normal_check_cwnd = check_cwnd;
+        xqc_test_h3_schedule_order[xqc_test_h3_schedule_count++] = 2;
+    }
+
+    if (cc_blocked != NULL) {
+        *cc_blocked = XQC_FALSE;
+    }
+    return conn->conn_initial_path;
+}
+
+static const xqc_scheduler_callback_t xqc_test_h3_priority_scheduler = {
+    .xqc_scheduler_get_path = xqc_test_h3_priority_get_path,
+};
+
+
+void
+xqc_test_h3_priority_queue_class()
+{
+    xqc_connection_t *conn = test_engine_connect();
+    CU_ASSERT_PTR_NOT_NULL_FATAL(conn);
+
+    xqc_stream_t *urgent_stream = xqc_create_stream_with_conn(
+        conn, XQC_UNDEFINE_STREAM_ID, XQC_CLI_BID, NULL, NULL);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(urgent_stream);
+
+    xqc_h3_stream_t urgent_h3s = {0};
+    xqc_h3_request_t urgent_h3r = {0};
+    urgent_h3s.stream = urgent_stream;
+    urgent_h3s.h3r = &urgent_h3r;
+    urgent_h3r.h3_stream = &urgent_h3s;
+
+    xqc_h3_priority_t priority;
+    xqc_h3_priority_init(&priority);
+    priority.urgency = 1;
+    xqc_h3_stream_set_priority(&urgent_h3s, &priority);
+    CU_ASSERT_EQUAL(urgent_stream->stream_priority, XQC_STREAM_PRI_URGENT);
+
+    xqc_packet_out_t *packet = xqc_send_queue_get_packet_out_for_stream(
+        conn->conn_send_queue, 1, XQC_PTYPE_SHORT_HEADER, urgent_stream);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(packet);
+    CU_ASSERT_PTR_EQUAL(packet, xqc_list_entry(
+        conn->conn_send_queue->sndq_send_packets_urgent.prev,
+        xqc_packet_out_t, po_list));
+    packet->po_user_data = (void *)(uintptr_t)1;
+
+    xqc_stream_t *fast_stream = xqc_create_stream_with_conn(
+        conn, XQC_UNDEFINE_STREAM_ID, XQC_CLI_BID, NULL, NULL);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(fast_stream);
+
+    xqc_h3_stream_t fast_h3s = {0};
+    xqc_h3_request_t fast_h3r = {0};
+    fast_h3s.stream = fast_stream;
+    fast_h3s.h3r = &fast_h3r;
+    fast_h3r.h3_stream = &fast_h3s;
+    priority.fastpath = 1;
+    xqc_h3_stream_set_priority(&fast_h3s, &priority);
+    CU_ASSERT_EQUAL(fast_stream->stream_priority, XQC_STREAM_PRI_HIGH);
+
+    packet = xqc_send_queue_get_packet_out_for_stream(
+        conn->conn_send_queue, 1, XQC_PTYPE_SHORT_HEADER, fast_stream);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(packet);
+    CU_ASSERT_PTR_EQUAL(packet, xqc_list_entry(
+        conn->conn_send_queue->sndq_send_packets_high_pri.prev,
+        xqc_packet_out_t, po_list));
+
+    xqc_stream_t *normal_stream = xqc_create_stream_with_conn(
+        conn, XQC_UNDEFINE_STREAM_ID, XQC_CLI_BID, NULL, NULL);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(normal_stream);
+    packet = xqc_send_queue_get_packet_out_for_stream(
+        conn->conn_send_queue, 1, XQC_PTYPE_SHORT_HEADER, normal_stream);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(packet);
+    packet->po_user_data = (void *)(uintptr_t)2;
+
+    const xqc_scheduler_callback_t *saved_scheduler = conn->scheduler_callback;
+    conn->scheduler_callback = &xqc_test_h3_priority_scheduler;
+    xqc_test_h3_schedule_count = 0;
+    xqc_test_h3_urgent_check_cwnd = -1;
+    xqc_test_h3_normal_check_cwnd = -1;
+    xqc_conn_schedule_packets_to_paths(conn);
+    conn->scheduler_callback = saved_scheduler;
+
+    CU_ASSERT_EQUAL(xqc_test_h3_schedule_count, 2);
+    CU_ASSERT_EQUAL(xqc_test_h3_schedule_order[0], 1);
+    CU_ASSERT_EQUAL(xqc_test_h3_schedule_order[1], 2);
+    CU_ASSERT_EQUAL(xqc_test_h3_urgent_check_cwnd, XQC_TRUE);
+    CU_ASSERT_EQUAL(xqc_test_h3_normal_check_cwnd, XQC_TRUE);
+    CU_ASSERT(!xqc_list_empty(&conn->conn_initial_path
+                                   ->path_schedule_buf[XQC_SEND_TYPE_NORMAL_URGENT]));
+
+    xqc_engine_destroy(conn->engine);
+}
+
+
+void
+xqc_test_h3_backpressure_api()
+{
+    xqc_connection_t *conn = test_engine_connect();
+    CU_ASSERT_PTR_NOT_NULL_FATAL(conn);
+
+    xqc_stream_t *stream = xqc_create_stream_with_conn(
+        conn, XQC_UNDEFINE_STREAM_ID, XQC_CLI_BID, NULL, NULL);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(stream);
+
+    xqc_h3_stream_t h3s = {0};
+    xqc_h3_request_t h3r = {0};
+    h3s.stream = stream;
+    h3r.h3_stream = &h3s;
+
+    uint64_t saved_used = conn->conn_send_queue->sndq_packets_used;
+    size_t saved_size = conn->pkt_out_size;
+    size_t saved_max_size = conn->max_pkt_out_size;
+    conn->conn_send_queue->sndq_packets_used = 3;
+    conn->pkt_out_size = 1200;
+    conn->max_pkt_out_size = 1400;
+    CU_ASSERT_EQUAL(xqc_h3_request_get_send_queue_bytes(&h3r), 4200);
+
+    conn->conn_send_queue->sndq_packets_used = UINT64_MAX;
+    CU_ASSERT_EQUAL(xqc_h3_request_get_send_queue_bytes(&h3r), UINT64_MAX);
+
+    xqc_stream_shutdown_write(stream);
+    CU_ASSERT_EQUAL(xqc_h3_request_set_write_notify(&h3r, 1), XQC_OK);
+    CU_ASSERT(h3s.flags & XQC_HTTP3_STREAM_NEED_WRITE_NOTIFY);
+    CU_ASSERT(stream->stream_flag & XQC_STREAM_FLAG_READY_TO_WRITE);
+    CU_ASSERT_EQUAL(xqc_h3_request_set_write_notify(&h3r, 0), XQC_OK);
+    CU_ASSERT((h3s.flags & XQC_HTTP3_STREAM_NEED_WRITE_NOTIFY) == 0);
+
+    conn->conn_send_queue->sndq_packets_used = saved_used;
+    conn->pkt_out_size = saved_size;
+    conn->max_pkt_out_size = saved_max_size;
+    xqc_engine_destroy(conn->engine);
 }

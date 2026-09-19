@@ -5,6 +5,7 @@
 #include <inttypes.h>
 #include "src/http3/xqc_h3_request.h"
 #include "src/transport/xqc_stream.h"
+#include "src/transport/xqc_send_queue.h"
 #include "src/transport/xqc_engine.h"
 #include "src/http3/xqc_h3_conn.h"
 #include "src/http3/xqc_h3_ctx.h"
@@ -712,6 +713,41 @@ xqc_h3_request_finish(xqc_h3_request_t *h3_request)
     return xqc_h3_stream_send_finish(h3_request->h3_stream);
 }
 
+uint64_t
+xqc_h3_request_get_send_queue_bytes(xqc_h3_request_t *h3_request)
+{
+    if (h3_request == NULL || h3_request->h3_stream == NULL
+        || h3_request->h3_stream->stream == NULL
+        || h3_request->h3_stream->stream->stream_conn == NULL
+        || h3_request->h3_stream->stream->stream_conn->conn_send_queue == NULL)
+    {
+        return 0;
+    }
+
+    return xqc_send_queue_get_used_bytes(
+        h3_request->h3_stream->stream->stream_conn->conn_send_queue);
+}
+
+xqc_int_t
+xqc_h3_request_set_write_notify(xqc_h3_request_t *h3_request, uint8_t enabled)
+{
+    if (h3_request == NULL || h3_request->h3_stream == NULL
+        || h3_request->h3_stream->stream == NULL)
+    {
+        return -XQC_EPARAM;
+    }
+
+    if (enabled) {
+        h3_request->h3_stream->flags |= XQC_HTTP3_STREAM_NEED_WRITE_NOTIFY;
+        xqc_stream_ready_to_write(h3_request->h3_stream->stream);
+
+    } else {
+        h3_request->h3_stream->flags &= ~XQC_HTTP3_STREAM_NEED_WRITE_NOTIFY;
+    }
+
+    return XQC_OK;
+}
+
 
 xqc_http_headers_t *
 xqc_h3_request_recv_headers(xqc_h3_request_t *h3_request, uint8_t *fin)
@@ -1195,69 +1231,98 @@ xqc_write_http_priority(xqc_h3_priority_t *prio, uint8_t *dst, size_t dstcap)
 xqc_int_t
 xqc_parse_http_priority(xqc_h3_priority_t *dst, const uint8_t *str, size_t str_len)
 {
+    if (dst == NULL || (str == NULL && str_len != 0)) {
+        return -XQC_EPARAM;
+    }
+
     xqc_h3_priority_t prio;
     xqc_h3_priority_init(&prio);
 
-    uint8_t *p = (uint8_t *)str;
-    uint8_t *e = p + str_len;
-
-    uint8_t *v, *next_k;
-
-    while (*p != '\0' && p < e) {
-        if (*p == ' ') {
-            p++;
-            continue;
-        }
-
-        if (strncmp(p, "u=", xqc_lengthof("u=")) == 0) {
-            p += xqc_lengthof("u=");
-            prio.urgency = strtoul(p, NULL, XQC_DECIMAL);
-
-        } else if (strncmp(p, "i", xqc_lengthof("i")) == 0) {
-            v = strchr(p, '=');
-            next_k = strchr(p, ',');
-
-            if ((v == NULL) || (next_k != NULL && v > next_k)) {
-                p += xqc_lengthof("i");
-                prio.incremental = XQC_TRUE;
-
-            } else if (strncmp(p, "i=?", xqc_lengthof("i=?")) == 0) {
-                p += xqc_lengthof("i=?");
-                prio.incremental = strtoul(p, NULL, XQC_DECIMAL);
-
-            } else {
-                return -XQC_H3_INVALID_PRIORITY;
-            }
-
-        } else if (strncmp(p, "s=", xqc_lengthof("s=")) == 0) {
-            p += xqc_lengthof("s=");
-            prio.schedule = strtoul(p, NULL, XQC_DECIMAL);
-
-        } else if (strncmp(p, "r=", xqc_lengthof("r=")) == 0) {
-            p += xqc_lengthof("r=");
-            prio.reinject = strtoul(p, NULL, XQC_DECIMAL);
-
-        } else if (strncmp(p, "f=", xqc_lengthof("f=")) == 0) {
-            p += xqc_lengthof("f=");
-            // when encounter invalid priority length, set prio.fec to close stats
-            if (p + XQC_PRIORITY_FEC_VAL_LEN > e) {
-                prio.fec = XQC_FEC_CLOSE;
-                goto end;
-            }
-            prio.fec = strtoul(p, NULL, XQC_DECIMAL);
-        } else if (strncmp(p, "p", xqc_lengthof("p")) == 0) {
-            p += xqc_lengthof("p");
-            prio.fastpath = 1;
-        }
-
-        p = strchr(p, ',');
-        if (p == NULL) {
-            goto end;
-        }
-        p++;
+    if (str_len == 0) {
+        *dst = prio;
+        return XQC_OK;
     }
 
-end:
+    const uint8_t *p = str;
+    const uint8_t *end = str + str_len;
+    while (p < end) {
+        while (p < end && (*p == ' ' || *p == '\t' || *p == ',')) {
+            p++;
+        }
+        if (p == end) {
+            break;
+        }
+
+        const uint8_t *item_end = p;
+        while (item_end < end && *item_end != ',') {
+            item_end++;
+        }
+        const uint8_t *trimmed_end = item_end;
+        while (trimmed_end > p
+               && (trimmed_end[-1] == ' ' || trimmed_end[-1] == '\t'))
+        {
+            trimmed_end--;
+        }
+
+        const uint8_t *eq = p;
+        while (eq < trimmed_end && *eq != '=') {
+            eq++;
+        }
+        const uint8_t *key_end = eq;
+        while (key_end > p && (key_end[-1] == ' ' || key_end[-1] == '\t')) {
+            key_end--;
+        }
+
+        if (key_end - p == 1 && *p == 'i' && eq == trimmed_end) {
+            prio.incremental = XQC_TRUE;
+
+        } else if (key_end - p == 1 && *p == 'p' && eq == trimmed_end) {
+            prio.fastpath = XQC_TRUE;
+
+        } else if (eq < trimmed_end && key_end - p == 1) {
+            const uint8_t *value = eq + 1;
+            while (value < trimmed_end && (*value == ' ' || *value == '\t')) {
+                value++;
+            }
+
+            if (*p == 'i') {
+                if (trimmed_end - value != 2 || value[0] != '?'
+                    || (value[1] != '0' && value[1] != '1'))
+                {
+                    return -XQC_H3_INVALID_PRIORITY;
+                }
+                prio.incremental = value[1] == '1';
+
+            } else if (*p == 'u' || *p == 's' || *p == 'r' || *p == 'f') {
+                uint64_t parsed = 0;
+                const uint64_t limit = *p == 'f' ? UINT32_MAX : UINT8_MAX;
+                if (value == trimmed_end) {
+                    return -XQC_H3_INVALID_PRIORITY;
+                }
+                for (const uint8_t *digit = value; digit < trimmed_end; digit++) {
+                    if (*digit < '0' || *digit > '9'
+                        || parsed > (limit - (*digit - '0')) / 10)
+                    {
+                        return -XQC_H3_INVALID_PRIORITY;
+                    }
+                    parsed = parsed * 10 + (*digit - '0');
+                }
+
+                if (*p == 'u') {
+                    prio.urgency = (uint8_t)parsed;
+                } else if (*p == 's') {
+                    prio.schedule = (uint8_t)parsed;
+                } else if (*p == 'r') {
+                    prio.reinject = (uint8_t)parsed;
+                } else {
+                    prio.fec = (uint32_t)parsed;
+                }
+            }
+        }
+
+        p = item_end;
+    }
+
     *dst = prio;
     return XQC_OK;
 }

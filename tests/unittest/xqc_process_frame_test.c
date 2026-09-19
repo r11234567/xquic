@@ -1706,6 +1706,8 @@ xqc_test_count_queued_frame(xqc_connection_t *conn,
                                           frame_bit);
     count += xqc_test_count_frame_in_list(
         &send_queue->sndq_send_packets_high_pri, frame_bit);
+    count += xqc_test_count_frame_in_list(
+        &send_queue->sndq_send_packets_urgent, frame_bit);
     count += xqc_test_count_frame_in_list(&send_queue->sndq_lost_packets,
                                           frame_bit);
     count += xqc_test_count_frame_in_list(

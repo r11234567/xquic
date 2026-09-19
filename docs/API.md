@@ -982,6 +982,23 @@ Finish request stream on endpoint's direction. if fin is not sent yet, and appli
 
 If there is data in h3 request stream's send buffer, the fin will be attached with the last data block. If all the data were sent, xquic will send a QUIC Transport STREAM frame with zero-length data and fin set.
 
+#### xqc_h3_request_get_send_queue_bytes
+```
+uint64_t xqc_h3_request_get_send_queue_bytes(xqc_h3_request_t *h3_request);
+```
+Return an upper-bound estimate of bytes retained by the request's QUIC
+connection send queue, including packets in flight awaiting acknowledgement.
+The value is intended for connection-level application backpressure.
+
+#### xqc_h3_request_set_write_notify
+```
+xqc_int_t xqc_h3_request_set_write_notify(xqc_h3_request_t *h3_request,
+    uint8_t enabled);
+```
+Enable or disable application write notifications for a request. Enabling also
+schedules a notification, allowing a paused producer to re-check its low-water
+mark as acknowledgements release queued packets.
+
 #### xqc_h3_request_recv_headers
 ```
 xqc_http_headers_t *xqc_h3_request_recv_headers(xqc_h3_request_t *h3_request, uint8_t *fin);
