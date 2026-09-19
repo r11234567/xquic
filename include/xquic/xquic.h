@@ -1447,7 +1447,7 @@ typedef struct xqc_conn_settings_s {
     /**
      * Max buffered out-of-order STREAM frame nodes per stream (reassembly
      * cap, CWE-770 mitigation per RFC 9000 §21.7). 0 means the built-in
-     * default (8192). Lowering it bounds reassembly memory more tightly at
+     * default (16384). Lowering it bounds reassembly memory more tightly at
      * the cost of more retransmissions under heavy cross-path reordering.
      */
     uint64_t max_stream_frame_buffered_cnt;

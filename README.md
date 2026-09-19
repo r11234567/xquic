@@ -17,7 +17,12 @@ This is the **r11234567/xquic** fork of [alibaba/xquic](https://github.com/aliba
   hits are rate-limited in logs, and FIN repair prevents a rejected frame from
   leaving the receive state incomplete. The packet remains unacknowledged so
   normal QUIC retransmission supplies backpressure without closing the
-  connection.
+  connection. Index: the public setting and its `16384` default are documented
+  in `include/xquic/xquic.h`; the default is defined by
+  `XQC_MAX_STREAM_FRAME_BUFFERED_COUNT` in `src/transport/xqc_defs.h`; and
+  `src/transport/xqc_frame.c` has a compile-time assertion that the default
+  frame budget, at the minimum STREAM-frame payload, covers the advertised
+  16 MiB receive window.
 
 ## HTTP/3 proxy backpressure and urgency
 
