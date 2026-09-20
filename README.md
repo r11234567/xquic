@@ -1,4 +1,4 @@
-# mp0rta/xquic — fork notice
+# r11234567/xquic — fork notice
 
 This is the **r11234567/xquic** fork of [alibaba/xquic](https://github.com/alibaba/xquic), adding [draft-ietf-quic-multipath-21](https://datatracker.ietf.org/doc/draft-ietf-quic-multipath/21/) wire compliance and CONNECT-IP ([RFC 9484](https://www.rfc-editor.org/rfc/rfc9484.html)) support for the [mqvpn(fork)](https://github.com/r11234567/mqvpn) project. Per-PR audit findings against the draft live under [`docs/audit-notes/`](docs/audit-notes/). Upstream alibaba/xquic README follows.
 
