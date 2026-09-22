@@ -982,24 +982,37 @@ Finish request stream on endpoint's direction. if fin is not sent yet, and appli
 
 If there is data in h3 request stream's send buffer, the fin will be attached with the last data block. If all the data were sent, xquic will send a QUIC Transport STREAM frame with zero-length data and fin set.
 
-#### xqc_h3_request_get_send_queue_bytes
+#### xqc_h3_request_get_unsent_queue_bytes
 ```
-uint64_t xqc_h3_request_get_send_queue_bytes(xqc_h3_request_t *h3_request);
+uint64_t xqc_h3_request_get_unsent_queue_bytes(xqc_h3_request_t *h3_request);
 ```
-Return an upper-bound estimate of bytes retained by the request's QUIC
-connection send queue, including packets in flight awaiting acknowledgement.
-The value is intended for connection-level application backpressure.
+Upper-bound estimate of the bytes this request's QUIC connection still has to
+put on the wire. Packets already sent and awaiting acknowledgement are not
+counted: they are the congestion controller's budget, and a connection running
+at its BDP holds a congestion window of them at all times, so counting them
+makes an application watermark latch closed on exactly the fast connections it
+is meant to pace.
+
+Use it as a memory bound only. To pace a producer, use the return value of
+`xqc_h3_request_send_body`: a short write or `-XQC_EAGAIN` is the
+authoritative stop signal and is scoped to one stream rather than the whole
+connection.
 
 #### xqc_h3_request_set_write_notify
 ```
 xqc_int_t xqc_h3_request_set_write_notify(xqc_h3_request_t *h3_request,
     uint8_t enabled);
 ```
-Enable or disable application write notifications for a request. Enabling also
-schedules a notification, allowing a paused producer to re-check its low-water
-mark as acknowledgements release queued packets. Disabling removes an otherwise
-idle transport stream from writable scheduling; H3-internal buffered-frame
-retries remain scheduled.
+Enable or disable application write notifications for a request. While
+enabled, `h3_request_write_notify` runs on every engine pass in which the
+stream is writable, so an acknowledgement that releases queue space reaches
+the application without a separate timer.
+
+Enabling is not sticky across a fully accepted write: `xqc_stream_send`
+removes a stream from writable scheduling once it has taken everything
+offered, so an application that still has data buffered must call this again
+after such a write. Disabling removes an otherwise idle transport stream from
+writable scheduling; H3-internal buffered-frame retries remain scheduled.
 
 #### xqc_h3_request_recv_headers
 ```

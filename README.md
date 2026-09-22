@@ -39,13 +39,21 @@
 
 ## HTTP/3 proxy backpressure and urgency
 
-The public request API exposes the connection send-queue estimate through
-`xqc_h3_request_get_send_queue_bytes()` and lets an event-driven proxy retain or
-release write callbacks with `xqc_h3_request_set_write_notify()`. Together they
-allow a proxy to stop reading a fast h2c backend at a high-water mark and resume
-only after QUIC acknowledgements drain the queue below a low-water mark. Releasing
-the callback also removes an otherwise idle transport stream from writable
-scheduling, while preserving H3's own buffered-frame retries.
+An event-driven proxy paces a fast backend against one H3 response using the
+return value of `xqc_h3_request_send_body()`: a short write or `-XQC_EAGAIN`
+means the stream cannot take more right now. `xqc_h3_request_set_write_notify()`
+then keeps `h3_request_write_notify` arriving on every engine pass in which the
+stream is writable, so the acknowledgement that releases queue space resumes
+the producer with no application timer. Releasing the callback removes an
+otherwise idle transport stream from writable scheduling, while preserving
+H3's own buffered-frame retries.
+
+`xqc_h3_request_get_unsent_queue_bytes()` reports only what the connection has
+yet to put on the wire and is a memory bound, not a rate control. Packets in
+flight are excluded on purpose: they are the congestion controller's budget,
+and a connection at its BDP holds a congestion window of them at all times, so
+a watermark that counted them latched closed on exactly the fast connections it
+was meant to pace.
 
 RFC 9218 urgency 0 and 1 now use a dedicated urgent packet queue. It is
 scheduled ahead of normal application data but, unlike the fork's private
