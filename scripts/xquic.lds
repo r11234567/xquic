@@ -26,7 +26,7 @@ XQUIC_VERS_1.0 {
         xqc_h3_request_close;
         xqc_h3_request_send_headers;
         xqc_h3_request_send_body;
-        xqc_h3_request_get_send_queue_bytes;
+        xqc_h3_request_get_unsent_queue_bytes;
         xqc_h3_request_set_write_notify;
         xqc_h3_request_recv_headers;
         xqc_h3_request_recv_body;

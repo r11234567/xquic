@@ -714,7 +714,7 @@ xqc_h3_request_finish(xqc_h3_request_t *h3_request)
 }
 
 uint64_t
-xqc_h3_request_get_send_queue_bytes(xqc_h3_request_t *h3_request)
+xqc_h3_request_get_unsent_queue_bytes(xqc_h3_request_t *h3_request)
 {
     if (h3_request == NULL || h3_request->h3_stream == NULL
         || h3_request->h3_stream->stream == NULL
@@ -724,7 +724,7 @@ xqc_h3_request_get_send_queue_bytes(xqc_h3_request_t *h3_request)
         return 0;
     }
 
-    return xqc_send_queue_get_used_bytes(
+    return xqc_send_queue_get_unsent_bytes(
         h3_request->h3_stream->stream->stream_conn->conn_send_queue);
 }
 
