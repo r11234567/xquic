@@ -499,23 +499,29 @@ wlb_path_blackholed(xqc_path_ctx_t *path)
               >= WLB_PTO_EVICT_THRESH;
 }
 
-/* The PTO guard is a preference between paths, not permission to deadlock a
- * connection. If every transport-usable path has crossed the threshold, one
- * of them still has to carry control and application traffic so an ACK can
- * clear ctl_pto_count. */
+/* The consecutive-PTO blackhole guard acts as a preference between paths rather
+ * than permission to deadlock a connection. When multiple transport-usable paths
+ * exist, traffic is kept off blackholed paths so evicted-path probes can test them
+ * safely. Only when at most one transport-usable path remains does WLB allow
+ * traffic onto it so the connection does not deadlock on PTO. */
 static xqc_bool_t
 wlb_any_path_responsive(xqc_connection_t *conn)
 {
     xqc_list_head_t *pos, *next;
     xqc_path_ctx_t  *path;
+    int n_transport_ok = 0;
+    xqc_bool_t has_responsive = XQC_FALSE;
 
     xqc_list_for_each_safe(pos, next, &conn->conn_paths_list) {
         path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
-        if (wlb_path_transport_ok(path) && !wlb_path_blackholed(path)) {
-            return XQC_TRUE;
+        if (wlb_path_transport_ok(path)) {
+            n_transport_ok++;
+            if (!wlb_path_blackholed(path)) {
+                has_responsive = XQC_TRUE;
+            }
         }
     }
-    return XQC_FALSE;
+    return (has_responsive || n_transport_ok > 1);
 }
 
 static xqc_bool_t
