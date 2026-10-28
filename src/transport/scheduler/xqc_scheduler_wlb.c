@@ -1348,6 +1348,7 @@ xqc_wlb_scheduler_get_path(void *scheduler,
         s->force_refresh_paths = 1;
     }
 
+    xqc_bool_t round_started = XQC_FALSE;
     if (s->force_refresh_paths) {
         xqc_log(conn->log, XQC_LOG_INFO,
                 "|wlb|refresh|reason:topology|old_n_paths:%d|",
