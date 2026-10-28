@@ -3,9 +3,13 @@ name: Build
 on:
   workflow_dispatch:
   push:
-    branches: [ main, mqvpn-main, mqvpn-dev ]
+    branches: [ main, mqvpn-main, mqvpn-dev, "sync/**" ]
   pull_request:
-    branches: [ mqvpn-main, mqvpn-dev ]
+    branches: [ main, mqvpn-main, mqvpn-dev ]
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
 
@@ -21,7 +25,7 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v2
+      uses: actions/checkout@v4
       with:
         fetch-depth: 2
         submodules: 'recursive'
@@ -90,6 +94,9 @@ jobs:
           exit 1
         fi
         gcovr -r .. --xml --gcov-ignore-parse-errors -o ../coverage.xml
+
+    - name: Test WLB scheduler
+      run: ./build/tests/wlb_tests
     
     - name: Check Test Result
       run: |
@@ -111,6 +118,11 @@ jobs:
           echo "====== Find test case failed! ======"
           exit 1
         fi
+
+    - name: Check FEC RSC test result
+      run: |
+        cat xquic_test.log
+        grep -Fq "[       OK ] xquic_case_test.fec_recovered_function_of_stream_rsc" xquic_test.log
 
     - name: Report coverage to Codacy
       shell: bash
