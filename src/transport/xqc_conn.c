@@ -2573,6 +2573,70 @@ xqc_conn_pmtud_on_blackhole(xqc_connection_t *conn, xqc_path_ctx_t *path,
 }
 
 
+xqc_int_t
+xqc_conn_set_path_pmtu(xqc_connection_t *conn, uint64_t path_id,
+    size_t udp_payload_size)
+{
+    xqc_path_ctx_t *path;
+    size_t reported;
+
+    if (conn == NULL) {
+        return -XQC_EPARAM;
+    }
+
+    path = xqc_conn_find_path_by_path_id(conn, path_id);
+    if (path == NULL) {
+        xqc_log(conn->log, XQC_LOG_WARN,
+                "|PMTU|external report for unknown path|path:%ui|size:%uz|",
+                path_id, udp_payload_size);
+        return -XQC_EMP_PATH_NOT_FOUND;
+    }
+
+    if (path->path_state >= XQC_PATH_STATE_CLOSING) {
+        return -XQC_EMP_PATH_STATE_ERROR;
+    }
+
+    /* Never below what QUIC requires every path to carry: a first hop claiming
+     * less than that is not something the connection can honour by shrinking. */
+    reported = xqc_max(udp_payload_size, (size_t)XQC_PACKET_OUT_SIZE);
+    reported = xqc_min(reported, conn->conn_settings.max_pkt_out_size);
+
+    /* Lowers only. The caller's source is the local route cache, which knows
+     * the first hop and assumes the rest; it is grounds for excluding larger
+     * sizes, never for asserting one works. Sizes are still raised only by an
+     * acked probe. */
+    if (reported >= path->path_max_pkt_out_size) {
+        return XQC_OK;
+    }
+
+    xqc_log(conn->log, XQC_LOG_INFO,
+            "|PMTU|external report|path:%ui|reported:%uz|curr:%uz|was_max:%uz|",
+            path_id, reported, path->curr_pkt_out_size,
+            path->path_max_pkt_out_size);
+
+    path->path_max_pkt_out_size = reported;
+    path->curr_pkt_out_size = xqc_min(path->curr_pkt_out_size, reported);
+
+    /* Arming the search needs PMTUD actually negotiated. The size reduction
+     * above does not: it is the whole value of this call when the peer
+     * declined PMTUD, and it is what stops the black hole. */
+    if (conn->enable_pmtud) {
+        if (conn->max_pkt_out_size > reported) {
+            conn->max_pkt_out_size = xqc_max(reported, conn->pkt_out_size);
+        }
+        if (conn->probing_pkt_out_size > conn->max_pkt_out_size) {
+            conn->probing_pkt_out_size = (conn->pkt_out_size + conn->max_pkt_out_size) >> 1;
+            conn->probing_cnt = 0;
+        }
+        conn->conn_flag |= XQC_CONN_FLAG_PMTUD_PROBING;
+        xqc_timer_unset(&conn->conn_timer_manager, XQC_TIMER_PMTUD_PROBING);
+    }
+
+    xqc_conn_try_to_update_mss(conn);
+
+    return XQC_OK;
+}
+
 ssize_t
 xqc_send_burst(xqc_connection_t *conn, xqc_path_ctx_t *path, struct iovec *iov, int cnt)
 {

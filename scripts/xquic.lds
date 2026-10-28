@@ -45,6 +45,7 @@ XQUIC_VERS_1.0 {
         xqc_conn_get_err_type;
         xqc_conn_get_ssl;
         xqc_conn_set_transport_user_data;
+        xqc_conn_set_path_pmtu;
         xqc_conn_get_peer_addr;
         xqc_conn_get_local_addr;
         xqc_stream_create;
