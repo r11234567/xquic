@@ -59,6 +59,8 @@
 #include "xqc_vn_test.h"
 #include "xqc_frame_type_bit_test.h"
 #include "xqc_applimit_test.h"
+#include "xqc_flow_ctl_test.h"
+#include "xqc_hq_test.h"
 
 static int
 xqc_init_suite(void)
@@ -199,6 +201,14 @@ main(int argc, char *argv[])
         || !CU_add_test(pSuite,
                         "xqc_test_conn_close_transport_error_type_overlap",
                         xqc_test_conn_close_transport_error_type_overlap)
+        /* hq test */
+        || !CU_add_test(pSuite, "xqc_test_hq_request_recv", xqc_test_hq_request_recv)
+        || !CU_add_test(pSuite, "xqc_test_hq_request_recv_errors", xqc_test_hq_request_recv_errors)
+        /* flow ctl clamp test */
+        || !CU_add_test(pSuite, "xqc_test_flow_ctl_clamp_boundary", xqc_test_flow_ctl_clamp_boundary)
+        || !CU_add_test(pSuite, "xqc_test_stream_flow_ctl_clamp", xqc_test_stream_flow_ctl_clamp)
+        || !CU_add_test(pSuite, "xqc_test_conn_flow_ctl_clamp", xqc_test_conn_flow_ctl_clamp)
+        || !CU_add_test(pSuite, "xqc_test_flow_ctl_normal_no_clamp", xqc_test_flow_ctl_normal_no_clamp)
         || !CU_add_test(pSuite, "xqc_test_h3_frame", xqc_test_frame)
         || !CU_add_test(pSuite, "xqc_test_h3_single_vint_frame_valid",
                         xqc_test_h3_single_vint_frame_valid)
@@ -563,6 +573,9 @@ main(int argc, char *argv[])
         || !CU_add_test(pSuite, "xqc_test_reapply_same_as_active_global_vtable", xqc_test_reapply_same_as_active_global_vtable)
         || !CU_add_test(pSuite, "xqc_test_reapply_same_vtable_params_land", xqc_test_reapply_same_vtable_params_land)
         || !CU_add_test(pSuite, "xqc_test_wlb_reapply_second_path_after_swap", xqc_test_wlb_reapply_second_path_after_swap)
+        || !CU_add_test(pSuite, "xqc_test_wlb_asym_pin_follows_weight_ratio", xqc_test_wlb_asym_pin_follows_weight_ratio)
+        || !CU_add_test(pSuite, "xqc_test_wlb_last_path_over_pto_still_schedules", xqc_test_wlb_last_path_over_pto_still_schedules)
+        || !CU_add_test(pSuite, "xqc_test_wlb_prefers_healthy_path_over_pto_blocked", xqc_test_wlb_prefers_healthy_path_over_pto_blocked)
         || !CU_add_test(pSuite, "xqc_test_wlb_reapply_from_minrtt_schedules", xqc_test_wlb_reapply_from_minrtt_schedules)
         || !CU_add_test(pSuite, "xqc_test_wlb_reapply_to_minrtt_schedules", xqc_test_wlb_reapply_to_minrtt_schedules)
         /* per-path app-limited marking at the end of each engine pass */
