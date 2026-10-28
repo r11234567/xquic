@@ -124,7 +124,7 @@ main(void)
         || NULL == CU_add_test(s, "last_path_over_pto_still_schedules",
                                xqc_test_wlb_last_path_over_pto_still_schedules)
         || NULL == CU_add_test(s, "prefers_healthy_path_over_pto_blocked",
-                               xqc_test_wlb_prefers_healthy_path_over_pto_blocked)))
+                               xqc_test_wlb_prefers_healthy_path_over_pto_blocked))
     {
         CU_cleanup_registry();
         return (int)CU_get_error();
