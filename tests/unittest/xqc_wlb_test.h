@@ -107,5 +107,8 @@ void xqc_test_wlb_duplicate_ack_counts_application_once(void);
 void xqc_test_wlb_reapply_from_minrtt_schedules(void);
 void xqc_test_wlb_reapply_to_minrtt_schedules(void);
 void xqc_test_wlb_reapply_second_path_after_swap(void);
+void xqc_test_wlb_asym_pin_follows_weight_ratio(void);
+void xqc_test_wlb_last_path_over_pto_still_schedules(void);
+void xqc_test_wlb_prefers_healthy_path_over_pto_blocked(void);
 
 #endif /* XQC_WLB_TEST_H_INCLUDED */

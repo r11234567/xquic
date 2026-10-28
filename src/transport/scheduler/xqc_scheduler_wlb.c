@@ -172,6 +172,7 @@ typedef struct {
     wlb_path_weight_t   paths[WLB_MAX_PATHS];
     int                  n_paths;
     int                  round_remaining;
+    uint64_t             last_weight_refresh_us;
     wlb_flow_entry_t     flows[WLB_FLOW_TABLE_SIZE];
     uint64_t             last_expire_ts;  /* throttle expire scans to 1/sec */
     int                  last_healthy_paths; /* for recovery-triggered rebalance */
@@ -496,6 +497,25 @@ wlb_path_blackholed(xqc_path_ctx_t *path)
     return path->path_send_ctl != NULL
            && xqc_send_ctl_get_effective_pto_count(path->path_send_ctl)
               >= WLB_PTO_EVICT_THRESH;
+}
+
+/* The PTO guard is a preference between paths, not permission to deadlock a
+ * connection. If every transport-usable path has crossed the threshold, one
+ * of them still has to carry control and application traffic so an ACK can
+ * clear ctl_pto_count. */
+static xqc_bool_t
+wlb_any_path_responsive(xqc_connection_t *conn)
+{
+    xqc_list_head_t *pos, *next;
+    xqc_path_ctx_t  *path;
+
+    xqc_list_for_each_safe(pos, next, &conn->conn_paths_list) {
+        path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
+        if (wlb_path_transport_ok(path) && !wlb_path_blackholed(path)) {
+            return XQC_TRUE;
+        }
+    }
+    return XQC_FALSE;
 }
 
 static xqc_bool_t
@@ -856,6 +876,7 @@ wlb_refresh_paths(xqc_wlb_scheduler_t *s, xqc_connection_t *conn)
     if (n > 0) {
         wlb_normalize_weights(s, raw_weights);
     }
+    s->last_weight_refresh_us = now_us;
 
     if (old != NULL) {
         xqc_free(old);
@@ -863,8 +884,40 @@ wlb_refresh_paths(xqc_wlb_scheduler_t *s, xqc_connection_t *conn)
 }
 
 /**
+ * Refresh acknowledged-goodput weights for the current schedulable paths.
+ *
+ * Keeps deficits and path IDs intact; only re-measures delivery samples and
+ * updates raw_weights. Avoids memory allocations and deficit resets on routine
+ * round rollovers.
+ */
+static void
+wlb_refresh_weights(xqc_wlb_scheduler_t *s, xqc_connection_t *conn,
+                    uint64_t now_us)
+{
+    uint64_t raw_weights[WLB_MAX_PATHS];
+
+    for (int i = 0; i < s->n_paths; i++) {
+        xqc_path_ctx_t *path = wlb_find_path_ctx(conn, s->paths[i].path_id);
+        if (path == NULL) {
+            /* The caller checks topology before entering here. If it changed
+             * between the two scans, leave the current weights intact; the
+             * next scheduling opportunity will rebuild the cache. */
+            return;
+        }
+        raw_weights[i] =
+            wlb_compute_goodput_weight(&s->paths[i], path, now_us);
+    }
+
+    if (s->n_paths > 0) {
+        wlb_normalize_weights(s, raw_weights);
+    }
+    s->last_weight_refresh_us = now_us;
+}
+
+/**
  * True once the round's payload opportunities are used up (see
- * wlb_start_round); the next hashed packet then refreshes the weights.
+ * wlb_start_round); the next hashed packet then starts a new round, and
+ * re-measures the weights if the sample interval has elapsed.
  */
 static xqc_bool_t
 wlb_needs_new_round(xqc_wlb_scheduler_t *s)
@@ -1000,6 +1053,7 @@ wlb_minrtt_fallback(xqc_connection_t *conn, xqc_packet_out_t *packet_out,
     xqc_path_ctx_t *best_path = NULL;
     uint64_t best_srtt = UINT64_MAX;
     xqc_bool_t reached_cwnd_check = XQC_FALSE;
+    xqc_bool_t avoid_blackholed = wlb_any_path_responsive(conn);
     xqc_list_head_t *pos, *next;
     xqc_path_ctx_t *path;
 
@@ -1020,11 +1074,14 @@ wlb_minrtt_fallback(xqc_connection_t *conn, xqc_packet_out_t *packet_out,
 
         /* Keep control/ACK traffic off blackholed paths as well.  WLB routes
          * po_flow_hash==0 packets via this MinRTT fallback, so omitting the
-         * PTO guard can stall failover even if app datagrams are re-pinned. */
-        if (path->path_send_ctl
-            && xqc_send_ctl_get_effective_pto_count(path->path_send_ctl)
-               >= WLB_PTO_EVICT_THRESH)
-        {
+         * PTO guard can stall failover even if app datagrams are re-pinned.
+         *
+         * The guard is a preference between paths, not permission to deadlock
+         * the connection: once every transport-usable path has crossed the
+         * PTO threshold (avoid_blackholed false, wlb_any_path_responsive) one
+         * of them still has to carry traffic, because only an ACK arriving on
+         * some path can clear ctl_pto_count again. */
+        if (avoid_blackholed && wlb_path_blackholed(path)) {
             continue;
         }
 
@@ -1274,10 +1331,10 @@ xqc_wlb_scheduler_get_path(void *scheduler,
     xqc_bool_t in_recovery_grace =
         (pin_flow && s->recovery_unpin_until_us != 0 && now_us < s->recovery_unpin_until_us);
     if (in_recovery_grace) {
-        xqc_log(conn->log, XQC_LOG_INFO,
+        xqc_log(conn->log, XQC_LOG_DEBUG,
                 "|wlb|recovery_grace|flow:%ui|remain_ms:%ui|",
-                packet_out->po_flow_hash,
-                (unsigned)((s->recovery_unpin_until_us - now_us) / 1000));
+                (uint64_t)packet_out->po_flow_hash,
+                (uint64_t)((s->recovery_unpin_until_us - now_us) / 1000));
     }
 
     if (pin_flow) {
@@ -1291,22 +1348,33 @@ xqc_wlb_scheduler_get_path(void *scheduler,
         s->force_refresh_paths = 1;
     }
 
-    if (s->force_refresh_paths || wlb_needs_new_round(s)) {
-        if (s->force_refresh_paths) {
-            xqc_log(conn->log, XQC_LOG_INFO,
-                    "|wlb|refresh|reason:recovery|old_n_paths:%d|",
-                    s->n_paths);
-        }
+    if (s->force_refresh_paths) {
+        xqc_log(conn->log, XQC_LOG_INFO,
+                "|wlb|refresh|reason:topology|old_n_paths:%d|",
+                s->n_paths);
         wlb_refresh_paths(s, conn);
         wlb_start_round(s);
-        xqc_log(conn->log, XQC_LOG_INFO,
-                "|wlb|round_start|n_paths:%d|p0:%ui|d0:%lld|p1:%ui|d1:%lld|",
-                s->n_paths,
-                (unsigned)(s->n_paths > 0 ? s->paths[0].path_id : UINT32_MAX),
-                (long long)(s->n_paths > 0 ? s->paths[0].deficit : -1),
-                (unsigned)(s->n_paths > 1 ? s->paths[1].path_id : UINT32_MAX),
-                (long long)(s->n_paths > 1 ? s->paths[1].deficit : -1));
+        round_started = XQC_TRUE;
         s->force_refresh_paths = 0;
+
+    } else if (wlb_needs_new_round(s)) {
+        if (now_us >= s->last_weight_refresh_us
+            && now_us - s->last_weight_refresh_us >= WLB_GOODPUT_SAMPLE_MIN_US)
+        {
+            wlb_refresh_weights(s, conn, now_us);
+        }
+        wlb_start_round(s);
+        round_started = XQC_TRUE;
+    }
+
+    if (round_started) {
+        xqc_log(conn->log, XQC_LOG_DEBUG,
+                "|wlb|round_start|n_paths:%d|p0:%ui|d0:%i|p1:%ui|d1:%i|",
+                s->n_paths,
+                (uint64_t)(s->n_paths > 0 ? s->paths[0].path_id : UINT32_MAX),
+                (int64_t)(s->n_paths > 0 ? s->paths[0].deficit : -1),
+                (uint64_t)(s->n_paths > 1 ? s->paths[1].path_id : UINT32_MAX),
+                (int64_t)(s->n_paths > 1 ? s->paths[1].deficit : -1));
     }
 
     /* Flow table lookup — reuse existing flow→path pinning (TCP only).
@@ -1339,9 +1407,9 @@ xqc_wlb_scheduler_get_path(void *scheduler,
 
             if (path && xqc_scheduler_check_path_can_send(path, packet_out, check_cwnd)) {
                 entry->last_ts = now_us;
-                xqc_log(conn->log, XQC_LOG_INFO,
+                xqc_log(conn->log, XQC_LOG_DEBUG,
                         "|wlb|flow_hit|flow:%ui|path:%ui|",
-                        packet_out->po_flow_hash, path->path_id);
+                        (uint64_t)packet_out->po_flow_hash, path->path_id);
                 wlb_note_payload_activity(s, path->path_id, now_us,
                                           XQC_TRUE);
                 return path;
@@ -1425,7 +1493,7 @@ xqc_wlb_scheduler_get_path(void *scheduler,
                     packet_out->po_flow_hash, pin_path_id, sel_path_id);
         }
         xqc_path_ctx_t *path = wlb_find_path_ctx(conn, sel_path_id);
-        xqc_log(conn->log, XQC_LOG_INFO,
+        xqc_log(conn->log, XQC_LOG_DEBUG,
                  "|wlb|select|path_id:%ui|n_paths:%d|pinned:%d|",
                  sel_path_id, s->n_paths, (int)pin_flow);
         wlb_note_payload_activity(s, sel_path_id, now_us, XQC_FALSE);

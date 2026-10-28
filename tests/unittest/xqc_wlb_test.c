@@ -2192,3 +2192,82 @@ xqc_test_wlb_reapply_second_path_after_swap(void)
     xqc_destroy_pool(f.conn.conn_pool);
     wlb_test_teardown(&f);
 }
+
+
+void
+xqc_test_wlb_asym_pin_follows_weight_ratio(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    wlb_test_add_path(&f, 0, 10000, 192 * 1024, 0);
+    wlb_test_add_path(&f, 1, 10000, 64 * 1024, 0);
+
+    int on_path0 = 0;
+    int on_path1 = 0;
+    for (int i = 0; i < 16; i++) {
+        uint32_t flow = 0x20000000u + (uint32_t)i;
+        (void)wlb_test_invoke(&f, flow);
+        uint64_t pinned = wlb_test_invoke(&f, flow);
+        if (pinned == 0) {
+            on_path0++;
+        } else if (pinned == 1) {
+            on_path1++;
+        }
+    }
+
+    CU_ASSERT_EQUAL(on_path0 + on_path1, 16);
+    CU_ASSERT_TRUE(on_path1 >= 2);
+    CU_ASSERT_TRUE(on_path0 > on_path1);
+
+    wlb_test_teardown(&f);
+}
+
+void
+xqc_test_wlb_last_path_over_pto_still_schedules(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    xqc_path_ctx_t *survivor =
+        wlb_test_add_path(&f, 0, 10000, 64 * 1024, 0);
+    xqc_path_ctx_t *lost =
+        wlb_test_add_path(&f, 1, 30000, 64 * 1024, 0);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(survivor);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(lost);
+
+    uint32_t flow = 0xB1AC4801;
+    (void)wlb_test_invoke(&f, flow);
+    wlb_test_detach_path(lost);
+    survivor->path_send_ctl->ctl_pto_count = 8;
+    wlb_test_clock_advance(2000000);
+
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, flow), 0);
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, 0), 0);
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, UINT32_MAX), 0);
+
+    wlb_test_teardown(&f);
+}
+
+void
+xqc_test_wlb_prefers_healthy_path_over_pto_blocked(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+
+    xqc_path_ctx_t *stalled =
+        wlb_test_add_path(&f, 0, 10000, 64 * 1024, 0);
+    xqc_path_ctx_t *healthy =
+        wlb_test_add_path(&f, 1, 30000, 64 * 1024, 0);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(stalled);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(healthy);
+
+    stalled->path_send_ctl->ctl_pto_count = 8;
+    wlb_test_clock_advance(2000000);
+
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, 0xC0FFEE01), 1);
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, 0), 1);
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, UINT32_MAX), 1);
+
+    wlb_test_teardown(&f);
+}

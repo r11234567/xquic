@@ -118,7 +118,13 @@ main(void)
         || NULL == CU_add_test(s, "rejected_0rtt_does_not_advance_learning",
                                xqc_test_wlb_rejected_0rtt_does_not_advance_learning)
         || NULL == CU_add_test(s, "duplicate_ack_counts_application_once",
-                               xqc_test_wlb_duplicate_ack_counts_application_once))
+                               xqc_test_wlb_duplicate_ack_counts_application_once)
+        || NULL == CU_add_test(s, "asym_pin_follows_weight_ratio",
+                               xqc_test_wlb_asym_pin_follows_weight_ratio)
+        || NULL == CU_add_test(s, "last_path_over_pto_still_schedules",
+                               xqc_test_wlb_last_path_over_pto_still_schedules)
+        || NULL == CU_add_test(s, "prefers_healthy_path_over_pto_blocked",
+                               xqc_test_wlb_prefers_healthy_path_over_pto_blocked)))
     {
         CU_cleanup_registry();
         return (int)CU_get_error();
