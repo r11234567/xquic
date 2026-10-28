@@ -5,6 +5,7 @@
 #include <inttypes.h>
 #include "src/http3/xqc_h3_request.h"
 #include "src/transport/xqc_stream.h"
+#include "src/transport/xqc_send_queue.h"
 #include "src/transport/xqc_engine.h"
 #include "src/http3/xqc_h3_conn.h"
 #include "src/http3/xqc_h3_ctx.h"
@@ -708,6 +709,47 @@ ssize_t
 xqc_h3_request_finish(xqc_h3_request_t *h3_request)
 {
     return xqc_h3_stream_send_finish(h3_request->h3_stream);
+}
+
+uint64_t
+xqc_h3_request_get_unsent_queue_bytes(xqc_h3_request_t *h3_request)
+{
+    if (h3_request == NULL || h3_request->h3_stream == NULL
+        || h3_request->h3_stream->stream == NULL
+        || h3_request->h3_stream->stream->stream_conn == NULL
+        || h3_request->h3_stream->stream->stream_conn->conn_send_queue == NULL)
+    {
+        return 0;
+    }
+
+    return xqc_send_queue_get_unsent_bytes(
+        h3_request->h3_stream->stream->stream_conn->conn_send_queue);
+}
+
+xqc_int_t
+xqc_h3_request_set_write_notify(xqc_h3_request_t *h3_request, uint8_t enabled)
+{
+    if (h3_request == NULL || h3_request->h3_stream == NULL
+        || h3_request->h3_stream->stream == NULL)
+    {
+        return -XQC_EPARAM;
+    }
+
+    if (enabled) {
+        h3_request->h3_stream->flags |= XQC_HTTP3_STREAM_NEED_WRITE_NOTIFY;
+        xqc_stream_ready_to_write(h3_request->h3_stream->stream);
+
+    } else {
+        h3_request->h3_stream->flags &= ~XQC_HTTP3_STREAM_NEED_WRITE_NOTIFY;
+        /* Application notifications share writable-list membership with
+         * H3's buffered-frame retries. Remove an otherwise idle stream, but
+         * retain scheduling while H3 still has data to flush. */
+        if (xqc_list_empty(&h3_request->h3_stream->send_buf)) {
+            xqc_stream_shutdown_write(h3_request->h3_stream->stream);
+        }
+    }
+
+    return XQC_OK;
 }
 
 

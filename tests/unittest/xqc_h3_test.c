@@ -12,6 +12,7 @@
 #include "src/http3/xqc_h3_header.h"
 #include "src/http3/qpack/xqc_qpack.h"
 #include "src/transport/xqc_stream.h"
+#include "src/transport/xqc_send_queue.h"
 #include "src/http3/qpack/stable/xqc_stable.h"
 
 #include "xqc_common_test.h"
@@ -2187,4 +2188,98 @@ xqc_test_h3_settings_frame_size_limit()
     ret = xqc_h3_frm_parse(normal_settings, sizeof(normal_settings), &pctx);
     /* normal-sized SETTINGS frame should parse successfully */
     CU_ASSERT(ret >= 0);
+}
+
+void
+xqc_test_h3_backpressure_api(void)
+{
+    xqc_connection_t *conn = test_engine_connect();
+    CU_ASSERT_PTR_NOT_NULL_FATAL(conn);
+
+    xqc_stream_t *stream = xqc_create_stream_with_conn(
+        conn, XQC_UNDEFINE_STREAM_ID, XQC_CLI_BID, NULL, NULL);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(stream);
+
+    xqc_h3_stream_t h3s = {0};
+    xqc_h3_request_t h3r = {0};
+    h3s.stream = stream;
+    h3r.h3_stream = &h3s;
+    xqc_init_list_head(&h3s.send_buf);
+
+    uint64_t saved_used = conn->conn_send_queue->sndq_packets_used;
+    uint64_t saved_unacked = conn->conn_send_queue->sndq_packets_in_unacked_list;
+    size_t saved_size = conn->pkt_out_size;
+    size_t saved_max_size = conn->max_pkt_out_size;
+
+    /*
+     * Happy path: only the packets still waiting to be sent are reported, at
+     * pkt_out_size. max_pkt_out_size is deliberately larger here so the
+     * assertion fails if the estimate goes back to xqc_max() of the two.
+     */
+    conn->conn_send_queue->sndq_packets_used = 5;
+    conn->conn_send_queue->sndq_packets_in_unacked_list = 2;
+    conn->pkt_out_size = 1200;
+    conn->max_pkt_out_size = 1400;
+    CU_ASSERT_EQUAL(xqc_h3_request_get_unsent_queue_bytes(&h3r), 3600);
+
+    /*
+     * The regression this helper exists to avoid: a connection running at its
+     * BDP holds every queued packet in flight. That is a full congestion
+     * window, not an application queue, and it must report zero so an
+     * application watermark cannot latch closed on a fast connection.
+     */
+    conn->conn_send_queue->sndq_packets_in_unacked_list = 5;
+    CU_ASSERT_EQUAL(xqc_h3_request_get_unsent_queue_bytes(&h3r), 0);
+
+    /* Abnormal: more unacked than used is corrupt bookkeeping, not a queue. */
+    conn->conn_send_queue->sndq_packets_in_unacked_list = 9;
+    CU_ASSERT_EQUAL(xqc_h3_request_get_unsent_queue_bytes(&h3r), 0);
+
+    /* Boundary: no negotiated packet size yet. */
+    conn->conn_send_queue->sndq_packets_in_unacked_list = 0;
+    conn->pkt_out_size = 0;
+    CU_ASSERT_EQUAL(xqc_h3_request_get_unsent_queue_bytes(&h3r), 0);
+
+    /* Boundary: the multiplication saturates instead of wrapping. */
+    conn->pkt_out_size = 1200;
+    conn->conn_send_queue->sndq_packets_used = UINT64_MAX;
+    CU_ASSERT_EQUAL(xqc_h3_request_get_unsent_queue_bytes(&h3r), UINT64_MAX);
+
+    xqc_stream_shutdown_write(stream);
+    CU_ASSERT_EQUAL(xqc_h3_request_set_write_notify(&h3r, 1), XQC_OK);
+    CU_ASSERT(h3s.flags & XQC_HTTP3_STREAM_NEED_WRITE_NOTIFY);
+    CU_ASSERT(stream->stream_flag & XQC_STREAM_FLAG_READY_TO_WRITE);
+    CU_ASSERT_EQUAL(xqc_h3_request_set_write_notify(&h3r, 0), XQC_OK);
+    CU_ASSERT((h3s.flags & XQC_HTTP3_STREAM_NEED_WRITE_NOTIFY) == 0);
+    CU_ASSERT((stream->stream_flag & XQC_STREAM_FLAG_READY_TO_WRITE) == 0);
+
+    /*
+     * Re-arming after the stream left writable scheduling must put it back.
+     * xqc_stream_send() calls xqc_stream_shutdown_write() once it has taken
+     * everything offered, so an application with data still buffered relies
+     * on this to keep receiving notifications.
+     */
+    CU_ASSERT_EQUAL(xqc_h3_request_set_write_notify(&h3r, 1), XQC_OK);
+    CU_ASSERT(stream->stream_flag & XQC_STREAM_FLAG_READY_TO_WRITE);
+    xqc_stream_shutdown_write(stream);
+    CU_ASSERT((stream->stream_flag & XQC_STREAM_FLAG_READY_TO_WRITE) == 0);
+    CU_ASSERT(h3s.flags & XQC_HTTP3_STREAM_NEED_WRITE_NOTIFY);
+    CU_ASSERT_EQUAL(xqc_h3_request_set_write_notify(&h3r, 1), XQC_OK);
+    CU_ASSERT(stream->stream_flag & XQC_STREAM_FLAG_READY_TO_WRITE);
+    CU_ASSERT_EQUAL(xqc_h3_request_set_write_notify(&h3r, 0), XQC_OK);
+
+    xqc_list_head_t pending_h3_buf;
+    xqc_init_list_head(&pending_h3_buf);
+    xqc_list_add_tail(&pending_h3_buf, &h3s.send_buf);
+    CU_ASSERT_EQUAL(xqc_h3_request_set_write_notify(&h3r, 1), XQC_OK);
+    CU_ASSERT_EQUAL(xqc_h3_request_set_write_notify(&h3r, 0), XQC_OK);
+    CU_ASSERT(stream->stream_flag & XQC_STREAM_FLAG_READY_TO_WRITE);
+    xqc_list_del_init(&pending_h3_buf);
+    xqc_stream_shutdown_write(stream);
+
+    conn->conn_send_queue->sndq_packets_used = saved_used;
+    conn->conn_send_queue->sndq_packets_in_unacked_list = saved_unacked;
+    conn->pkt_out_size = saved_size;
+    conn->max_pkt_out_size = saved_max_size;
+    xqc_engine_destroy(conn->engine);
 }

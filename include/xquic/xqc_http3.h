@@ -788,6 +788,40 @@ XQC_EXPORT_PUBLIC_API
 ssize_t xqc_h3_request_finish(xqc_h3_request_t *h3_request);
 
 /**
+ * @brief Upper-bound estimate of the bytes this request's QUIC connection
+ * still has to put on the wire. Packets already sent and awaiting
+ * acknowledgement are NOT counted: they belong to the congestion
+ * controller's budget, and a connection running at its BDP holds a cwnd of
+ * them at all times, so including them makes any application watermark latch
+ * closed on a fast connection.
+ *
+ * This is a memory bound, not a rate control. Pace on the return value of
+ * xqc_h3_request_send_body() instead: a short write or -XQC_EAGAIN is the
+ * authoritative "stop" signal, and it is per-stream rather than per
+ * connection.
+ */
+XQC_EXPORT_PUBLIC_API
+uint64_t xqc_h3_request_get_unsent_queue_bytes(xqc_h3_request_t *h3_request);
+
+/**
+ * @brief Enable or disable application write notifications for a request.
+ *
+ * While enabled, h3_request_write_notify is invoked on every engine pass in
+ * which the stream is writable, so an acknowledgement that releases queue
+ * space reaches the application without a separate timer.
+ *
+ * Enabling is not sticky across a fully accepted write: xqc_stream_send()
+ * removes a stream from writable scheduling once it has taken everything
+ * offered. An application that still has data buffered must therefore call
+ * this again after such a write. Disabling removes an otherwise idle
+ * transport stream from writable scheduling; H3-internal buffered-frame
+ * retries remain scheduled.
+ */
+XQC_EXPORT_PUBLIC_API
+xqc_int_t xqc_h3_request_set_write_notify(xqc_h3_request_t *h3_request,
+    uint8_t enabled);
+
+/**
  * @brief receive headers of a request
  * 
  * @param h3_request handler of http3 request
