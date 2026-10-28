@@ -76,6 +76,8 @@ xqc_conn_settings_t internal_default_conn_settings = {
     .fec_conn_queue_rpr_timeout = 0,
     .enable_pmtud = 0,
     .pmtud_probing_interval = 500000,
+    /* RFC 8899 §5.3 PMTU_RAISE_TIMER, recommended 600 s. */
+    .pmtud_raise_interval = 600000000,
     .marking_reinjection = 0,
 
     .recv_rate_bytes_per_sec = 0,
@@ -229,6 +231,11 @@ xqc_server_set_conn_settings(xqc_engine_t *engine, const xqc_conn_settings_t *se
     if (settings->pmtud_probing_interval) {
         engine->default_conn_settings.pmtud_probing_interval =
             settings->pmtud_probing_interval;
+    }
+
+    if (settings->pmtud_raise_interval) {
+        engine->default_conn_settings.pmtud_raise_interval =
+            settings->pmtud_raise_interval;
     }
 
     if (settings->max_ack_delay) {
@@ -975,6 +982,11 @@ xqc_conn_create(xqc_engine_t *engine, xqc_cid_t *dcid, xqc_cid_t *scid,
     if (xc->conn_settings.pmtud_probing_interval == 0) {
         xc->conn_settings.pmtud_probing_interval =
             engine->default_conn_settings.pmtud_probing_interval;
+    }
+
+    if (xc->conn_settings.pmtud_raise_interval == 0) {
+        xc->conn_settings.pmtud_raise_interval =
+            engine->default_conn_settings.pmtud_raise_interval;
     }
 
     if (xc->conn_settings.ack_frequency == 0) {
@@ -6329,8 +6341,10 @@ xqc_conn_ptmud_probing(xqc_connection_t *conn)
             conn->max_pkt_out_size = conn->conn_settings.probing_pkt_out_size;
             conn->probing_pkt_out_size = conn->max_pkt_out_size;
             conn->probing_cnt = 0;
+            uint64_t raise_interval = conn->conn_settings.pmtud_raise_interval
+                ? conn->conn_settings.pmtud_raise_interval : XQC_PMTUD_RAISE_INTERVAL;
             xqc_timer_set(&conn->conn_timer_manager, XQC_TIMER_PMTUD_PROBING,
-                          xqc_monotonic_timestamp(), XQC_PMTUD_RAISE_INTERVAL);
+                          xqc_monotonic_timestamp(), raise_interval);
         }
         return;
     }
