@@ -65,6 +65,15 @@ main(void)
                                xqc_test_wlb_blackholed_path_does_not_stall_rounds)
         || NULL == CU_add_test(s, "unpinned_blackhole_refreshes_topology",
                                xqc_test_wlb_unpinned_blackhole_refreshes_topology)
+        || NULL == CU_add_test(s, "unresponsive_path_evicted_before_pto",
+                               xqc_test_wlb_unresponsive_path_evicted_before_pto)
+        || NULL == CU_add_test(s, "acked_path_not_evicted",
+                               xqc_test_wlb_acked_path_not_evicted)
+        || NULL == CU_add_test(
+                   s, "unacked_path_kept_until_third_hidden_pto",
+                   xqc_test_wlb_unacked_path_kept_until_third_hidden_pto)
+        || NULL == CU_add_test(s, "all_paths_silent_recover_on_ack",
+                               xqc_test_wlb_all_paths_silent_recover_on_ack)
         || NULL == CU_add_test(s, "routine_path_event_preserves_round",
                                xqc_test_wlb_routine_path_event_preserves_round)
         || NULL == CU_add_test(s, "measured_goodput_ignores_loss_penalty",
