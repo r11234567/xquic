@@ -5,8 +5,8 @@
 #
 # The downstream main contains product changes; propose dependency updates by
 # PR, never by a direct main push. GITHUB_TOKEN-authored pushes and PR events
-# do not normally start other workflows, so validation must be started by a
-# maintainer before merge.
+# do not normally start other workflows, so this workflow explicitly
+# dispatches validation for the proposed branch before maintainer review.
 name: Bump BoringSSL submodule
 
 on:
@@ -15,6 +15,7 @@ on:
   workflow_dispatch:          # Manual trigger for on-demand checks
 
 permissions:
+  actions: write
   contents: write
   pull-requests: write
 
@@ -29,8 +30,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - name: Checkout downstream main (with submodules)
-        uses: actions/checkout@v4
+      - name: Checkout main (with submodules)
+        uses: actions/checkout@v5
         with:
           ref: main
           fetch-depth: 0
@@ -94,14 +95,15 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -c "$branch"
           git add third_party/boringssl
-          git commit -m "build: bump BoringSSL to $LATEST"
-          # Idempotent push, never forced: reuse an existing bump branch. The PR is
-          # ensured independently below, so a prior run that pushed but failed to
-          # open a PR still gets one on the next run.
-          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
-            echo "Remote branch $branch already exists — reusing it (not pushing)."
+          git commit -m "[=]: Bump BoringSSL to $LATEST"
+          # Refresh a prior bot branch against current main, but only when it
+          # still points at the SHA observed here (guarded force update).
+          remote_sha=$(git ls-remote --heads origin "$branch" | awk '{print $1}')
+          if [ -n "$remote_sha" ]; then
+            git push --force-with-lease="refs/heads/$branch:$remote_sha" \
+              origin "HEAD:refs/heads/$branch"
           else
-            git push origin "$branch"
+            git push origin "HEAD:refs/heads/$branch"
           fi
           echo "changed=true"   >> "$GITHUB_OUTPUT"
           echo "branch=$branch" >> "$GITHUB_OUTPUT"
@@ -127,7 +129,8 @@ jobs:
           gh pr create \
             --base main \
             --head "$BRANCH" \
-            --title "build: bump BoringSSL $CURRENT → $LATEST" \
+            --draft \
+            --title "[=]: Bump BoringSSL $CURRENT to $LATEST" \
             --body "$(cat <<'BODY'
           ## Auto BoringSSL pin bump
 
@@ -135,13 +138,22 @@ jobs:
           `third_party/boringssl` submodule pin to it. Opened automatically by
           `.github/workflows/bump-boringssl.yml` (weekly, Monday 09:00 JST).
 
-          > Events authored with GITHUB_TOKEN do not normally trigger other
-          > workflows. Start Build and CodeQL manually for this branch, or push
-          > a maintainer-authored commit, and validate before merge.
+          The workflow dispatches Build and CodeQL explicitly for the bump
+          branch because token-authored events do not recursively start them.
 
           ### Review checklist
           - [ ] Skim the BoringSSL changelog between the old and new tag for API / build breaks
           - [ ] Local build passes against the new pin (`./third_party/boringssl` + xquic)
-          - [ ] mqvpn builds against this xquic SHA (bump the consumer's xquic pin to test)
+          - [ ] mqvpn builds against this xquic SHA before its submodule is updated
           BODY
           )"
+
+      - name: Dispatch validation workflows
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ steps.bump.outputs.branch }}
+        run: |
+          set -euo pipefail
+          gh workflow run build.yml --ref "$BRANCH"
+          gh workflow run codeql-analysis.yml --ref "$BRANCH"

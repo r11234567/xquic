@@ -22,6 +22,19 @@
 #include "src/tls/xqc_tls.h"
 
 
+/*
+ * Whether stream_id denotes a locally initiated bidirectional stream that has
+ * never been created. xqc_gen_stream_id() post-increments the local stream
+ * counter, so indexes below it have already existed.
+ */
+static inline xqc_int_t
+xqc_stream_local_bidi_uncreated(xqc_connection_t *conn,
+                                xqc_stream_id_t stream_id)
+{
+    return (stream_id >> 2) >= conn->cur_stream_id_bidi_local;
+}
+
+
 static const char *const frame_type_2_str[XQC_FRAME_NUM] = {
     [XQC_FRAME_PADDING] = "PADDING",
     [XQC_FRAME_PING] = "PING",
@@ -92,6 +105,19 @@ xqc_crypto_frame_header_size(uint64_t offset, size_t length)
 {
     return 1 + xqc_vint_len_by_val(offset) + xqc_vint_len_by_val(length);
 }
+
+/*
+ * The hard node cap must not sit below what the advertised receive window lets a
+ * conforming peer buffer, or bulk transfer over a reordering path is rejected
+ * for staying inside its flow-control budget. 1 KiB is the smallest frame
+ * payload we assume a bulk sender uses; see the cap's own comment in
+ * xqc_defs.h. This assert is what keeps the two constants from drifting when
+ * either is tuned.
+ */
+_Static_assert((uint64_t)XQC_MAX_STREAM_FRAME_BUFFERED_COUNT_HARD * 1024 >=
+                   (uint64_t)XQC_MAX_RECV_WINDOW,
+               "buffered-frame cap is below the advertised receive window: a "
+               "conforming peer could be rejected for obeying flow control");
 
 xqc_int_t
 xqc_insert_stream_frame(xqc_connection_t *conn, xqc_stream_t *stream,
@@ -416,6 +442,15 @@ xqc_process_frames(xqc_connection_t *conn, xqc_packet_in_t *packet_in)
 {
     xqc_int_t ret;
     unsigned char *last_pos = NULL;
+#ifdef XQC_PING_ATTACK_PROTECT
+    xqc_bool_t first_server_initial;
+
+    first_server_initial =
+        conn->conn_type == XQC_CONN_TYPE_SERVER
+        && conn->conn_state == XQC_CONN_STATE_SERVER_INIT
+        && packet_in->pi_pkt.pkt_type == XQC_PTYPE_INIT
+        && !(conn->conn_flag & XQC_CONN_FLAG_INIT_RECVD);
+#endif
 
     while (packet_in->pos < packet_in->last) {
         last_pos = packet_in->pos;
@@ -600,6 +635,22 @@ xqc_process_frames(xqc_connection_t *conn, xqc_packet_in_t *packet_in)
         }
     }
 
+#ifdef XQC_PING_ATTACK_PROTECT
+    /*
+     * RFC 9000 Section 17.2.2 permits PING in Initial packets and requires
+     * the first client Initial to include CRYPTO.  Check the complete packet
+     * so acceptance does not depend on the relative order of those frames.
+     */
+    if (first_server_initial
+        && (packet_in->pi_frame_types & XQC_FRAME_BIT_PING)
+        && !(packet_in->pi_frame_types & XQC_FRAME_BIT_CRYPTO))
+    {
+        xqc_log(conn->log, XQC_LOG_ERROR,
+                "|first client Initial contains PING without CRYPTO|");
+        return XQC_ERROR;
+    }
+#endif
+
     /*
      * An endpoint MUST treat receipt of a packet containing no frames as a
      * connection error of type PROTOCOL_VIOLATION
@@ -687,6 +738,21 @@ xqc_process_stream_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_in)
             if (!stream) {
                 goto free;
             }
+
+        } else if (xqc_stream_local_bidi_uncreated(conn, stream_id)) {
+            /*
+             * RFC 9000 19.8: receiving a STREAM frame for a locally initiated
+             * stream that has not yet been created MUST be treated as a
+             * connection error of type STREAM_STATE_ERROR.  A stream index
+             * below the local counter was created earlier and has since been
+             * closed, so a retransmitted frame for it is still tolerated below.
+             */
+            xqc_log(conn->log, XQC_LOG_ERROR,
+                    "|STREAM frame on locally initiated uncreated stream|stream_id:%ui|",
+                    stream_id);
+            XQC_CONN_ERR(conn, TRA_STREAM_STATE_ERROR);
+            ret = -XQC_EPROTO;
+            goto error;
 
         } else {
             xqc_log(conn->log, XQC_LOG_WARN, "|cannot find stream|stream_id:%ui|",
@@ -986,6 +1052,34 @@ xqc_check_crypto_frame_data_buffer_exceed(xqc_stream_t *stream,
     return XQC_OK;
 }
 
+
+xqc_int_t
+xqc_check_crypto_frame_level(xqc_connection_t *conn, xqc_stream_t *stream,
+    xqc_stream_frame_t *stream_frame, xqc_encrypt_level_t current_level)
+{
+    uint64_t frame_end;
+
+    if (stream_frame->data_length == 0
+        || stream->stream_encrypt_level >= current_level)
+    {
+        return XQC_OK;
+    }
+
+    frame_end = stream_frame->data_offset + stream_frame->data_length;
+    if (frame_end <= stream->stream_max_recv_offset) {
+        return XQC_OK;
+    }
+
+    xqc_log(conn->log, XQC_LOG_ERROR,
+            "|CRYPTO data extends previous encryption level|level:%d|"
+            "current_level:%d|frame_end:%ui|received_end:%ui|",
+            stream->stream_encrypt_level, current_level, frame_end,
+            stream->stream_max_recv_offset);
+    XQC_CONN_ERR(conn, TRA_PROTOCOL_VIOLATION);
+    return -XQC_EPROTO;
+}
+
+
 xqc_int_t
 xqc_insert_crypto_frame(xqc_connection_t *conn, xqc_stream_t *stream,
                         xqc_stream_frame_t *stream_frame)
@@ -1107,6 +1201,18 @@ xqc_process_crypto_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_in)
     xqc_log(conn->log, XQC_LOG_DEBUG, "|level:%d|", encrypt_level);
 
     xqc_stream_t *stream = conn->crypto_stream[encrypt_level];
+    xqc_encrypt_level_t current_level = xqc_tls_get_read_level(conn->tls);
+
+    /*
+     * RFC 9001 Section 4.1.3: data received at a previously installed
+     * encryption level cannot extend that level's CRYPTO flow.
+     */
+    ret = xqc_check_crypto_frame_level(conn, stream, stream_frame,
+                                       current_level);
+    if (ret != XQC_OK) {
+        xqc_destroy_stream_frame(stream_frame);
+        return ret;
+    }
 
     ret = xqc_insert_crypto_frame(conn, stream, stream_frame);
     if (ret != XQC_OK) {
@@ -1114,6 +1220,10 @@ xqc_process_crypto_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_in)
         xqc_destroy_stream_frame(stream_frame);
         return ret;
     }
+
+    stream->stream_max_recv_offset =
+        xqc_max(stream->stream_max_recv_offset,
+                stream_frame->data_offset + stream_frame->data_length);
 
     ret = xqc_read_crypto_stream(stream);
     if (ret < 0) {
@@ -1220,17 +1330,6 @@ xqc_int_t
 xqc_process_ping_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_in)
 {
     xqc_int_t ret;
-#ifdef XQC_PING_ATTACK_PROTECT
-    /* ping frame should not be the first frame in the first initial packet */
-    if (conn->conn_state == XQC_CONN_STATE_SERVER_INIT &&
-        !(conn->conn_flag & XQC_CONN_FLAG_INIT_RECVD)) {
-        xqc_log(
-            conn->log, XQC_LOG_ERROR,
-            "|xqc_process_ping_frame error: ping frame shoud not be the first frame|");
-        return XQC_ERROR;
-    }
-#endif
-
     ret = xqc_parse_ping_frame(packet_in, conn);
     if (ret != XQC_OK) {
         xqc_log(conn->log, XQC_LOG_ERROR, "|xqc_parse_ping_frame error|");
@@ -1476,6 +1575,22 @@ xqc_process_conn_close_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_in)
     xqc_int_t ret;
     uint64_t err_code;
 
+    /*
+     * RFC 9000 Section 12.5: an application CONNECTION_CLOSE frame (0x1d)
+     * MUST only appear in the application data packet number space.
+     */
+    if (packet_in->pos[0] == 0x1d
+        && (packet_in->pi_pkt.pkt_type == XQC_PTYPE_INIT
+            || packet_in->pi_pkt.pkt_type == XQC_PTYPE_HSK))
+    {
+        xqc_log(conn->log, XQC_LOG_ERROR,
+                "|illegal application CONNECTION_CLOSE in %s packet, close "
+                "with PROTOCOL_VIOLATION|",
+                xqc_pkt_type_2_str(packet_in->pi_pkt.pkt_type));
+        XQC_CONN_ERR(conn, TRA_PROTOCOL_VIOLATION);
+        return -XQC_EPROTO;
+    }
+
     ret = xqc_parse_conn_close_frame(packet_in, &err_code, conn);
     if (ret != XQC_OK) {
         xqc_log(conn->log, XQC_LOG_ERROR, "|xqc_parse_conn_close_frame error|");
@@ -1489,7 +1604,12 @@ xqc_process_conn_close_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_in)
     if (err_code) {
         xqc_log(conn->log, XQC_LOG_ERROR, "|with err:0x%xi|", err_code);
         XQC_CONN_CLOSE_MSG(conn, "remote error");
-        XQC_CONN_ERR(conn, err_code);
+        if (conn->conn_err_type == XQC_CONN_ERR_TYPE_APPLICATION) {
+            XQC_CONN_APP_ERR(conn, err_code);
+
+        } else {
+            XQC_CONN_ERR(conn, err_code);
+        }
     } else {
         XQC_CONN_CLOSE_MSG(conn, "remote close");
     }
@@ -1536,12 +1656,31 @@ xqc_process_reset_stream_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_i
             }
 
         } else {
-            xqc_log(conn->log, XQC_LOG_WARN, "|cannot find stream|stream_id:%ui|",
+            /* Ordinary, not exceptional: cancelling a request makes the peer
+             * mirror RESET_STREAM back, and that echo routinely arrives after
+             * the local stream has already been retired. Also covers a plain
+             * retransmit after close. */
+            xqc_log(conn->log, XQC_LOG_DEBUG, "|cannot find stream|stream_id:%ui|",
                     stream_id);
-            /* Packet retransmitted after stream is closed */
             return XQC_OK;
         }
     }
+
+    /*
+     * RFC 9000 Section 4.5: the final size cannot be smaller than the
+     * largest offset of stream data already received.
+     */
+    if (stream->stream_state_recv < XQC_RECV_STREAM_ST_RESET_RECVD
+        && final_size < stream->stream_max_recv_offset)
+    {
+        xqc_log(conn->log, XQC_LOG_ERROR,
+                "|RESET_STREAM final size too small|stream_id:%ui|"
+                "final_size:%ui|max_recv_offset:%ui|",
+                stream_id, final_size, stream->stream_max_recv_offset);
+        XQC_CONN_ERR(conn, TRA_FINAL_SIZE_ERROR);
+        return -XQC_EPROTO;
+    }
+
     stream->stream_err = err_code;
 
     XQC_STREAM_CLOSE_MSG(stream, "remote reset");
@@ -1552,7 +1691,10 @@ xqc_process_reset_stream_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_i
 
     xqc_stream_closing(stream, err_code);
 
-    if (stream->stream_state_send < XQC_SEND_STREAM_ST_RESET_SENT) {
+    /* RFC 9000 Section 3.3: only the sender sends RESET_STREAM. */
+    if (!xqc_stream_is_recv_only(conn->conn_type, stream_id)
+        && stream->stream_state_send < XQC_SEND_STREAM_ST_RESET_SENT)
+    {
         xqc_send_queue_drop_stream_frame_packets(conn, stream_id);
         xqc_write_reset_stream_to_packet(conn, stream, err_code,
                                          stream->stream_send_offset);
@@ -1608,9 +1750,9 @@ xqc_process_stop_sending_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_i
             }
 
         } else {
-            xqc_log(conn->log, XQC_LOG_WARN, "|cannot find stream|stream_id:%ui|",
+            /* Same benign race as in xqc_process_reset_stream_frame. */
+            xqc_log(conn->log, XQC_LOG_DEBUG, "|cannot find stream|stream_id:%ui|",
                     stream_id);
-            /* Packet retransmitted after stream is closed */
             return XQC_OK;
         }
     }
@@ -1931,6 +2073,18 @@ xqc_process_new_token_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_in)
 xqc_int_t
 xqc_process_datagram_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_in)
 {
+    /* RFC 9221 Section 5 permits DATAGRAM only with 0-RTT or 1-RTT keys. */
+    if (packet_in->pi_pkt.pkt_type != XQC_PTYPE_0RTT
+        && packet_in->pi_pkt.pkt_type != XQC_PTYPE_SHORT_HEADER)
+    {
+        xqc_log(conn->log, XQC_LOG_ERROR,
+                "|illegal DATAGRAM frame in %s packet, close with "
+                "PROTOCOL_VIOLATION|",
+                xqc_pkt_type_2_str(packet_in->pi_pkt.pkt_type));
+        XQC_CONN_ERR(conn, TRA_PROTOCOL_VIOLATION);
+        return -XQC_EPROTO;
+    }
+
     /* does not support datagram */
     if (conn->local_settings.max_datagram_frame_size == 0) {
         xqc_log(conn->log, XQC_LOG_ERROR,
@@ -1944,12 +2098,11 @@ xqc_process_datagram_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_in)
 
     xqc_int_t ret = xqc_parse_datagram_frame(packet_in, conn, &data_buffer, &data_len);
     if (ret == -XQC_EPROTO) {
-        xqc_log(
-            conn->log, XQC_LOG_ERROR,
-            "|the endpoint receives a DATAGRAM frame larger than max_datagram_frame_size|"
-            "max_datagram_frame_size:%ud|frame_size:%ud|",
-            conn->local_settings.max_datagram_frame_size,
-            data_len + XQC_DATAGRAM_HEADER_BYTES);
+        xqc_log(conn->log, XQC_LOG_ERROR,
+                "|the endpoint receives a DATAGRAM frame larger than max_datagram_frame_size|"
+                "max_datagram_frame_size:%ui|frame_size:%uz|",
+                conn->local_settings.max_datagram_frame_size,
+                data_len + XQC_DATAGRAM_HEADER_BYTES);
         XQC_CONN_ERR(conn, TRA_PROTOCOL_VIOLATION);
         return ret;
     }

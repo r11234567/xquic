@@ -348,6 +348,7 @@ xqc_test_pmtud_search_stops_within_precision(void)
     conn->max_pkt_out_size = 1300 + XQC_PMTUD_SEARCH_PRECISION - 1;
     conn->probing_pkt_out_size = 1301;
     conn->conn_flag |= XQC_CONN_FLAG_PMTUD_PROBING
+                       | XQC_CONN_FLAG_HANDSHAKE_COMPLETED
                        | XQC_CONN_FLAG_CAN_SEND_1RTT;
 
     xqc_conn_ptmud_probing(conn);
@@ -371,6 +372,7 @@ xqc_test_pmtud_search_probes_wide_range(void)
     conn->probing_pkt_out_size = 1350;
     conn->probing_cnt = 0;
     conn->conn_flag |= XQC_CONN_FLAG_PMTUD_PROBING
+                       | XQC_CONN_FLAG_HANDSHAKE_COMPLETED
                        | XQC_CONN_FLAG_CAN_SEND_1RTT;
     conn->conn_initial_path->path_state = XQC_PATH_STATE_ACTIVE;
 
@@ -1060,8 +1062,70 @@ xqc_test_pmtud_no_ack_into_packet_above_path_size(void)
     xqc_engine_destroy(conn->engine);
 }
 
-/* a PTO on a path at the base size sends no copy of a larger packet sent
- * elsewhere: a PING instead */
+/* A newly validated path resizes queued urgent STREAM packets only when
+ * the path lowers the connection's packet size. */
+static void
+xqc_test_pmtud_urgent_path_size(size_t new_size)
+{
+    xqc_connection_t *conn = xqc_test_pmtud_conn(PMTUD_BASE, 1400);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(conn);
+    xqc_stream_t *stream = xqc_create_stream_with_conn(conn,
+        XQC_UNDEFINE_STREAM_ID, XQC_CLI_BID, NULL, NULL);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(stream);
+    xqc_packet_out_t *po = xqc_write_new_packet(conn, XQC_PTYPE_SHORT_HEADER);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(po);
+    unsigned char data[1340];
+    memset(data, 'u', sizeof(data));
+    size_t written = 0;
+    int n = xqc_gen_stream_frame(po, stream->stream_id, 0, 0, data,
+                                 sizeof(data), &written);
+    CU_ASSERT_FATAL(n > 0 && written == sizeof(data));
+    po->po_used_size += n;
+    xqc_conn_increase_unacked_stream_ref(conn, po);
+    xqc_send_queue_move_to_urgent(&po->po_list, conn->conn_send_queue);
+
+    xqc_path_ctx_t path;
+    memset(&path, 0, sizeof(path));
+    path.path_id = 1;
+    path.curr_pkt_out_size = new_size;
+    xqc_conn_pmtud_on_new_path(conn, &path);
+
+    xqc_send_queue_t *sq = conn->conn_send_queue;
+    if (new_size < 1400) {
+        CU_ASSERT(xqc_list_empty(&sq->sndq_send_packets_urgent));
+        size_t total = 0;
+        xqc_list_head_t *pos;
+        xqc_list_for_each(pos, &sq->sndq_lost_packets) {
+            xqc_packet_out_t *part = xqc_list_entry(pos,
+                xqc_packet_out_t, po_list);
+            CU_ASSERT(part->po_used_size <= new_size);
+            total += part->po_stream_frames[0].ps_length;
+        }
+        CU_ASSERT_EQUAL(total, sizeof(data));
+
+    } else {
+        CU_ASSERT(!xqc_list_empty(&sq->sndq_send_packets_urgent));
+        CU_ASSERT(sq->sndq_send_packets_urgent.next == &po->po_list);
+        CU_ASSERT(xqc_list_empty(&sq->sndq_lost_packets));
+    }
+
+    xqc_engine_destroy(conn->engine);
+}
+
+void
+xqc_test_pmtud_urgent_queue_resized_on_new_path(void)
+{
+    xqc_test_pmtud_urgent_path_size(PMTUD_BASE);
+}
+
+void
+xqc_test_pmtud_urgent_queue_kept_when_path_fits(void)
+{
+    xqc_test_pmtud_urgent_path_size(1400);
+}
+
+/* A PTO on a path at the base size sends a PING rather than copying a
+ * larger packet sent elsewhere. */
 void
 xqc_test_pmtud_pto_copy_fits_path_size(void)
 {

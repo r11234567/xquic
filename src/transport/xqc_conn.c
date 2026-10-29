@@ -39,6 +39,9 @@
 
 #define XQC_DEFAULT_MAX_STREAMS 1024
 
+static void xqc_conn_tls_transport_error_cb(xqc_int_t transport_err,
+    void *user_data);
+
 xqc_conn_settings_t internal_default_conn_settings = {
     .pacing_on = 0,
     .ping_on = 0,
@@ -74,7 +77,7 @@ xqc_conn_settings_t internal_default_conn_settings = {
 
     .standby_path_probe_timeout = 0,
     .fec_conn_queue_rpr_timeout = 0,
-    .enable_pmtud = 0,
+    .enable_pmtud = 1,
     .pmtud_probing_interval = 500000,
     /* RFC 8899 §5.3 PMTU_RAISE_TIMER, recommended 600 s. */
     .pmtud_raise_interval = 600000000,
@@ -813,6 +816,7 @@ xqc_conn_init_key_update_ctx(xqc_connection_t *conn)
     ctx->first_sent_pktno = 0;
     ctx->first_recv_pktno = 0;
     ctx->enc_pkt_cnt = 0;
+    ctx->aead_confidentiality_limit = 0;
 
     ctx->initiate_time_guard = 0;
 }
@@ -1546,7 +1550,8 @@ xqc_conn_server_on_alpn(xqc_connection_t *conn, const unsigned char *alpn,
         }
 
         conn->conn_flag &= ~XQC_CONN_FLAG_LOCAL_TP_UPDATED;
-        xqc_log(conn->log, XQC_LOG_INFO, "|update tp|max_datagram_frame_size:%ud|",
+        xqc_log(conn->log, XQC_LOG_INFO,
+                "|update tp|max_datagram_frame_size:%ui|",
                 conn->local_settings.max_datagram_frame_size);
     }
 
@@ -1759,7 +1764,7 @@ xqc_conn_destroy(xqc_connection_t *xc)
             ? (xc->first_data_send_time - xc->conn_create_time)
             : 0,
         xqc_monotonic_timestamp() - xc->conn_create_time,
-        xc->key_update_ctx.key_update_cnt, xc->conn_err,
+        xc->key_update_ctx.key_update_cnt, XQC_CONN_ERR_CODE(xc->conn_err),
         xc->conn_close_msg ? xc->conn_close_msg : "", xqc_conn_addr_str(xc),
         xqc_calc_delay(xc->conn_hsk_recv_time, xc->conn_create_time),
         xqc_calc_delay(xc->conn_close_recv_time, xc->conn_create_time),
@@ -1776,7 +1781,7 @@ xqc_conn_destroy(xqc_connection_t *xc)
         conn_stats.send_fec_cnt, xc->fec_ctl ? xc->fec_ctl->fec_recover_pkt_cnt : 0,
         xc->pkt_out_size, xc->max_pkt_out_size, xc->probing_pkt_out_size,
         conn_stats.extern_conn_info, xc->max_acked_po_size,
-        xc->local_settings.enable_pmtud & xc->remote_settings.enable_pmtud,
+        (uint64_t)xc->enable_pmtud,
         xc->conn_avg_close_delay);
     xqc_log_event(xc->log, CON_CONNECTION_CLOSED, xc);
 
@@ -2411,7 +2416,8 @@ xqc_conn_pmtud_drop_unsent(xqc_connection_t *conn)
 {
     xqc_send_queue_t *sq = conn->conn_send_queue;
     xqc_list_head_t *lists[] = {
-        &sq->sndq_send_packets, &sq->sndq_send_packets_high_pri, &sq->sndq_lost_packets,
+        &sq->sndq_send_packets, &sq->sndq_send_packets_high_pri,
+        &sq->sndq_send_packets_urgent, &sq->sndq_lost_packets,
     };
     xqc_list_head_t *pos, *next, *ppos, *pnext;
     xqc_path_ctx_t *path;
@@ -2745,6 +2751,106 @@ xqc_check_acked_or_dropped_pkt(xqc_connection_t *conn, xqc_packet_out_t *packet_
 }
 
 
+/**
+ * Why is the connection out of cwnd: the controllers, or the sndbuf clamp?
+ *
+ * This replaces a check that could not answer anything. The previous version
+ * asked whether any path would accept one more packet, using
+ * xqc_send_packet_cwnd_allows -- which is the very predicate every scheduler
+ * consults via xqc_scheduler_check_path_can_send. So it was only ever reached
+ * when every path had already answered no to the same function, and it
+ * necessarily answered no again: sched_stop_headroom_left came back 0 in all 46
+ * rows of run 34026833126 and all 22 WLB rows of 34036912262, which is what a
+ * tautology looks like in an artifact. Only one bit of it was real -- that the
+ * PTO exclusion never dropped a path that had cwnd -- and that bit never fired.
+ *
+ * The question worth asking at this point is not WHETHER capacity exists but
+ * WHICH ceiling removed it. xqc_send_ctl_can_send takes the min of the
+ * congestion window and conn_settings.so_sndbuf, so a connection can be
+ * "cwnd-blocked" with every controller wide open, purely because the shared
+ * sndbuf clamp is below the sum of the paths' BDPs. That is a configuration
+ * bug, not congestion, and the two demand opposite responses -- yet they are
+ * indistinguishable in sched_cc_blocked, and were indistinguishable in the
+ * counter this replaces.
+ *
+ * mqvpn sets so_sndbuf to 8 MiB (mqvpn_conn_settings.c:128) against a fast
+ * leg whose BDP is ~7.6 MB, so the clamp binding is not hypothetical -- it is
+ * the leading untested explanation for the aggregate-below-one-leg rows.
+ *
+ * Returns XQC_TRUE when at least one path was refused by the sndbuf clamp
+ * while its own congestion window still had room, i.e. when the ceiling was
+ * ours rather than the network's.
+ */
+static xqc_bool_t
+xqc_conn_sndbuf_clamp_bound(xqc_connection_t *conn, xqc_packet_out_t *packet_out)
+{
+    xqc_list_head_t *pos, *next;
+    xqc_path_ctx_t  *path;
+    uint32_t sndbuf = conn->conn_settings.so_sndbuf;
+
+    /* No clamp configured means it cannot be the binding constraint. */
+    if (sndbuf == 0) {
+        return XQC_FALSE;
+    }
+
+    xqc_list_for_each_safe(pos, next, &conn->conn_paths_list) {
+        path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
+        if (path->path_state != XQC_PATH_STATE_ACTIVE
+            || path->app_path_status == XQC_APP_PATH_STATUS_FROZEN
+            || (path->path_flag & XQC_PATH_FLAG_SOCKET_ERROR)
+            || path->path_send_ctl == NULL
+            || path->path_send_ctl->ctl_cong_callback == NULL)
+        {
+            continue;
+        }
+
+        /* Recompute the same comparison xqc_send_ctl_can_send makes, but
+         * against the raw congestion window instead of min(cwnd, sndbuf). If
+         * the packet fits the controller's window and not the clamp, the clamp
+         * is what stopped it. */
+        uint64_t need = (uint64_t)path->path_send_ctl->ctl_bytes_in_flight
+                        + path->path_schedule_bytes
+                        + packet_out->po_used_size;
+        unsigned cwnd = path->path_send_ctl->ctl_cong_callback
+                            ->xqc_cong_ctl_get_cwnd(path->path_send_ctl->ctl_cong);
+
+        if (need <= (uint64_t)cwnd && need > (uint64_t)sndbuf) {
+            return XQC_TRUE;
+        }
+    }
+    return XQC_FALSE;
+}
+
+/**
+ * One line per second naming where the send side stopped.
+ *
+ * REPORT, not INFO: this is a statistics line, and an embedder that maps its
+ * own INFO onto a higher xquic level would otherwise never see it -- mqvpn
+ * does exactly that, which is how two earlier instrumentation attempts came
+ * back with empty logs.
+ */
+static void
+xqc_conn_send_supply_log(xqc_connection_t *conn, xqc_usec_t now)
+{
+    if (now - conn->supply_log_ts < 1000000) {
+        return;
+    }
+    conn->supply_log_ts = now;
+
+    xqc_log(conn->log, XQC_LOG_REPORT,
+            "|send_supply|passes:%ui|drained:%ui|stop_all_blocked:%ui"
+            "|stop_sndbuf_clamp:%ui|stop_backlog:%ui|sndq_used:%ui"
+            "|paths:%ud|",
+            conn->supply_stats.sched_passes,
+            conn->supply_stats.sched_drained,
+            conn->supply_stats.sched_stop_all_blocked,
+            conn->supply_stats.sched_stop_sndbuf_clamp,
+            conn->supply_stats.sched_stop_backlog,
+            (uint64_t)(conn->conn_send_queue
+                       ? conn->conn_send_queue->sndq_packets_used : 0),
+            conn->active_path_count);
+}
+
 void
 xqc_conn_schedule_packets(xqc_connection_t *conn, xqc_list_head_t *head,
                           xqc_bool_t packets_are_limited_by_cc, xqc_send_type_t send_type)
@@ -2761,6 +2867,10 @@ xqc_conn_schedule_packets(xqc_connection_t *conn, xqc_list_head_t *head,
 
     now = xqc_monotonic_timestamp();
     reset_rpr_timer = 0;
+    xqc_bool_t stopped_early = XQC_FALSE;
+    /* Sampled before the loop: the loop empties the list, so testing it
+     * afterwards would report "empty" precisely on the passes that succeeded. */
+    xqc_bool_t had_work = !xqc_list_empty(head);
 
     xqc_list_for_each_safe(pos, next, head)
     {
@@ -2793,6 +2903,34 @@ xqc_conn_schedule_packets(xqc_connection_t *conn, xqc_list_head_t *head,
                 if (xqc_timer_is_set(&conn->conn_timer_manager, XQC_TIMER_QUEUE_FIN)) {
                     reset_rpr_timer = 1;
                 }
+                /* Record what this pass left behind and why. Only for the
+                 * normal-data list: the others (PTO, retrans, high-pri) run
+                 * uncapped by cc or carry a handful of packets, so counting
+                 * them would drown the signal from the list that carries the
+                 * datagrams. */
+                if (send_type == XQC_SEND_TYPE_NORMAL) {
+                    xqc_list_head_t *rest;
+                    uint64_t backlog = 0;
+                    /* Capped walk. The queue can hold 18000 packets and this
+                     * runs once per engine tick, so an unbounded count would
+                     * cost more than the scheduling it measures. The cap only
+                     * has to be big enough to distinguish "stopped with a
+                     * couple queued" from "stopped with the queue full", which
+                     * is the whole question. */
+                    for (rest = pos;
+                         rest != head && backlog < XQC_SCHED_BACKLOG_PROBE_MAX;
+                         rest = rest->next)
+                    {
+                        backlog++;
+                    }
+                    conn->supply_stats.sched_stop_backlog += backlog;
+                    if (xqc_conn_sndbuf_clamp_bound(conn, packet_out)) {
+                        conn->supply_stats.sched_stop_sndbuf_clamp++;
+                    } else {
+                        conn->supply_stats.sched_stop_all_blocked++;
+                    }
+                }
+                stopped_early = XQC_TRUE;
                 break;
             }
         }
@@ -2815,6 +2953,20 @@ xqc_conn_schedule_packets(xqc_connection_t *conn, xqc_list_head_t *head,
         xqc_path_send_buffer_append(path, packet_out,
                                     &path->path_schedule_buf[send_type]);
     }
+
+    /* A pass that reached the end of the list placed everything offered, so the
+     * limit was the supply, not the paths. Counted only for the normal-data
+     * list, and only when it had something to do -- an empty queue on an idle
+     * connection is not a drained pass, and counting it would swamp the ratio
+     * this exists to report. */
+    if (send_type == XQC_SEND_TYPE_NORMAL && had_work) {
+        conn->supply_stats.sched_passes++;
+        if (!stopped_early) {
+            conn->supply_stats.sched_drained++;
+        }
+        xqc_conn_send_supply_log(conn, now);
+    }
+
     if (conn->conn_settings.fec_params.fec_encoder_scheme == XQC_PACKET_MASK_CODE &&
         send_type == XQC_SEND_TYPE_NORMAL && reset_rpr_timer) {
         cq_fin_timeout = xqc_conn_get_queue_fin_timeout(conn);
@@ -3090,8 +3242,16 @@ xqc_conn_send_packets_batch(xqc_connection_t *conn)
                                     XQC_SEND_TYPE_NORMAL_HIGH_PRI);
     }
 
-    head = &conn->conn_send_queue->sndq_send_packets;
+    head = &conn->conn_send_queue->sndq_send_packets_urgent;
     congest = 1;
+    xqc_list_for_each_safe(pos, next, &conn->conn_paths_list)
+    {
+        path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
+        xqc_path_send_packets_batch(conn, path, head, congest,
+                                    XQC_SEND_TYPE_NORMAL_URGENT);
+    }
+
+    head = &conn->conn_send_queue->sndq_send_packets;
     xqc_list_for_each_safe(pos, next, &conn->conn_paths_list)
     {
         path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
@@ -3196,6 +3356,13 @@ xqc_conn_send_packets(xqc_connection_t *conn)
     }
 
     congest = 1;
+    head = &conn->conn_send_queue->sndq_send_packets_urgent;
+    xqc_list_for_each_safe(pos, next, &conn->conn_paths_list)
+    {
+        path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
+        xqc_path_send_packets(conn, path, head, congest, XQC_SEND_TYPE_NORMAL_URGENT);
+    }
+
     head = &conn->conn_send_queue->sndq_send_packets;
     xqc_list_for_each_safe(pos, next, &conn->conn_paths_list)
     {
@@ -3574,6 +3741,9 @@ xqc_conn_schedule_packets_to_paths(xqc_connection_t *conn)
 
     head = &conn->conn_send_queue->sndq_send_packets_high_pri;
     xqc_conn_schedule_packets(conn, head, XQC_FALSE, XQC_SEND_TYPE_NORMAL_HIGH_PRI);
+
+    head = &conn->conn_send_queue->sndq_send_packets_urgent;
+    xqc_conn_schedule_packets(conn, head, XQC_TRUE, XQC_SEND_TYPE_NORMAL_URGENT);
 
     /* try to reinject unacked packets if paths still have cwnd */
     if (conn->conn_settings.mp_enable_reinjection & XQC_REINJ_UNACK_BEFORE_SCHED) {
@@ -3982,14 +4152,14 @@ end:
 xqc_int_t
 xqc_conn_close_with_error(xqc_connection_t *conn, uint64_t err_code)
 {
-    XQC_CONN_ERR(conn, err_code);
+    XQC_CONN_APP_ERR(conn, err_code);
     return XQC_OK;
 }
 
 xqc_int_t
 xqc_conn_get_errno(xqc_connection_t *conn)
 {
-    return conn->conn_err;
+    return XQC_CONN_ERR_CODE(conn->conn_err);
 }
 
 xqc_conn_err_type_t
@@ -4449,7 +4619,7 @@ xqc_conn_get_stats_internal(xqc_connection_t *conn, xqc_conn_stats_t *conn_stats
         conn_stats->alpn[1] = '1';
     }
 
-    conn_stats->conn_err = (int)conn->conn_err;
+    conn_stats->conn_err = (int)XQC_CONN_ERR_CODE(conn->conn_err);
     conn_stats->early_data_flag = XQC_0RTT_NONE;
     conn_stats->enable_multipath = conn->enable_multipath;
     conn_stats->enable_fec = conn->conn_settings.fec_params.fec_encoder_scheme ? 1 : 0;
@@ -5053,7 +5223,7 @@ xqc_conn_early_data_reject(xqc_connection_t *conn)
  * check retry packet condition first and send retry packet if needed
  */
 xqc_int_t
-xqc_conn_server_accept(xqc_connection_t *c)
+xqc_conn_server_accept(xqc_connection_t *c, xqc_packet_in_t *packet_in)
 {
     xqc_int_t ret = XQC_OK;
     /* check whether to send retry packet */
@@ -5067,7 +5237,13 @@ xqc_conn_server_accept(xqc_connection_t *c)
             xqc_log(c->log, XQC_LOG_INFO, "|check_token fail|conn:%p|%s|", c,
                     xqc_conn_addr_str(c));
             if (c->conn_flag & XQC_CONN_FLAG_RETRY_SENT) {
-                return -XQC_EIGNORE_PKT; /* retry packet already sent */
+                if (packet_in != NULL
+                    && xqc_cid_is_equal(&packet_in->pi_pkt.pkt_dcid, &c->retry_scid) == XQC_OK)
+                {
+                    XQC_CONN_ERR(c, TRA_INVALID_TOKEN);
+                    return -XQC_EPROTO;
+                }
+                return -XQC_EIGNORE_PKT;
             } else {
                 if (c->transport_cbs.conn_retry_packet_condition_check) {
                     if (c->transport_cbs.conn_retry_packet_condition_check(
@@ -5197,11 +5373,25 @@ xqc_conn_add_path_cid_sets(xqc_connection_t *conn, uint32_t start, uint32_t end)
 void
 xqc_conn_try_to_enable_pmtud(xqc_connection_t *conn)
 {
-    uint64_t pmtud_check_bit = conn->conn_type == XQC_CONN_TYPE_SERVER ? 0x2 : 0x1;
+    uint64_t pmtud_check_bit = conn->conn_type == XQC_CONN_TYPE_SERVER
+                               ? XQC_PMTUD_ENABLE_SERVER
+                               : XQC_PMTUD_ENABLE_CLIENT;
     xqc_usec_t now;
-    if (((conn->remote_settings.enable_pmtud & conn->local_settings.enable_pmtud) &
-         pmtud_check_bit) != 0) {
+    if ((conn->local_settings.enable_pmtud & XQC_PMTUD_FORCE_ENABLE)
+        || ((conn->remote_settings.enable_pmtud
+             & conn->local_settings.enable_pmtud
+             & pmtud_check_bit) != 0))
+    {
         conn->enable_pmtud = 1;
+
+        /*
+         * RFC 9000 Section 14.3.1 starts QUIC DPLPMTUD after the
+         * handshake completes. Transport parameters can arrive earlier.
+         */
+        if (!(conn->conn_flag & XQC_CONN_FLAG_HANDSHAKE_COMPLETED)) {
+            return;
+        }
+
         now = xqc_monotonic_timestamp();
         if (conn->enable_multipath) {
             xqc_timer_set(&conn->conn_timer_manager, XQC_TIMER_PMTUD_PROBING, now,
@@ -5330,6 +5520,8 @@ xqc_conn_handshake_complete(xqc_connection_t *conn)
             xqc_conn_early_data_accept(conn);
         }
     }
+
+    xqc_conn_try_to_enable_pmtud(conn);
 
     return XQC_OK;
 }
@@ -5948,6 +6140,25 @@ xqc_conn_tolerant_error(xqc_int_t ret)
         return XQC_TRUE;
     }
 
+    /*
+     * -XQC_ELIMIT means a receive buffer is full, not that the peer misbehaved,
+     * so it must not close the connection. Being tolerant here drops the packet
+     * WITHOUT acknowledging it (the caller skips xqc_conn_on_pkt_processed),
+     * which makes the peer retransmit once the backlog drains: real
+     * backpressure, and lossless, because a QUIC frame is idempotent on
+     * replay.
+     *
+     * Previously this reached the generic error path and was reported as
+     * FRAME_ENCODING_ERROR — a protocol violation — which killed connections
+     * mid-transfer whenever a reorder hole grew the buffered-frame count past
+     * its cap. That is the normal state of a multipath connection whose paths
+     * have different one-way delays, i.e. precisely the case this stack exists
+     * to serve.
+     */
+    if (-XQC_ELIMIT == ret) {
+        return XQC_TRUE;
+    }
+
     return XQC_FALSE;
 }
 
@@ -5980,9 +6191,12 @@ xqc_conn_process_packet(xqc_connection_t *c, const unsigned char *packet_in_buf,
     const unsigned char *end = packet_in_buf + packet_in_size; /* end of udp datagram */
     xqc_packet_in_t packet;
     unsigned char decrypt_payload[XQC_MAX_PACKET_IN_LEN];
+    xqc_cid_t first_dcid;
+    xqc_bool_t dcid_mismatch;
 
     /* process all QUIC packets in UDP datagram */
     while (pos < end) {
+        dcid_mismatch = XQC_FALSE;
         last_pos = pos;
 
         /* init packet in */
@@ -5990,16 +6204,30 @@ xqc_conn_process_packet(xqc_connection_t *c, const unsigned char *packet_in_buf,
         memset(packet_in, 0, sizeof(*packet_in));
         xqc_packet_in_init(packet_in, pos, end - pos, decrypt_payload,
                            XQC_MAX_PACKET_IN_LEN, recv_time);
+        packet_in->datagram_size = packet_in_size;
 
         packet_in->pi_path_id = XQC_UNKNOWN_PATH_ID;
 
         /* packet_in->pos will update inside */
-        ret = xqc_packet_process_single(c, packet_in);
+        ret = xqc_packet_process_single(
+            c, packet_in, pos == packet_in_buf ? NULL : &first_dcid,
+            &dcid_mismatch);
+        if (ret == XQC_OK && pos == packet_in_buf) {
+            xqc_cid_copy(&first_dcid, &packet_in->pi_pkt.pkt_dcid);
+        }
 
         xqc_conn_log_recvd_packet(c, packet_in, packet_in_size, ret, recv_time);
 
         if (ret == XQC_OK) {
             ret = xqc_conn_on_pkt_processed(c, packet_in, recv_time);
+
+        } else if (dcid_mismatch) {
+            xqc_log(c->log, XQC_LOG_INFO,
+                    "|ignore coalesced packet with different DCID|skip:%uz|",
+                    (size_t)(packet_in->last - packet_in->buf));
+            pos = packet_in->last;
+            ret = XQC_OK;
+            continue;
 
         } else if (xqc_conn_tolerant_error(ret)) {
             /* ignore the remain bytes. -XQC_EIGNORE_PKT drops are a handled
@@ -6291,31 +6519,22 @@ xqc_conn_try_add_new_conn_id(xqc_connection_t *conn, uint64_t retire_prior_to)
     return XQC_OK;
 }
 
+
 void
 xqc_conn_ptmud_probing(xqc_connection_t *conn)
 {
     if (conn->conn_state >= XQC_CONN_STATE_CLOSING) {
         xqc_log(conn->log, XQC_LOG_INFO, "|conn closing, cannot send PMTUD probing|");
-    }
-    /* probing can only be sent in 0RTT/1RTT packets */
-
-    xqc_pkt_type_t pkt_type = XQC_PTYPE_SHORT_HEADER;
-    int support_0rtt = xqc_conn_is_ready_to_send_early_data(conn);
-
-    if (!(conn->conn_flag & XQC_CONN_FLAG_CAN_SEND_1RTT)) {
-        if ((conn->conn_type == XQC_CONN_TYPE_CLIENT) &&
-            (conn->conn_state == XQC_CONN_STATE_CLIENT_INITIAL_SENT) && support_0rtt) {
-            pkt_type = XQC_PTYPE_0RTT;
-            conn->conn_flag |= XQC_CONN_FLAG_HAS_0RTT;
-
-        } else {
-            return;
-        }
-    }
-
-    if (pkt_type == XQC_PTYPE_0RTT && conn->zero_rtt_count >= XQC_PACKET_0RTT_MAX_COUNT) {
         return;
     }
+    /* RFC 9000 Section 14.3.1: defer DPLPMTUD until handshake completion. */
+    if (!(conn->conn_flag & XQC_CONN_FLAG_HANDSHAKE_COMPLETED)
+        || !(conn->conn_flag & XQC_CONN_FLAG_CAN_SEND_1RTT))
+    {
+        return;
+    }
+
+    xqc_pkt_type_t pkt_type = XQC_PTYPE_SHORT_HEADER;
 
     /* generate PING packets */
     if (conn->probing_cnt >= 3) {
@@ -6564,7 +6783,8 @@ xqc_need_reassemble_packet(xqc_packet_out_t *packet_out)
 }
 
 static xqc_int_t
-xqc_conn_reassemble_packet(xqc_connection_t *conn, xqc_packet_out_t *ori_po)
+xqc_conn_reassemble_packet(xqc_connection_t *conn, xqc_packet_out_t *ori_po,
+                           xqc_stream_priority_t priority)
 {
     xqc_packet_out_t *new_po = xqc_write_new_packet(conn, ori_po->po_pkt.pkt_type);
     if (new_po == NULL) {
@@ -6616,8 +6836,13 @@ xqc_conn_reassemble_packet(xqc_connection_t *conn, xqc_packet_out_t *ori_po)
     /* set RESEND flag */
     new_po->po_flag |= XQC_POF_RESEND;
 
-    if (new_po->po_frame_types & XQC_FRAME_BIT_CRYPTO) {
+    if ((new_po->po_frame_types & XQC_FRAME_BIT_CRYPTO)
+        || priority == XQC_STREAM_PRI_HIGH)
+    {
         xqc_send_queue_move_to_high_pri(&new_po->po_list, conn->conn_send_queue);
+
+    } else if (priority == XQC_STREAM_PRI_URGENT) {
+        xqc_send_queue_move_to_urgent(&new_po->po_list, conn->conn_send_queue);
     }
 
     xqc_log(conn->log, XQC_LOG_DEBUG, "|pkt_num:%ui|ptype:%d|frames:%s|",
@@ -6628,23 +6853,15 @@ xqc_conn_reassemble_packet(xqc_connection_t *conn, xqc_packet_out_t *ori_po)
 }
 
 static xqc_int_t
-xqc_conn_resend_packets(xqc_connection_t *conn)
+xqc_conn_resend_packets_from_list(xqc_connection_t *conn, xqc_list_head_t *head,
+                                  xqc_stream_priority_t priority)
 {
-    /*
-     * Generate new header and reassemble packet for Initial and 0-RTT packets
-     * that need to be resent, and drop all old packets with the original header.
-     *
-     * TODO: Refactoring packet generation: generate packet header before sent.
-     * Then we don't have to reassemble the packets.
-     */
-
     xqc_int_t ret;
     xqc_send_queue_t *send_queue = conn->conn_send_queue;
-
     xqc_list_head_t *pos, *next;
     xqc_packet_out_t *packet_out;
 
-    xqc_list_for_each_safe(pos, next, &send_queue->sndq_send_packets)
+    xqc_list_for_each_safe(pos, next, head)
     {
         packet_out = xqc_list_entry(pos, xqc_packet_out_t, po_list);
 
@@ -6654,7 +6871,7 @@ xqc_conn_resend_packets(xqc_connection_t *conn)
 
         /* reassemble new packet with updated header and insert to send queue */
         if (xqc_need_reassemble_packet(packet_out)) {
-            ret = xqc_conn_reassemble_packet(conn, packet_out);
+            ret = xqc_conn_reassemble_packet(conn, packet_out, priority);
             if (ret != XQC_OK) {
                 xqc_log(conn->log, XQC_LOG_ERROR,
                         "|xqc_conn_reassemble_packet error|ret:%d|", ret);
@@ -6671,6 +6888,33 @@ xqc_conn_resend_packets(xqc_connection_t *conn)
     return XQC_OK;
 }
 
+static xqc_int_t
+xqc_conn_resend_packets(xqc_connection_t *conn)
+{
+    /*
+     * Generate new header and reassemble packet for Initial and 0-RTT packets
+     * that need to be resent, and drop all old packets with the original header.
+     *
+     * TODO: Refactoring packet generation: generate packet header before sent.
+     * Then we don't have to reassemble the packets.
+     */
+    xqc_send_queue_t *send_queue = conn->conn_send_queue;
+    xqc_int_t ret = xqc_conn_resend_packets_from_list(
+        conn, &send_queue->sndq_send_packets_high_pri, XQC_STREAM_PRI_HIGH);
+    if (ret != XQC_OK) {
+        return ret;
+    }
+
+    ret = xqc_conn_resend_packets_from_list(
+        conn, &send_queue->sndq_send_packets_urgent, XQC_STREAM_PRI_URGENT);
+    if (ret != XQC_OK) {
+        return ret;
+    }
+
+    return xqc_conn_resend_packets_from_list(
+        conn, &send_queue->sndq_send_packets, XQC_STREAM_PRI_NORMAL);
+}
+
 xqc_int_t
 xqc_conn_on_recv_retry(xqc_connection_t *conn, xqc_cid_t *retry_scid)
 {
@@ -6681,8 +6925,12 @@ xqc_conn_on_recv_retry(xqc_connection_t *conn, xqc_cid_t *retry_scid)
     /* RFC 9000 §7.3: save Retry SCID for later retry_source_connection_id validation */
     xqc_cid_copy(&conn->retry_scid, retry_scid);
 
-    /* change the DCID it uses for sending packets in response to Retry packet. */
+    /*
+     * RFC 9000 Section 17.2.5.1: subsequent packets use the Retry SCID
+     * as their DCID. The final send path reads the per-path DCID.
+     */
     xqc_cid_copy(&conn->dcid_set.current_dcid, retry_scid);
+    xqc_cid_copy(&conn->conn_initial_path->path_dcid, retry_scid);
     xqc_datagram_record_mss(conn);
     /* reset initial keys */
     ret = xqc_tls_reset_initial(conn->tls, conn->version, retry_scid);
@@ -6854,7 +7102,8 @@ xqc_conn_get_local_transport_params(xqc_connection_t *conn,
     params->multipath_version = settings->multipath_version;
     params->init_max_path_id = settings->init_max_path_id;
     params->max_datagram_frame_size = settings->max_datagram_frame_size;
-    params->enable_pmtud = settings->enable_pmtud;
+    /* XQC_PMTUD_FORCE_ENABLE is a local-only sender policy. */
+    params->enable_pmtud = settings->enable_pmtud & XQC_PMTUD_ENABLE_MASK;
 
     params->close_dgram_redundancy = settings->close_dgram_redundancy;
 
@@ -7213,7 +7462,7 @@ xqc_conn_tls_transport_params_cb(const uint8_t *tp, size_t len, void *user_data)
                 "remembered:%ui|new:%ui|",
                 conn->remote_settings.max_datagram_frame_size,
                 params.max_datagram_frame_size);
-        XQC_CONN_ERR(conn, TRA_0RTT_TRANS_PARAMS_ERROR);
+        XQC_CONN_ERR(conn, TRA_0RTT_DGRAM_PARAMS_ERROR);
         return;
     }
 
@@ -7227,7 +7476,7 @@ xqc_conn_tls_transport_params_cb(const uint8_t *tp, size_t len, void *user_data)
     }
 
     xqc_log(conn->log, XQC_LOG_DEBUG,
-            "|1RTT_transport_params|max_datagram_frame_size:%ud|",
+            "|1RTT_transport_params|max_datagram_frame_size:%ui|",
             conn->remote_settings.max_datagram_frame_size);
 
     if ((conn->local_settings.extended_ack_features & XQC_ACK_EXT_FEATURE_BIT_RECV_TS) &&
@@ -7581,6 +7830,16 @@ xqc_conn_tls_error_cb(xqc_int_t tls_err, void *user_data)
 }
 
 
+static void
+xqc_conn_tls_transport_error_cb(xqc_int_t transport_err, void *user_data)
+{
+    xqc_connection_t *conn = (xqc_connection_t *)user_data;
+    xqc_log(conn->log, XQC_LOG_ERROR, "|transport error from tls|0x%xi|",
+            transport_err);
+    XQC_CONN_ERR(conn, transport_err);
+}
+
+
 void
 xqc_free_crypto_buffer_list(xqc_list_head_t *buffer_list)
 {
@@ -7639,6 +7898,7 @@ const xqc_tls_callbacks_t xqc_conn_tls_cbs = {
     .session_cb = xqc_conn_tls_session_cb,
     .keylog_cb = xqc_conn_tls_keylog_cb,
     .error_cb = xqc_conn_tls_error_cb,
+    .transport_error_cb = xqc_conn_tls_transport_error_cb,
     .hsk_completed_cb = xqc_conn_tls_handshake_completed_cb,
     .cert_cb = xqc_conn_tls_cert_cb,
     .msg_cb = xqc_conn_tls_msg_cb,
@@ -7992,7 +8252,8 @@ xqc_conn_closing_notify(xqc_connection_t *conn)
         if (!(conn->conn_flag & XQC_CONN_FLAG_CLOSING_NOTIFIED)) {
             conn->conn_flag |= XQC_CONN_FLAG_CLOSING_NOTIFIED;
             conn->transport_cbs.conn_closing(conn, &conn->scid_set.user_scid,
-                                             conn->conn_err, conn->user_data);
+                                             XQC_CONN_ERR_CODE(conn->conn_err),
+                                             conn->user_data);
         }
     }
 }
@@ -8198,7 +8459,9 @@ xqc_conn_destroy_ping_notification_list(xqc_connection_t *conn)
 xqc_bool_t
 xqc_conn_should_clear_0rtt_ticket(xqc_int_t conn_err)
 {
-    if (conn_err == TRA_0RTT_TRANS_PARAMS_ERROR) {
+    if (conn_err == TRA_0RTT_TRANS_PARAMS_ERROR
+        || conn_err == TRA_0RTT_DGRAM_PARAMS_ERROR)
+    {
         return XQC_TRUE;
     }
     return XQC_FALSE;

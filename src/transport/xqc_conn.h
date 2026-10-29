@@ -37,10 +37,19 @@
 /* maximum accumulated number of xqc_engine_packet_process */
 #define XQC_MAX_PACKET_PROCESS_BATCH 100
 
+/* Ceiling on the backlog count taken when a scheduling pass stops early. The
+ * measurement only has to separate "a couple of packets left" from "the queue
+ * is backed up", and the queue can hold sndq_packets_used_max (18000 by
+ * default) entries -- walking all of them once per engine tick would cost more
+ * than the scheduling being measured. */
+#define XQC_SCHED_BACKLOG_PROBE_MAX 512
+
 #define XQC_MAX_RECV_WINDOW (16 * 1024 * 1024)
 
+/* RFC 9000: variable-length integer max value, used as flow control upper bound */
 #define XQC_MAX_FLOW_CONTROL_WINDOW (((uint64_t)1 << 62) - 1)
 
+/* clamp a flow control value to the RFC 9000 variable-length integer maximum */
 static inline uint64_t
 xqc_clamp_to_max_flow_ctl(uint64_t value)
 {
@@ -65,8 +74,22 @@ static const uint32_t MAX_RSP_CONN_CLOSE_CNT = 3;
         }                                     \
     } while (0)
 
+/*
+ * RFC 9000 Section 16 limits QUIC variable-length integers to 62 bits.
+ * Reserve bit 63 internally so conn_err itself preserves whether the stored
+ * error belongs to the application namespace. Public and wire boundaries
+ * strip this bit before exposing the error code.
+ */
+#define XQC_CONN_ERR_APPLICATION_FLAG ((uint64_t) 1 << 63)
+#define XQC_CONN_ERR_CODE(err) \
+    ((uint64_t) (err) & ~XQC_CONN_ERR_APPLICATION_FLAG)
+#define XQC_CONN_ERR_IS_APPLICATION(err) \
+    (((uint64_t) (err) & XQC_CONN_ERR_APPLICATION_FLAG) != 0)
+#define XQC_CONN_ERR_ENCODE_APPLICATION(err) \
+    ((uint64_t) (err) | XQC_CONN_ERR_APPLICATION_FLAG)
+
 /* send CONNECTION_CLOSE with err */
-#define XQC_CONN_ERR(conn, err)                                                   \
+#define XQC_CONN_ERR_INTERNAL(conn, err)                                          \
     do {                                                                          \
         if ((conn)->conn_err == 0) {                                              \
             (conn)->conn_err = (err);                                             \
@@ -74,9 +97,15 @@ static const uint32_t MAX_RSP_CONN_CLOSE_CNT = 3;
             (conn)->conn_flag |= XQC_CONN_FLAG_ERROR;                             \
             xqc_conn_closing(conn);                                               \
             xqc_log((conn)->log, XQC_LOG_ERROR, "|conn:%p|err:0x%xi|%s|", (conn), \
-                    (uint64_t)(err), xqc_conn_addr_str(conn));                    \
+                    XQC_CONN_ERR_CODE(err), xqc_conn_addr_str(conn));             \
         }                                                                         \
     } while (0)
+
+#define XQC_CONN_ERR(conn, err) \
+    XQC_CONN_ERR_INTERNAL(conn, err)
+
+#define XQC_CONN_APP_ERR(conn, err) \
+    XQC_CONN_ERR_INTERNAL(conn, XQC_CONN_ERR_ENCODE_APPLICATION(err))
 
 extern xqc_conn_settings_t internal_default_conn_settings;
 extern const xqc_tls_callbacks_t xqc_conn_tls_cbs;
@@ -238,7 +267,7 @@ typedef struct {
     uint64_t no_crypto;
     uint64_t enable_multipath;
     xqc_multipath_version_t multipath_version;
-    uint16_t max_datagram_frame_size;
+    uint64_t max_datagram_frame_size;
     uint32_t conn_options[XQC_CO_MAX_NUM];
     uint8_t conn_option_num;
 
@@ -297,6 +326,7 @@ typedef struct {
     xqc_packet_number_t
         first_recv_pktno;           /* lowest packet number recv with each key phase */
     uint64_t enc_pkt_cnt;           /* number of packet encrypt with each key phase */
+    uint64_t aead_confidentiality_limit; /* RFC 9001 Section 6.6 limit */
     xqc_usec_t initiate_time_guard; /* time limit for initiating next key update */
 
 } xqc_key_update_ctx_t;
@@ -529,6 +559,53 @@ struct xqc_connection_s {
     /* cc blocking stats */
     uint32_t sched_cc_blocked;
     uint32_t send_cc_blocked;
+
+    /* Where the send side actually stops.
+     *
+     * The question these answer: a two-path connection whose legs measure 43
+     * and 235 Mbps alone delivers 50 Mbps together. Everything above the
+     * scheduler was ruled out by inspection -- connection flow control does
+     * not apply to DATAGRAM, the per-tick send budget is per-path, the packet
+     * pool is 18000 deep -- which leaves the question of whether the send side
+     * is even offered enough to fill both legs, and if it is, which layer
+     * refuses it. Existing counters cannot answer that: sched_cc_blocked
+     * counts scheduling passes that ended early without saying whether any
+     * path had headroom at the time, and nothing at all counts the passes that
+     * ended because the queue simply ran dry.
+     *
+     * Cheap: one increment per scheduling pass or per refused packet, no
+     * allocation, no clock read. Reported once per second by
+     * xqc_conn_send_supply_log() so a run's summary can be read without
+     * enabling DEBUG. */
+    struct {
+        /* Scheduling passes over sndq_send_packets, and how each one ended. */
+        uint64_t sched_passes;
+        /* ...ran out of packets. The send side did not supply enough to
+         * saturate what the paths would have taken -- the supply question. */
+        uint64_t sched_drained;
+        /* ...stopped with packets still queued because the scheduler returned
+         * no path. Split by WHICH ceiling took the capacity away, which is the
+         * only form of this question that has an answer: asking whether any
+         * path had headroom meant re-running the predicate the scheduler had
+         * just consulted, so the answer was always no (0 in every row of runs
+         * 34026833126 and 34036912262).
+         *
+         * "all_blocked" is backpressure from the network -- the congestion
+         * controllers are genuinely full. "sndbuf_clamp" means at least one
+         * path's own congestion window still had room and the shared
+         * conn_settings.so_sndbuf ceiling is what refused the packet. The
+         * second is a configuration bug rather than congestion, and it is the
+         * leading untested explanation for a two-path connection aggregating
+         * below one of its legs (mqvpn clamps at 8 MiB against a ~7.6 MB
+         * fast-leg BDP). */
+        uint64_t sched_stop_all_blocked;
+        uint64_t sched_stop_sndbuf_clamp;
+        /* Packets left unscheduled at the moment a pass stopped. Depth, not
+         * just occurrence: stopping with 3 queued once a millisecond is noise,
+         * stopping with 3000 queued is the bottleneck. */
+        uint64_t sched_stop_backlog;
+    } supply_stats;
+    xqc_usec_t supply_log_ts;
 
     /* internal loss detection stats */
     uint32_t detected_loss_cnt;
@@ -864,7 +941,8 @@ void xqc_conn_set_init_idle_timeout(xqc_connection_t *conn,
                                     xqc_msec_t init_idle_time_out);
 void xqc_conn_try_to_enable_pmtud(xqc_connection_t *conn);
 
-xqc_int_t xqc_conn_server_accept(xqc_connection_t *c);
+xqc_int_t xqc_conn_server_accept(xqc_connection_t *c,
+                                 xqc_packet_in_t *packet_in);
 
 void xqc_conn_flush_or_defer(xqc_connection_t *conn);
 #endif /* _XQC_CONN_H_INCLUDED_ */

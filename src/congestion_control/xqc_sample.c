@@ -29,7 +29,11 @@ xqc_generate_sample(xqc_sample_t *sampler, xqc_send_ctl_t *send_ctl,
     /* the ACK acks nothing */
     if (sampler->prior_time == 0) {
         sampler->interval = 0;
-        xqc_log(send_ctl->ctl_conn->log, XQC_LOG_WARN, 
+        /* An ACK that acknowledges no new data is ordinary -- it arrives in
+         * bursts after any path event, and pure-ACK traffic produces nothing
+         * else. Logged at DEBUG because at WARN it buries the events worth
+         * reading: a single link-down produced dozens of these lines. */
+        xqc_log(send_ctl->ctl_conn->log, XQC_LOG_DEBUG,
                 "|sampler_prior_time_is_zero!|");
         return XQC_RATE_SAMPLE_ACK_NOTHING;
     }

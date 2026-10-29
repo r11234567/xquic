@@ -21,8 +21,23 @@ The upstream maintenance workflow proposes missing mp0rta history as a draft
 PR, and reuses a pending PR that already contains it. It never synchronizes
 remote main through GitHub's mirror API. The BoringSSL workflow also targets
 main through a PR and never changes main directly. Events authored with the
-default GITHUB_TOKEN do not normally trigger other workflows: a maintainer
-must run Build and CodeQL or push a follow-up commit before merging those PRs.
+default GITHUB_TOKEN do not normally trigger other workflows. The dependency
+workflow explicitly dispatches Build and CodeQL; upstream-sync proposals
+require a maintainer to start validation or push a follow-up commit.
+
+The integration retains the fork's RFC-oriented transport and TLS fixes,
+HTTP/3 urgency queue, proxy backpressure/write notifications, external PMTU
+API, configurable raise interval, and bounded send-supply statistics. It
+keeps upstream's current black-hole recovery, queue-aware WLB weights,
+effective-PTO handling, STREAM MinRTT fallback, connection-allocation cleanup,
+closed-path/CID traversal, and BoringSSL pin instead of restoring older
+implementations. The urgent queue participates in PMTU resize cleanup as
+well as ordinary teardown, retry, and 0-RTT handling.
+
+The former Alibaba cherry-pick workflow is superseded by full-history
+mp0rta synchronization. `.github/upstream-sync-base` remains only as the
+historical record of the fork's last selective Alibaba audit; it does not
+claim that Alibaba main is an ancestor of this fork.
 
 Record current-head results honestly. A ready-for-review PR is not an approval
 to merge, and pending Actions are not passing evidence. The downstream mqvpn

@@ -9,6 +9,7 @@
 #include "src/transport/xqc_engine.h"
 #include "src/http3/xqc_h3_conn.h"
 #include "src/http3/xqc_h3_ctx.h"
+#include "src/http3/qpack/xqc_qpack.h"
 #include "src/common/xqc_time.h"
 
 
@@ -401,7 +402,8 @@ xqc_h3_request_get_stats(xqc_h3_request_t *h3_request)
     /* try to update stats */
     xqc_h3_stream_update_stats(h3_request->h3_stream);
 
-    uint64_t conn_err = h3_request->h3_stream->h3c->conn->conn_err;
+    uint64_t conn_err = XQC_CONN_ERR_CODE(
+        h3_request->h3_stream->h3c->conn->conn_err);
     stats.recv_body_size = h3_request->body_recvd;
     stats.send_body_size = h3_request->body_sent;
     stats.recv_header_size = h3_request->header_recvd;
@@ -872,7 +874,7 @@ xqc_h3_request_on_recv_header(xqc_h3_request_t *h3r)
     xqc_http_headers_t *headers;
     uint64_t fields_size;
 
-    if (h3r->current_header == 1) {
+    if (h3r->completed_header_count == 1) {
         /* notify data before trailer headers*/
         ret = xqc_h3_request_on_recv_body(h3r);
         if (ret != XQC_OK) {
@@ -882,7 +884,7 @@ xqc_h3_request_on_recv_header(xqc_h3_request_t *h3r)
     }
 
     /* header section and trailer section are all processed */
-    if (h3r->current_header >= XQC_H3_REQUEST_MAX_HEADERS_CNT) {
+    if (h3r->completed_header_count >= XQC_H3_REQUEST_MAX_HEADERS_CNT) {
         xqc_log(h3r->h3_stream->log, XQC_LOG_WARN,
                 "|headers count exceed 2|"
                 "stream_id:%ui|",
@@ -890,7 +892,7 @@ xqc_h3_request_on_recv_header(xqc_h3_request_t *h3r)
         return -XQC_H3_INVALID_HEADER;
     }
 
-    headers = &h3r->h3_header[h3r->current_header];
+    headers = &h3r->h3_header[h3r->completed_header_count];
 
     xqc_h3_request_header_end(h3r);
 
@@ -931,13 +933,50 @@ xqc_h3_request_on_recv_header(xqc_h3_request_t *h3r)
         }
     }
 
+    /*
+     * RFC 9114 Sections 4.2 and 4.3 define field-name and pseudo-header
+     * constraints at the HTTP layer. The QPACK layer is purposefully
+     * byte-transparent, so enforce those constraints at the H3 boundary.
+     */
+    xqc_bool_t regular_field_seen = XQC_FALSE;
+    for (size_t i = 0; i < headers->count; i++) {
+        xqc_http_header_t *hdr = &headers->headers[i];
+        xqc_bool_t is_pseudo = hdr->name.iov_len > 0
+            && *((unsigned char *)hdr->name.iov_base) == ':';
+
+        if (is_pseudo) {
+            if (regular_field_seen) {
+                xqc_log(h3r->h3_stream->log, XQC_LOG_ERROR,
+                        "|pseudo-header after regular field|conn:%p|"
+                        "stream_id:%ui|field_index:%uz|name_len:%uz|",
+                        h3r->h3_stream->h3c->conn,
+                        h3r->h3_stream->stream_id, i, hdr->name.iov_len);
+                return -XQC_H3_EMALFORMED_HEADER;
+            }
+
+        } else {
+            regular_field_seen = XQC_TRUE;
+        }
+
+        if (xqc_qpack_field_name_has_uppercase(hdr->name.iov_base,
+                                               hdr->name.iov_len))
+        {
+            xqc_log(h3r->h3_stream->log, XQC_LOG_ERROR,
+                    "|uppercase character in field name|conn:%p|"
+                    "stream_id:%ui|field_index:%uz|name_len:%uz|",
+                    h3r->h3_stream->h3c->conn, h3r->h3_stream->stream_id,
+                    i, hdr->name.iov_len);
+            return -XQC_H3_EMALFORMED_HEADER;
+        }
+    }
+
     /* set read flag */
-    h3r->read_flag |= hdr_type_2_flag[h3r->current_header];
+    h3r->read_flag |= hdr_type_2_flag[h3r->completed_header_count];
 
     h3r->header_recvd += headers->total_len;
 
     /* prepare to process next header */
-    h3r->current_header++;
+    h3r->completed_header_count++;
 
     /* header notify callback */
     if (h3r->request_if->h3_request_read_notify) {
@@ -1035,12 +1074,12 @@ xqc_h3_stream_id(xqc_h3_request_t *h3_request)
 xqc_http_headers_t *
 xqc_h3_request_get_writing_headers(xqc_h3_request_t *h3r)
 {
-    if (h3r->current_header >= XQC_H3_REQUEST_MAX_HEADERS_CNT) {
+    if (h3r->completed_header_count >= XQC_H3_REQUEST_MAX_HEADERS_CNT) {
         return NULL;
     }
 
     xqc_h3_request_header_begin(h3r);
-    return &h3r->h3_header[h3r->current_header];
+    return &h3r->h3_header[h3r->completed_header_count];
 }
 
 #define XQC_H3_REQUEST_RECORD_TIME(a)    \
@@ -1198,69 +1237,98 @@ xqc_write_http_priority(xqc_h3_priority_t *prio, uint8_t *dst, size_t dstcap)
 xqc_int_t
 xqc_parse_http_priority(xqc_h3_priority_t *dst, const uint8_t *str, size_t str_len)
 {
+    if (dst == NULL || (str == NULL && str_len != 0)) {
+        return -XQC_EPARAM;
+    }
+
     xqc_h3_priority_t prio;
     xqc_h3_priority_init(&prio);
 
-    uint8_t *p = (uint8_t *)str;
-    uint8_t *e = p + str_len;
-
-    uint8_t *v, *next_k;
-
-    while (*p != '\0' && p < e) {
-        if (*p == ' ') {
-            p++;
-            continue;
-        }
-
-        if (strncmp(p, "u=", xqc_lengthof("u=")) == 0) {
-            p += xqc_lengthof("u=");
-            prio.urgency = strtoul(p, NULL, XQC_DECIMAL);
-
-        } else if (strncmp(p, "i", xqc_lengthof("i")) == 0) {
-            v = strchr(p, '=');
-            next_k = strchr(p, ',');
-
-            if ((v == NULL) || (next_k != NULL && v > next_k)) {
-                p += xqc_lengthof("i");
-                prio.incremental = XQC_TRUE;
-
-            } else if (strncmp(p, "i=?", xqc_lengthof("i=?")) == 0) {
-                p += xqc_lengthof("i=?");
-                prio.incremental = strtoul(p, NULL, XQC_DECIMAL);
-
-            } else {
-                return -XQC_H3_INVALID_PRIORITY;
-            }
-
-        } else if (strncmp(p, "s=", xqc_lengthof("s=")) == 0) {
-            p += xqc_lengthof("s=");
-            prio.schedule = strtoul(p, NULL, XQC_DECIMAL);
-
-        } else if (strncmp(p, "r=", xqc_lengthof("r=")) == 0) {
-            p += xqc_lengthof("r=");
-            prio.reinject = strtoul(p, NULL, XQC_DECIMAL);
-
-        } else if (strncmp(p, "f=", xqc_lengthof("f=")) == 0) {
-            p += xqc_lengthof("f=");
-            // when encounter invalid priority length, set prio.fec to close stats
-            if (p + XQC_PRIORITY_FEC_VAL_LEN > e) {
-                prio.fec = XQC_FEC_CLOSE;
-                goto end;
-            }
-            prio.fec = strtoul(p, NULL, XQC_DECIMAL);
-        } else if (strncmp(p, "p", xqc_lengthof("p")) == 0) {
-            p += xqc_lengthof("p");
-            prio.fastpath = 1;
-        }
-
-        p = strchr(p, ',');
-        if (p == NULL) {
-            goto end;
-        }
-        p++;
+    if (str_len == 0) {
+        *dst = prio;
+        return XQC_OK;
     }
 
-end:
+    const uint8_t *p = str;
+    const uint8_t *end = str + str_len;
+    while (p < end) {
+        while (p < end && (*p == ' ' || *p == '\t' || *p == ',')) {
+            p++;
+        }
+        if (p == end) {
+            break;
+        }
+
+        const uint8_t *item_end = p;
+        while (item_end < end && *item_end != ',') {
+            item_end++;
+        }
+        const uint8_t *trimmed_end = item_end;
+        while (trimmed_end > p
+               && (trimmed_end[-1] == ' ' || trimmed_end[-1] == '\t'))
+        {
+            trimmed_end--;
+        }
+
+        const uint8_t *eq = p;
+        while (eq < trimmed_end && *eq != '=') {
+            eq++;
+        }
+        const uint8_t *key_end = eq;
+        while (key_end > p && (key_end[-1] == ' ' || key_end[-1] == '\t')) {
+            key_end--;
+        }
+
+        if (key_end - p == 1 && *p == 'i' && eq == trimmed_end) {
+            prio.incremental = XQC_TRUE;
+
+        } else if (key_end - p == 1 && *p == 'p' && eq == trimmed_end) {
+            prio.fastpath = XQC_TRUE;
+
+        } else if (eq < trimmed_end && key_end - p == 1) {
+            const uint8_t *value = eq + 1;
+            while (value < trimmed_end && (*value == ' ' || *value == '\t')) {
+                value++;
+            }
+
+            if (*p == 'i') {
+                if (trimmed_end - value != 2 || value[0] != '?'
+                    || (value[1] != '0' && value[1] != '1'))
+                {
+                    return -XQC_H3_INVALID_PRIORITY;
+                }
+                prio.incremental = value[1] == '1';
+
+            } else if (*p == 'u' || *p == 's' || *p == 'r' || *p == 'f') {
+                uint64_t parsed = 0;
+                const uint64_t limit = *p == 'f' ? UINT32_MAX : UINT8_MAX;
+                if (value == trimmed_end) {
+                    return -XQC_H3_INVALID_PRIORITY;
+                }
+                for (const uint8_t *digit = value; digit < trimmed_end; digit++) {
+                    if (*digit < '0' || *digit > '9'
+                        || parsed > (limit - (*digit - '0')) / 10)
+                    {
+                        return -XQC_H3_INVALID_PRIORITY;
+                    }
+                    parsed = parsed * 10 + (*digit - '0');
+                }
+
+                if (*p == 'u') {
+                    prio.urgency = (uint8_t)parsed;
+                } else if (*p == 's') {
+                    prio.schedule = (uint8_t)parsed;
+                } else if (*p == 'r') {
+                    prio.reinject = (uint8_t)parsed;
+                } else {
+                    prio.fec = (uint32_t)parsed;
+                }
+            }
+        }
+
+        p = item_end;
+    }
+
     *dst = prio;
     return XQC_OK;
 }

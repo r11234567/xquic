@@ -422,7 +422,7 @@ wlb_flow_expire(xqc_wlb_scheduler_t *s, uint64_t now_us, xqc_connection_t *conn)
             s->recovery_prefer_path_id = newly_seen_path_id;
             xqc_log(conn->log, XQC_LOG_INFO,
                     "|wlb|recovery_detected|new_path_id:%ui|healthy_prev:%d|healthy_now:%d|",
-                    (unsigned)newly_seen_path_id, s->last_healthy_paths, active_healthy_paths);
+                    newly_seen_path_id, s->last_healthy_paths, active_healthy_paths);
         } else {
             s->recovery_prefer_path_id = WLB_NO_PATH_ID;
             xqc_log(conn->log, XQC_LOG_INFO,
@@ -1408,7 +1408,7 @@ xqc_wlb_scheduler_get_path(void *scheduler,
             if (path == NULL) {
                 xqc_log(conn->log, XQC_LOG_INFO,
                         "|wlb|flow_evict|reason:unusable|flow:%ui|path:%ui|",
-                        packet_out->po_flow_hash, entry->path_id);
+                        (uint64_t)packet_out->po_flow_hash, entry->path_id);
                 entry->hash = WLB_FLOW_TOMBSTONE;
             }
 
@@ -1441,7 +1441,7 @@ xqc_wlb_scheduler_get_path(void *scheduler,
             wlb_flow_insert(s, packet_out->po_flow_hash, rpath->path_id, now_us);
             xqc_log(conn->log, XQC_LOG_INFO,
                     "|wlb|recovery_prefer|flow:%ui|path:%ui|",
-                    packet_out->po_flow_hash, rpath->path_id);
+                    (uint64_t)packet_out->po_flow_hash, rpath->path_id);
             wlb_note_payload_activity(s, rpath->path_id, now_us, XQC_TRUE);
             return rpath;
         }
@@ -1497,7 +1497,7 @@ xqc_wlb_scheduler_get_path(void *scheduler,
             wlb_flow_insert(s, packet_out->po_flow_hash, pin_path_id, now_us);
             xqc_log(conn->log, XQC_LOG_INFO,
                     "|wlb|flow_pin|flow:%ui|pin:%ui|send:%ui|",
-                    packet_out->po_flow_hash, pin_path_id, sel_path_id);
+                    (uint64_t)packet_out->po_flow_hash, pin_path_id, sel_path_id);
         }
         xqc_path_ctx_t *path = wlb_find_path_ctx(conn, sel_path_id);
         xqc_log(conn->log, XQC_LOG_DEBUG,

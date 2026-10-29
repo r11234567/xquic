@@ -43,5 +43,7 @@ void xqc_test_pmtud_active_path_in_mss(void);
 void xqc_test_pmtud_dgram_on_validating_path_fits_its_size(void);
 void xqc_test_pmtud_no_ack_into_packet_above_path_size(void);
 void xqc_test_pmtud_pto_copy_fits_path_size(void);
+void xqc_test_pmtud_urgent_queue_resized_on_new_path(void);
+void xqc_test_pmtud_urgent_queue_kept_when_path_fits(void);
 
 #endif /* XQC_PMTUD_TEST_H_INCLUDED */

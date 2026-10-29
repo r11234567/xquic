@@ -78,18 +78,29 @@ its case is retired so later changes cannot reuse it.
 
 | Range | New-case namespace | Allocated IDs |
 |-------|--------------------|---------------|
-| `[705, 799]` | QUIC Transport core | `705-706`, `713-714`, `735-736` |
+| `[705, 799]` | QUIC Transport core | `705-728`, `735-736` |
 | `[800, 899]` | Recovery and congestion control | `800-810` |
-| `[900, 999]` | QUIC-TLS | `900-901` |
-| `[1000, 1099]` | HTTP/3 framing, streams, and settings | `1000-1012` |
+| `[900, 999]` | QUIC-TLS | `900-903` |
+| `[1000, 1099]` | HTTP/3 framing, streams, and settings | `1000-1021` |
 | `[1100, 1149]` | QPACK | None |
 | `[1150, 1199]` | HTTP priority | None |
-| `[1200, 1299]` | QUIC DATAGRAM | None |
-| `[1300, 1399]` | Multipath QUIC | `1300-1301` |
+| `[1200, 1299]` | QUIC DATAGRAM | `1201-1202` |
+| `[1300, 1399]` | Multipath QUIC | `1300-1302` |
 | `[1400, 1499]` | MoQT | None |
 | `[1500, 1599]` | LOC and MSF application protocols | None |
 | `[1600, 1699]` | FEC and experimental transport extensions | None |
-| `[1700, 1799]` | Common runtime, public API, and test harness | None |
+| `[1700, 1799]` | Common runtime, public API, and test harness | `1702-1703` |
+
+The allocations affected by the fork and upstream synchronization are:
+
+| ID | Behavior contract |
+|----|-------------------|
+| `727` | Stream reassembly stays below the default cap on the normal lossy-transfer path. |
+| `728` | Stream reassembly recovers under a deliberately small cap without closing the connection. |
+| `800` | MASQUE CONNECT-IP datagrams complete over a single QUIC path. |
+| `801` | MASQUE CONNECT-IP datagrams complete over multipath QUIC. |
+| `802-803` | Per-path application-limited marking after scheduling, including an unvalidated path. |
+| `1302` | A lost `PATH_RESPONSE` is not retransmitted by multipath repair; a later challenge elicits a fresh response. |
 
 Apply these allocation rules before running a new case:
 

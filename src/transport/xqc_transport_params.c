@@ -588,7 +588,17 @@ xqc_decode_max_udp_payload_size(xqc_transport_params_t *params,
                                 const uint8_t *end, uint64_t param_type,
                                 uint64_t param_len)
 {
-    XQC_DECODE_VINT_VALUE(&params->max_udp_payload_size, p, end);
+    ssize_t nread = xqc_vint_read(p, end, &params->max_udp_payload_size);
+    if (nread < 0) {
+        return -XQC_TLS_MALFORMED_TRANSPORT_PARAM;
+    }
+
+    /* RFC 9000 Section 18.2: values below 1200 are invalid. */
+    if (params->max_udp_payload_size < XQC_MIN_UDP_PAYLOAD_SIZE) {
+        return -XQC_TLS_MALFORMED_TRANSPORT_PARAM;
+    }
+
+    return XQC_OK;
 }
 
 static xqc_int_t
@@ -755,7 +765,17 @@ xqc_decode_active_cid_limit(xqc_transport_params_t *params,
                             xqc_transport_params_type_t exttype, const uint8_t *p,
                             const uint8_t *end, uint64_t param_type, uint64_t param_len)
 {
-    XQC_DECODE_VINT_VALUE(&params->active_connection_id_limit, p, end);
+    ssize_t nread = xqc_vint_read(p, end, &params->active_connection_id_limit);
+    if (nread < 0) {
+        return -XQC_TLS_MALFORMED_TRANSPORT_PARAM;
+    }
+
+    /* RFC 9000 §18.2: active_connection_id_limit MUST be at least 2 */
+    if (params->active_connection_id_limit < 2) {
+        return -XQC_TLS_MALFORMED_TRANSPORT_PARAM;
+    }
+
+    return XQC_OK;
 }
 
 static xqc_int_t
@@ -777,6 +797,10 @@ xqc_decode_retry_scid(xqc_transport_params_t *params, xqc_transport_params_type_
                       const uint8_t *p, const uint8_t *end, uint64_t param_type,
                       uint64_t param_len)
 {
+    if (exttype != XQC_TP_TYPE_ENCRYPTED_EXTENSIONS) {
+        return -XQC_TLS_MALFORMED_TRANSPORT_PARAM;
+    }
+
     if (param_len > XQC_MAX_CID_LEN) {
         return -XQC_TLS_MALFORMED_TRANSPORT_PARAM;
     }

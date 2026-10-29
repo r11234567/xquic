@@ -619,9 +619,11 @@ xqc_h3_critical_run_case(xqc_connection_t *conn, xqc_h3_conn_t *h3c,
     CU_ASSERT(ret == XQC_OK);
 
     if (tc->expected_conn_err == H3_CLOSED_CRITICAL_STREAM) {
-        CU_ASSERT(conn->conn_err == H3_CLOSED_CRITICAL_STREAM);
+        CU_ASSERT(XQC_CONN_ERR_CODE(conn->conn_err)
+                  == H3_CLOSED_CRITICAL_STREAM);
     } else {
-        CU_ASSERT(conn->conn_err == tc->expected_conn_err);
+        CU_ASSERT(XQC_CONN_ERR_CODE(conn->conn_err)
+                  == tc->expected_conn_err);
     }
 
     if (tc->expect_error_flag) {
@@ -741,8 +743,8 @@ xqc_test_h3_second_stream_one(uint64_t stype, uint64_t expected_err_second)
     /* second instance: must be rejected */
     ret = xqc_h3_conn_on_uni_stream_created(h3c, stype);
     CU_ASSERT(ret == -XQC_H3_INVALID_STREAM);
-    CU_ASSERT(conn->conn_err == expected_err_second);
-    CU_ASSERT(conn->conn_err == 0x103);  /* literal H3_STREAM_CREATION_ERROR */
+    CU_ASSERT(XQC_CONN_ERR_CODE(conn->conn_err) == expected_err_second);
+    CU_ASSERT(XQC_CONN_ERR_CODE(conn->conn_err) == 0x103);
     CU_ASSERT((conn->conn_flag & XQC_CONN_FLAG_ERROR) != 0);
 
     xqc_h3_conn_destroy(h3c);
@@ -774,7 +776,7 @@ xqc_test_h3_push_stream_rejected(xqc_conn_type_t conn_type,
     xqc_int_t ret = xqc_h3_conn_on_uni_stream_created(h3c,
             XQC_H3_STREAM_TYPE_PUSH);
     CU_ASSERT(ret == -XQC_H3_INVALID_STREAM);
-    CU_ASSERT(conn->conn_err == expected_err);
+    CU_ASSERT(XQC_CONN_ERR_CODE(conn->conn_err) == expected_err);
     CU_ASSERT((conn->conn_flag & XQC_CONN_FLAG_ERROR) != 0);
 
     xqc_h3_conn_destroy(h3c);
@@ -942,14 +944,24 @@ xqc_test_h3_recv_header_field_section_size()
     xqc_init_list_head(&h3r->body_buf);
 
     xqc_http_headers_t *hdr = &h3r->h3_header[0];
-    hdr->headers  = NULL;
-    hdr->capacity = 0;
+    xqc_http_header_t fake_hdrs[2] = {
+        {
+            .name = {.iov_base = (void *)"x", .iov_len = 1},
+            .value = {.iov_base = (void *)"v", .iov_len = 1},
+        },
+        {
+            .name = {.iov_base = (void *)"y", .iov_len = 1},
+            .value = {.iov_base = (void *)"v", .iov_len = 1},
+        },
+    };
+    hdr->headers  = fake_hdrs;
+    hdr->capacity = 2;
 
     /* regression for issue 751: total_len < limit but
        total_len + count*32 > limit. Pre-fix this would have been accepted. */
     hdr->count     = 1;
     hdr->total_len = 80;
-    h3r->current_header = 0;
+    h3r->completed_header_count = 0;
     h3r->read_flag      = 0;
     ret = xqc_h3_request_on_recv_header(h3r);
     CU_ASSERT_EQUAL(ret, -XQC_H3_INVALID_HEADER);
@@ -957,7 +969,7 @@ xqc_test_h3_recv_header_field_section_size()
     /* exact-equal-to-limit must be accepted (check is strictly greater) */
     hdr->count     = 2;
     hdr->total_len = 36;
-    h3r->current_header = 0;
+    h3r->completed_header_count = 0;
     h3r->read_flag      = 0;
     ret = xqc_h3_request_on_recv_header(h3r);
     CU_ASSERT_EQUAL(ret, XQC_OK);
@@ -965,7 +977,7 @@ xqc_test_h3_recv_header_field_section_size()
     /* one byte over the limit must be rejected */
     hdr->count     = 2;
     hdr->total_len = 37;
-    h3r->current_header = 0;
+    h3r->completed_header_count = 0;
     h3r->read_flag      = 0;
     ret = xqc_h3_request_on_recv_header(h3r);
     CU_ASSERT_EQUAL(ret, -XQC_H3_INVALID_HEADER);
@@ -973,11 +985,12 @@ xqc_test_h3_recv_header_field_section_size()
     /* zero-field headers under the limit are accepted */
     hdr->count     = 0;
     hdr->total_len = 50;
-    h3r->current_header = 0;
+    h3r->completed_header_count = 0;
     h3r->read_flag      = 0;
     ret = xqc_h3_request_on_recv_header(h3r);
     CU_ASSERT_EQUAL(ret, XQC_OK);
 
+    hdr->headers = NULL;
     for (size_t i = 0; i < XQC_H3_REQUEST_MAX_HEADERS_CNT; i++) {
         xqc_h3_headers_free(&h3r->h3_header[i]);
     }
@@ -1066,7 +1079,7 @@ xqc_h3_msgerr_setup(xqc_connection_t **out_conn, xqc_h3_conn_t **out_h3c)
         return NULL;
     }
 
-    /* eagerly create the request so tests can manipulate current_header
+    /* eagerly create the request so tests can manipulate completed_header_count
      * before feeding bytes through process_in. */
     h3s->h3r = xqc_h3_request_create_inner(h3c, h3s, NULL);
     if (h3s->h3r == NULL) {
@@ -1201,7 +1214,7 @@ xqc_test_h3_headers_capacity_uses_internal_error()
 
     /*
      * Simulate two prior HEADERS sections (request + trailer) by
-     * jumping current_header to the cap. A third HEADERS frame then
+     * jumping completed_header_count to the cap. A third HEADERS frame then
      * makes xqc_h3_request_get_writing_headers return NULL inside
      * xqc_h3_stream_process_request (xqc_h3_stream.c:920), which is
      * an implementation-side capacity exhaustion. Post-fix this must
@@ -1210,7 +1223,7 @@ xqc_test_h3_headers_capacity_uses_internal_error()
      * first-write-wins so the outer process_in mapping at line 1521
      * does not overwrite it.
      */
-    h3s->h3r->current_header = XQC_H3_REQUEST_MAX_HEADERS_CNT;
+    h3s->h3r->completed_header_count = XQC_H3_REQUEST_MAX_HEADERS_CNT;
 
     CU_ASSERT(conn->conn_err == 0);
 
@@ -1221,8 +1234,9 @@ xqc_test_h3_headers_capacity_uses_internal_error()
             XQC_TRUE);
 
     CU_ASSERT(ret == -XQC_H3_EPROC_REQUEST);
-    CU_ASSERT(conn->conn_err == H3_INTERNAL_ERROR);
-    CU_ASSERT(conn->conn_err == 0x102);
+    CU_ASSERT(XQC_CONN_ERR_CODE(conn->conn_err) == H3_INTERNAL_ERROR);
+    CU_ASSERT(XQC_CONN_ERR_CODE(conn->conn_err) == 0x102);
+    CU_ASSERT(XQC_CONN_ERR_IS_APPLICATION(conn->conn_err));
     CU_ASSERT((conn->conn_flag & XQC_CONN_FLAG_ERROR) != 0);
 
     xqc_h3_msgerr_teardown(h3s, h3c, conn);
@@ -1255,7 +1269,7 @@ xqc_test_h3_valid_headers_smoke()
     CU_ASSERT(h3s->stream->stream_state_send
               < XQC_SEND_STREAM_ST_RESET_SENT);
     /* the HEADERS frame should have advanced the request to 1 section */
-    CU_ASSERT(h3s->h3r->current_header == 1);
+    CU_ASSERT(h3s->h3r->completed_header_count == 1);
 
     xqc_h3_msgerr_teardown(h3s, h3c, conn);
 }
@@ -1295,8 +1309,8 @@ xqc_test_h3_frame_parse_error_uses_frame_error()
             XQC_TRUE);
 
     CU_ASSERT(ret < 0);
-    CU_ASSERT(conn->conn_err == H3_FRAME_ERROR);
-    CU_ASSERT(conn->conn_err != H3_MESSAGE_ERROR);
+    CU_ASSERT(XQC_CONN_ERR_CODE(conn->conn_err) == H3_FRAME_ERROR);
+    CU_ASSERT(XQC_CONN_ERR_CODE(conn->conn_err) != H3_MESSAGE_ERROR);
     CU_ASSERT((conn->conn_flag & XQC_CONN_FLAG_ERROR) != 0);
 
     xqc_h3_msgerr_teardown(h3s, h3c, conn);
@@ -1381,10 +1395,293 @@ xqc_h3_ctrl_feed_settings(xqc_h3_stream_t *h3s)
 
 
 static ssize_t
+xqc_h3_ctrl_feed_setting(xqc_h3_stream_t *h3s, unsigned char identifier,
+    unsigned char value)
+{
+    unsigned char settings[] = {
+        XQC_H3_FRM_SETTINGS, 0x02, identifier, value
+    };
+    return xqc_h3_stream_process_control(h3s, settings, sizeof(settings));
+}
+
+
+void
+xqc_test_h3_settings_accepted()
+{
+    const xqc_conn_type_t roles[] = {
+        XQC_CONN_TYPE_CLIENT, XQC_CONN_TYPE_SERVER
+    };
+    const unsigned char identifiers[] = {
+        XQC_H3_SETTINGS_MAX_FIELD_SECTION_SIZE,
+        0x08,
+        0x21,
+    };
+
+    for (size_t i = 0; i < sizeof(roles) / sizeof(roles[0]); i++) {
+        for (size_t j = 0;
+             j < sizeof(identifiers) / sizeof(identifiers[0]); j++)
+        {
+            xqc_connection_t *conn = NULL;
+            xqc_h3_conn_t *h3c = NULL;
+            xqc_h3_stream_t *h3s = xqc_h3_ctrl_test_setup(&conn, &h3c);
+            CU_ASSERT_FATAL(h3s != NULL);
+
+            conn->conn_type = roles[i];
+            ssize_t processed = xqc_h3_ctrl_feed_setting(
+                h3s, identifiers[j], 1);
+
+            CU_ASSERT(processed == 4);
+            CU_ASSERT(conn->conn_err == 0);
+            CU_ASSERT(h3c->flags & XQC_H3_CONN_FLAG_SETTINGS_RECVED);
+            if (identifiers[j]
+                == XQC_H3_SETTINGS_MAX_FIELD_SECTION_SIZE)
+            {
+                CU_ASSERT(h3c->peer_h3_conn_settings.max_field_section_size
+                          == 1);
+            }
+
+            xqc_h3_ctrl_test_teardown(h3s, h3c, conn);
+        }
+    }
+}
+
+
+void
+xqc_test_h3_reserved_h2_settings_rejected()
+{
+    const xqc_conn_type_t roles[] = {
+        XQC_CONN_TYPE_CLIENT, XQC_CONN_TYPE_SERVER
+    };
+    const unsigned char identifiers[] = {
+        XQC_H3_SETTINGS_H2_ENABLE_PUSH,
+        XQC_H3_SETTINGS_H2_MAX_CONCURRENT_STREAMS,
+        XQC_H3_SETTINGS_H2_INITIAL_WINDOW_SIZE,
+        XQC_H3_SETTINGS_H2_MAX_FRAME_SIZE,
+    };
+
+    for (size_t i = 0; i < sizeof(roles) / sizeof(roles[0]); i++) {
+        for (size_t j = 0;
+             j < sizeof(identifiers) / sizeof(identifiers[0]); j++)
+        {
+            xqc_connection_t *conn = NULL;
+            xqc_h3_conn_t *h3c = NULL;
+            xqc_h3_stream_t *h3s = xqc_h3_ctrl_test_setup(&conn, &h3c);
+            CU_ASSERT_FATAL(h3s != NULL);
+
+            conn->conn_type = roles[i];
+            ssize_t processed = xqc_h3_ctrl_feed_setting(
+                h3s, identifiers[j], 0);
+
+            CU_ASSERT(processed == -H3_SETTINGS_ERROR);
+            CU_ASSERT(XQC_CONN_ERR_CODE(conn->conn_err)
+                      == H3_SETTINGS_ERROR);
+            CU_ASSERT(conn->conn_flag & XQC_CONN_FLAG_ERROR);
+
+            xqc_h3_ctrl_test_teardown(h3s, h3c, conn);
+        }
+    }
+}
+
+
+static ssize_t
 xqc_h3_ctrl_feed_max_push_id(xqc_h3_stream_t *h3s, unsigned char push_id)
 {
     unsigned char frame[] = { XQC_H3_FRM_MAX_PUSH_ID, 0x01, push_id };
     return xqc_h3_stream_process_control(h3s, frame, sizeof(frame));
+}
+
+
+static ssize_t
+xqc_h3_ctrl_feed_cancel_push(xqc_h3_stream_t *h3s, unsigned char push_id)
+{
+    unsigned char frame[] = { XQC_H3_FRM_CANCEL_PUSH, 0x01, push_id };
+    return xqc_h3_stream_process_control(h3s, frame, sizeof(frame));
+}
+
+
+static ssize_t
+xqc_h3_ctrl_feed_goaway(xqc_h3_stream_t *h3s, unsigned char identifier)
+{
+    unsigned char frame[] = { XQC_H3_FRM_GOAWAY, 0x01, identifier };
+    return xqc_h3_stream_process_control(h3s, frame, sizeof(frame));
+}
+
+
+void
+xqc_test_h3_goaway_id_valid()
+{
+    const xqc_conn_type_t roles[] = {
+        XQC_CONN_TYPE_CLIENT, XQC_CONN_TYPE_SERVER
+    };
+
+    for (size_t i = 0; i < sizeof(roles) / sizeof(roles[0]); i++) {
+        xqc_connection_t *conn = NULL;
+        xqc_h3_conn_t *h3c = NULL;
+        xqc_h3_stream_t *h3s = xqc_h3_ctrl_test_setup(&conn, &h3c);
+        CU_ASSERT_FATAL(h3s != NULL);
+
+        conn->conn_type = roles[i];
+        CU_ASSERT_FATAL(xqc_h3_ctrl_feed_settings(h3s) > 0);
+
+        /* RFC 9114 Section 5.2 permits equal and decreasing IDs. */
+        CU_ASSERT(xqc_h3_ctrl_feed_goaway(h3s, 8) == 3);
+        CU_ASSERT(xqc_h3_ctrl_feed_goaway(h3s, 4) == 3);
+        CU_ASSERT(xqc_h3_ctrl_feed_goaway(h3s, 4) == 3);
+        CU_ASSERT(h3c->goaway_stream_id == 4);
+        CU_ASSERT(conn->conn_err == 0);
+        CU_ASSERT((conn->conn_flag & XQC_CONN_FLAG_ERROR) == 0);
+
+        xqc_h3_ctrl_test_teardown(h3s, h3c, conn);
+    }
+}
+
+
+void
+xqc_test_h3_goaway_id_increase_rejected()
+{
+    const xqc_conn_type_t roles[] = {
+        XQC_CONN_TYPE_CLIENT, XQC_CONN_TYPE_SERVER
+    };
+
+    for (size_t i = 0; i < sizeof(roles) / sizeof(roles[0]); i++) {
+        xqc_connection_t *conn = NULL;
+        xqc_h3_conn_t *h3c = NULL;
+        xqc_h3_stream_t *h3s = xqc_h3_ctrl_test_setup(&conn, &h3c);
+        CU_ASSERT_FATAL(h3s != NULL);
+
+        conn->conn_type = roles[i];
+        CU_ASSERT_FATAL(xqc_h3_ctrl_feed_settings(h3s) > 0);
+        CU_ASSERT_FATAL(xqc_h3_ctrl_feed_goaway(h3s, 4) == 3);
+
+        /* A later larger ID is an H3_ID_ERROR and cannot replace the cutoff. */
+        CU_ASSERT(xqc_h3_ctrl_feed_goaway(h3s, 8)
+                  == -XQC_H3_INVALID_GOAWAY_ID);
+        CU_ASSERT(XQC_CONN_ERR_CODE(conn->conn_err) == H3_ID_ERROR);
+        CU_ASSERT((conn->conn_flag & XQC_CONN_FLAG_ERROR) != 0);
+        CU_ASSERT(h3c->goaway_stream_id == 4);
+        CU_ASSERT(h3s->pctx.frame_pctx.state == XQC_H3_FRM_STATE_TYPE);
+
+        xqc_h3_ctrl_test_teardown(h3s, h3c, conn);
+    }
+}
+
+
+void
+xqc_test_h3_reserved_control_frame_accepted()
+{
+    xqc_connection_t *conn = NULL;
+    xqc_h3_conn_t *h3c = NULL;
+    xqc_h3_stream_t *h3s = xqc_h3_ctrl_test_setup(&conn, &h3c);
+    CU_ASSERT_FATAL(h3s != NULL);
+
+    CU_ASSERT_FATAL(xqc_h3_ctrl_feed_settings(h3s) > 0);
+
+    /*
+     * RFC 9114 Section 9: the CANCEL_PUSH rejection must remain narrow;
+     * an unknown reserved control frame is ignored.
+     */
+    unsigned char reserved[] = { 0x21, 0x01, 0x00 };
+    CU_ASSERT(xqc_h3_stream_process_control(h3s, reserved,
+              sizeof(reserved)) == sizeof(reserved));
+    CU_ASSERT(conn->conn_err == 0);
+    CU_ASSERT((conn->conn_flag & XQC_CONN_FLAG_ERROR) == 0);
+
+    xqc_h3_ctrl_test_teardown(h3s, h3c, conn);
+}
+
+
+void
+xqc_test_h3_h2_reserved_frames_rejected()
+{
+    const unsigned char frame_types[] = {
+        XQC_H3_FRM_RESERVED_PRIORITY,
+        XQC_H3_FRM_RESERVED_PING,
+        XQC_H3_FRM_RESERVED_WINDOW_UPDATE,
+        XQC_H3_FRM_RESERVED_CONTINUATION,
+    };
+
+    for (size_t i = 0; i < sizeof(frame_types); ++i) {
+        unsigned char frame[] = { frame_types[i], 0x00 };
+        xqc_h3_frame_pctx_t pctx = {0};
+        xqc_h3_frm_reset_pctx(&pctx);
+        CU_ASSERT(xqc_h3_frm_parse(frame, sizeof(frame), &pctx)
+                  == -XQC_H3_RESERVED_FRAME_UNEXPECTED);
+        CU_ASSERT(pctx.frame.type == frame_types[i]);
+        CU_ASSERT(pctx.state == XQC_H3_FRM_STATE_LEN);
+
+        xqc_connection_t *conn = NULL;
+        xqc_h3_conn_t *h3c = NULL;
+        xqc_h3_stream_t *h3s = xqc_h3_ctrl_test_setup(&conn, &h3c);
+        CU_ASSERT_FATAL(h3s != NULL);
+        CU_ASSERT_FATAL(xqc_h3_ctrl_feed_settings(h3s) > 0);
+
+        CU_ASSERT(xqc_h3_stream_process_control(h3s, frame, sizeof(frame))
+                  == -XQC_H3_RESERVED_FRAME_UNEXPECTED);
+        CU_ASSERT(XQC_CONN_ERR_CODE(conn->conn_err) == H3_FRAME_UNEXPECTED);
+        CU_ASSERT((conn->conn_flag & XQC_CONN_FLAG_ERROR) != 0);
+        CU_ASSERT(h3s->pctx.frame_pctx.state == XQC_H3_FRM_STATE_TYPE);
+        xqc_h3_ctrl_test_teardown(h3s, h3c, conn);
+
+        conn = NULL;
+        h3c = NULL;
+        h3s = xqc_h3_msgerr_setup(&conn, &h3c);
+        CU_ASSERT_FATAL(h3s != NULL);
+        conn->conn_type = XQC_CONN_TYPE_SERVER;
+
+        CU_ASSERT(xqc_h3_stream_process_in(h3s, frame, sizeof(frame),
+                  XQC_FALSE) == -XQC_H3_EPROC_REQUEST);
+        CU_ASSERT(XQC_CONN_ERR_CODE(conn->conn_err) == H3_FRAME_UNEXPECTED);
+        CU_ASSERT((conn->conn_flag & XQC_CONN_FLAG_ERROR) != 0);
+        CU_ASSERT(h3s->pctx.frame_pctx.state == XQC_H3_FRM_STATE_TYPE);
+        xqc_h3_msgerr_teardown(h3s, h3c, conn);
+    }
+
+    CU_ASSERT(xqc_h3_frm_is_h2_reserved(0x21) == XQC_FALSE);
+}
+
+
+void
+xqc_test_h3_cancel_push_rejected()
+{
+    xqc_connection_t *conn = NULL;
+    xqc_h3_conn_t *h3c = NULL;
+    xqc_h3_stream_t *h3s = xqc_h3_ctrl_test_setup(&conn, &h3c);
+    CU_ASSERT_FATAL(h3s != NULL);
+
+    CU_ASSERT_FATAL(conn->conn_type == XQC_CONN_TYPE_CLIENT);
+    CU_ASSERT_FATAL(xqc_h3_ctrl_feed_settings(h3s) > 0);
+
+    /*
+     * RFC 9114 Sections 4.6 and 7.2.3: XQUIC has no production path that
+     * sends MAX_PUSH_ID, so even push ID zero exceeds the unset maximum.
+     */
+    CU_ASSERT(xqc_h3_ctrl_feed_cancel_push(h3s, 0)
+              == -XQC_H3_INVALID_CANCEL_PUSH_ID);
+    CU_ASSERT(XQC_CONN_ERR_CODE(conn->conn_err) == H3_ID_ERROR);
+    CU_ASSERT((conn->conn_flag & XQC_CONN_FLAG_ERROR) != 0);
+
+    xqc_h3_ctrl_test_teardown(h3s, h3c, conn);
+
+    conn = NULL;
+    h3c = NULL;
+    h3s = xqc_h3_ctrl_test_setup(&conn, &h3c);
+    CU_ASSERT_FATAL(h3s != NULL);
+
+    conn->conn_type = XQC_CONN_TYPE_SERVER;
+    CU_ASSERT_FATAL(xqc_h3_ctrl_feed_settings(h3s) > 0);
+    CU_ASSERT_FATAL(xqc_h3_ctrl_feed_max_push_id(h3s, 5) == 3);
+
+    /*
+     * XQUIC never sends PUSH_PROMISE in production. A cancellation from the
+     * client is therefore for an unmentioned push ID, even when the ID is
+     * within the received MAX_PUSH_ID range.
+     */
+    CU_ASSERT(xqc_h3_ctrl_feed_cancel_push(h3s, 0)
+              == -XQC_H3_INVALID_CANCEL_PUSH_ID);
+    CU_ASSERT(XQC_CONN_ERR_CODE(conn->conn_err) == H3_ID_ERROR);
+    CU_ASSERT((conn->conn_flag & XQC_CONN_FLAG_ERROR) != 0);
+
+    xqc_h3_ctrl_test_teardown(h3s, h3c, conn);
 }
 
 
@@ -1430,7 +1727,7 @@ xqc_test_h3_max_push_id_errors()
     /* A client cannot receive MAX_PUSH_ID from a server. */
     CU_ASSERT(xqc_h3_ctrl_feed_max_push_id(h3s, 1)
               == -XQC_H3_INVALID_MAX_PUSH_ID);
-    CU_ASSERT(conn->conn_err == H3_FRAME_UNEXPECTED);
+    CU_ASSERT(XQC_CONN_ERR_CODE(conn->conn_err) == H3_FRAME_UNEXPECTED);
     CU_ASSERT((conn->conn_flag & XQC_CONN_FLAG_ERROR) != 0);
     CU_ASSERT(h3c->max_stream_id_recvd == 0);
 
@@ -1448,7 +1745,7 @@ xqc_test_h3_max_push_id_errors()
     /* A decreasing value is H3_ID_ERROR and cannot replace the maximum. */
     CU_ASSERT(xqc_h3_ctrl_feed_max_push_id(h3s, 4)
               == -XQC_H3_INVALID_MAX_PUSH_ID);
-    CU_ASSERT(conn->conn_err == H3_ID_ERROR);
+    CU_ASSERT(XQC_CONN_ERR_CODE(conn->conn_err) == H3_ID_ERROR);
     CU_ASSERT((conn->conn_flag & XQC_CONN_FLAG_ERROR) != 0);
     CU_ASSERT(h3c->max_stream_id_recvd == 5);
 
@@ -1477,7 +1774,7 @@ xqc_test_h3_ctrl_reject_data(void)
             sizeof(data_frame));
 
     CU_ASSERT(processed == -XQC_H3_CONTROL_FRAME_UNEXPECTED);
-    CU_ASSERT(conn->conn_err == H3_FRAME_UNEXPECTED);
+    CU_ASSERT(XQC_CONN_ERR_CODE(conn->conn_err) == H3_FRAME_UNEXPECTED);
     CU_ASSERT((conn->conn_flag & XQC_CONN_FLAG_ERROR) != 0);
     CU_ASSERT(h3s->pctx.frame_pctx.state == XQC_H3_FRM_STATE_TYPE);
 
@@ -1505,7 +1802,7 @@ xqc_test_h3_ctrl_reject_zero_len_data(void)
             sizeof(zero_data));
 
     CU_ASSERT(processed == -XQC_H3_CONTROL_FRAME_UNEXPECTED);
-    CU_ASSERT(conn->conn_err == H3_FRAME_UNEXPECTED);
+    CU_ASSERT(XQC_CONN_ERR_CODE(conn->conn_err) == H3_FRAME_UNEXPECTED);
     CU_ASSERT((conn->conn_flag & XQC_CONN_FLAG_ERROR) != 0);
     CU_ASSERT(h3s->pctx.frame_pctx.state == XQC_H3_FRM_STATE_TYPE);
 
@@ -1533,7 +1830,7 @@ xqc_test_h3_ctrl_reject_headers(void)
             sizeof(headers_frame));
 
     CU_ASSERT(processed == -XQC_H3_CONTROL_FRAME_UNEXPECTED);
-    CU_ASSERT(conn->conn_err == H3_FRAME_UNEXPECTED);
+    CU_ASSERT(XQC_CONN_ERR_CODE(conn->conn_err) == H3_FRAME_UNEXPECTED);
     CU_ASSERT((conn->conn_flag & XQC_CONN_FLAG_ERROR) != 0);
     CU_ASSERT(h3s->pctx.frame_pctx.state == XQC_H3_FRM_STATE_TYPE);
 
@@ -1561,7 +1858,7 @@ xqc_test_h3_ctrl_reject_push_promise(void)
             sizeof(push_promise));
 
     CU_ASSERT(processed == -XQC_H3_CONTROL_FRAME_UNEXPECTED);
-    CU_ASSERT(conn->conn_err == H3_FRAME_UNEXPECTED);
+    CU_ASSERT(XQC_CONN_ERR_CODE(conn->conn_err) == H3_FRAME_UNEXPECTED);
     CU_ASSERT((conn->conn_flag & XQC_CONN_FLAG_ERROR) != 0);
     CU_ASSERT(h3s->pctx.frame_pctx.state == XQC_H3_FRM_STATE_TYPE);
 
@@ -1589,7 +1886,7 @@ xqc_test_h3_ctrl_reject_data_before_settings(void)
             sizeof(data_frame));
 
     CU_ASSERT(processed == -XQC_H3_CONTROL_FRAME_UNEXPECTED);
-    CU_ASSERT(conn->conn_err == H3_FRAME_UNEXPECTED);
+    CU_ASSERT(XQC_CONN_ERR_CODE(conn->conn_err) == H3_FRAME_UNEXPECTED);
     CU_ASSERT((conn->conn_flag & XQC_CONN_FLAG_ERROR) != 0);
     CU_ASSERT(h3s->pctx.frame_pctx.state == XQC_H3_FRM_STATE_TYPE);
 
@@ -1627,7 +1924,7 @@ xqc_test_h3_ctrl_goaway_then_data(void)
 
     /* DATA must be rejected */
     CU_ASSERT(processed == -XQC_H3_CONTROL_FRAME_UNEXPECTED);
-    CU_ASSERT(conn->conn_err == H3_FRAME_UNEXPECTED);
+    CU_ASSERT(XQC_CONN_ERR_CODE(conn->conn_err) == H3_FRAME_UNEXPECTED);
     CU_ASSERT((conn->conn_flag & XQC_CONN_FLAG_ERROR) != 0);
     CU_ASSERT(h3s->pctx.frame_pctx.state == XQC_H3_FRM_STATE_TYPE);
 
@@ -1665,7 +1962,7 @@ xqc_test_h3_ctrl_reject_partial_feed(void)
     processed = xqc_h3_stream_process_control(h3s, len_byte, sizeof(len_byte));
 
     CU_ASSERT(processed == -XQC_H3_CONTROL_FRAME_UNEXPECTED);
-    CU_ASSERT(conn->conn_err == H3_FRAME_UNEXPECTED);
+    CU_ASSERT(XQC_CONN_ERR_CODE(conn->conn_err) == H3_FRAME_UNEXPECTED);
     CU_ASSERT((conn->conn_flag & XQC_CONN_FLAG_ERROR) != 0);
     CU_ASSERT(h3s->pctx.frame_pctx.state == XQC_H3_FRM_STATE_TYPE);
 
@@ -1767,7 +2064,7 @@ xqc_test_h3_missing_settings_one(uint64_t frame_type)
             sizeof(frame_buf));
 
     CU_ASSERT(processed == -XQC_H3_MISSING_SETTINGS);
-    CU_ASSERT(conn->conn_err == H3_MISSING_SETTINGS);
+    CU_ASSERT(XQC_CONN_ERR_CODE(conn->conn_err) == H3_MISSING_SETTINGS);
     CU_ASSERT((conn->conn_flag & XQC_CONN_FLAG_ERROR) != 0);
 
     stream->stream_flag |= XQC_STREAM_FLAG_DISCARDED;
@@ -1843,15 +2140,16 @@ xqc_test_h3_request_frame_unexpected_one(uint64_t frame_type,
         /* must return the new internal error code */
         CU_ASSERT(processed == -XQC_H3_REQUEST_FRAME_UNEXPECTED);
         /* must set the wire-level H3_FRAME_UNEXPECTED (0x0105) */
-        CU_ASSERT(conn->conn_err == H3_FRAME_UNEXPECTED);
-        CU_ASSERT(conn->conn_err == 0x0105);
+        CU_ASSERT(XQC_CONN_ERR_CODE(conn->conn_err) == H3_FRAME_UNEXPECTED);
+        CU_ASSERT(XQC_CONN_ERR_CODE(conn->conn_err) == 0x0105);
         /* must set the error flag so CONNECTION_CLOSE is sent */
         CU_ASSERT((conn->conn_flag & XQC_CONN_FLAG_ERROR) != 0);
     } else {
         /* must NOT return the frame-unexpected error */
         CU_ASSERT(processed != -XQC_H3_REQUEST_FRAME_UNEXPECTED);
         /* must NOT set H3_FRAME_UNEXPECTED */
-        CU_ASSERT(conn->conn_err != H3_FRAME_UNEXPECTED);
+        CU_ASSERT(XQC_CONN_ERR_CODE(conn->conn_err)
+                  != H3_FRAME_UNEXPECTED);
     }
 
     xqc_h3_msgerr_teardown(h3s, h3c, conn);
@@ -1887,17 +2185,8 @@ xqc_test_h3_request_frame_unexpected()
     CU_ASSERT(XQC_H3_FRM_MAX_PUSH_ID == 0x0D);
 
 
-    /*
-     * ===== Negative cases: request-stream frames MUST NOT be rejected =====
-     *
-     * DATA and HEADERS are valid on request streams. Verify the fix
-     * does not accidentally widen the rejection to legitimate frames.
-     */
-
-    /* Case 5: DATA (0x00) on request stream -- must be accepted */
-    xqc_test_h3_request_frame_unexpected_one(XQC_H3_FRM_DATA, XQC_FALSE);
-
-    /* Case 6: HEADERS (0x01) on request stream -- must be accepted */
+    /* HEADERS is valid on request streams. DATA validity depends on the
+     * HTTP message sequence and is covered by dedicated tests below. */
     xqc_test_h3_request_frame_unexpected_one(XQC_H3_FRM_HEADERS, XQC_FALSE);
 
 
@@ -1930,6 +2219,88 @@ xqc_test_h3_request_frame_unexpected()
      */
     CU_ASSERT(XQC_H3_REQUEST_FRAME_UNEXPECTED == 835);
     CU_ASSERT(XQC_H3_REQUEST_FRAME_UNEXPECTED >= XQC_H3_EMALLOC);
+}
+
+
+void
+xqc_test_h3_data_after_headers_accepted()
+{
+    xqc_connection_t *conn = NULL;
+    xqc_h3_conn_t *h3c = NULL;
+    xqc_h3_stream_t *h3s = xqc_h3_msgerr_setup(&conn, &h3c);
+    CU_ASSERT_FATAL(h3s != NULL);
+
+    unsigned char headers[sizeof(xqc_h3_msgerr_valid_headers)];
+    xqc_memcpy(headers, xqc_h3_msgerr_valid_headers, sizeof(headers));
+    unsigned char data[] = { XQC_H3_FRM_DATA, 0x01, 0x2a };
+
+    ssize_t processed = xqc_h3_stream_process_request(h3s, headers,
+            sizeof(headers), XQC_FALSE);
+    CU_ASSERT(processed == (ssize_t)sizeof(headers));
+    CU_ASSERT(h3s->h3r->completed_header_count == 1);
+
+    processed = xqc_h3_stream_process_request(h3s, data, sizeof(data),
+            XQC_FALSE);
+    CU_ASSERT(processed == (ssize_t)sizeof(data));
+    CU_ASSERT(conn->conn_err == 0);
+    CU_ASSERT((conn->conn_flag & XQC_CONN_FLAG_ERROR) == 0);
+    CU_ASSERT(h3s->h3r->body_buf_count == 1);
+    CU_ASSERT(!xqc_list_empty(&h3s->h3r->body_buf));
+
+    xqc_h3_msgerr_teardown(h3s, h3c, conn);
+}
+
+
+void
+xqc_test_h3_data_before_headers_rejected()
+{
+    xqc_connection_t *conn = NULL;
+    xqc_h3_conn_t *h3c = NULL;
+    xqc_h3_stream_t *h3s = xqc_h3_msgerr_setup(&conn, &h3c);
+    CU_ASSERT_FATAL(h3s != NULL);
+
+    /* RFC 9114 Section 4.1 requires H3_FRAME_UNEXPECTED for this sequence. */
+    unsigned char data[] = { XQC_H3_FRM_DATA, 0x01, 0x2a };
+    ssize_t processed = xqc_h3_stream_process_request(h3s, data,
+            sizeof(data), XQC_FALSE);
+
+    CU_ASSERT(processed == -XQC_H3_REQUEST_FRAME_UNEXPECTED);
+    CU_ASSERT(XQC_CONN_ERR_CODE(conn->conn_err) == H3_FRAME_UNEXPECTED);
+    CU_ASSERT(XQC_CONN_ERR_IS_APPLICATION(conn->conn_err));
+    CU_ASSERT((conn->conn_flag & XQC_CONN_FLAG_ERROR) != 0);
+    CU_ASSERT(h3s->h3r->completed_header_count == 0);
+    CU_ASSERT(h3s->h3r->body_buf_count == 0);
+    CU_ASSERT(xqc_list_empty(&h3s->h3r->body_buf));
+    CU_ASSERT(h3s->pctx.frame_pctx.state == XQC_H3_FRM_STATE_TYPE);
+
+    xqc_h3_msgerr_teardown(h3s, h3c, conn);
+
+    /*
+     * A peer-created bidi stream is initially type-unknown when extensions
+     * are enabled. Exercise a complete zero-length DATA frame, which the
+     * unknown-type dispatcher consumes before request-stream processing.
+     */
+    conn = NULL;
+    h3c = NULL;
+    h3s = xqc_h3_msgerr_setup(&conn, &h3c);
+    CU_ASSERT_FATAL(h3s != NULL);
+    xqc_h3_request_destroy(h3s->h3r);
+    h3s->h3r = NULL;
+    h3s->type = XQC_H3_STREAM_TYPE_UNKNOWN;
+    h3c->flags |= XQC_H3_CONN_FLAG_EXT_ENABLED;
+
+    unsigned char empty_data[] = { XQC_H3_FRM_DATA, 0x00 };
+    processed = xqc_h3_stream_process_in(h3s, empty_data,
+            sizeof(empty_data), XQC_FALSE);
+
+    CU_ASSERT(processed == -XQC_H3_EPROC_REQUEST);
+    CU_ASSERT(XQC_CONN_ERR_CODE(conn->conn_err) == H3_FRAME_UNEXPECTED);
+    CU_ASSERT(XQC_CONN_ERR_IS_APPLICATION(conn->conn_err));
+    CU_ASSERT((conn->conn_flag & XQC_CONN_FLAG_ERROR) != 0);
+    CU_ASSERT(h3s->h3r == NULL);
+    CU_ASSERT(h3s->pctx.frame_pctx.state == XQC_H3_FRM_STATE_TYPE);
+
+    xqc_h3_msgerr_teardown(h3s, h3c, conn);
 }
 
 
@@ -1976,8 +2347,8 @@ xqc_test_h3_server_push_promise_rejected()
             sizeof(push_promise), XQC_FALSE);
 
     CU_ASSERT(processed == -XQC_H3_REQUEST_FRAME_UNEXPECTED);
-    CU_ASSERT(conn->conn_err == H3_FRAME_UNEXPECTED);
-    CU_ASSERT(conn->conn_err == 0x0105);
+    CU_ASSERT(XQC_CONN_ERR_CODE(conn->conn_err) == H3_FRAME_UNEXPECTED);
+    CU_ASSERT(XQC_CONN_ERR_CODE(conn->conn_err) == 0x0105);
     CU_ASSERT((conn->conn_flag & XQC_CONN_FLAG_ERROR) != 0);
 
     xqc_h3_msgerr_teardown(h3s, h3c, conn);
@@ -2000,8 +2371,8 @@ xqc_test_h3_server_push_promise_rejected()
             sizeof(push_promise), XQC_FALSE);
 
     CU_ASSERT(processed == -XQC_H3_EPROC_REQUEST);
-    CU_ASSERT(conn->conn_err == H3_FRAME_UNEXPECTED);
-    CU_ASSERT(conn->conn_err == 0x0105);
+    CU_ASSERT(XQC_CONN_ERR_CODE(conn->conn_err) == H3_FRAME_UNEXPECTED);
+    CU_ASSERT(XQC_CONN_ERR_CODE(conn->conn_err) == 0x0105);
     CU_ASSERT((conn->conn_flag & XQC_CONN_FLAG_ERROR) != 0);
 
     xqc_h3_msgerr_teardown(h3s, h3c, conn);
@@ -2092,7 +2463,8 @@ xqc_test_h3_blocked_buf_limit(void)
     xqc_int_t ret = xqc_h3_stream_process_in(h3s, frame, fl, XQC_TRUE);
 
     /* blocked-buffer cap must have fired */
-    CU_ASSERT(conn->conn_err == H3_EXCESSIVE_LOAD);
+    CU_ASSERT(XQC_CONN_ERR_CODE(conn->conn_err) == H3_EXCESSIVE_LOAD);
+    CU_ASSERT(XQC_CONN_ERR_IS_APPLICATION(conn->conn_err));
     CU_ASSERT(ret == -XQC_H3_EPROC_REQUEST);
 
     xqc_var_buf_free(fs);
@@ -2189,6 +2561,429 @@ xqc_test_h3_settings_frame_size_limit()
     /* normal-sized SETTINGS frame should parse successfully */
     CU_ASSERT(ret >= 0);
 }
+
+
+/*
+ * Issue #748 regression test.
+ *
+ * RFC 9114 4.2 says any request or response containing uppercase
+ * characters in field names MUST be treated as malformed, and 4.1.2
+ * routes malformed messages to a stream error of type H3_MESSAGE_ERROR.
+ * The xquic encoder already silently lowercases on send, but the
+ * receiver had no check at all -- xqc_qpack_dec_headers handed any
+ * decoded header straight to the application without validating the
+ * name was lowercase. This test exercises the new helper that powers
+ * the receive-side guard.
+ *
+ * The helper is a pure byte scan, so the test drives it directly
+ * with stack-allocated names rather than going through QPACK encoding.
+ * Pseudo-header names (which start with ':') go through the same
+ * scan: ':' is 0x3A which sits below 'A' = 0x41, so a pseudo-header
+ * name like ":Method" is caught on the 'M', exactly the same path
+ * as a regular field.
+ */
+void
+xqc_test_h3_field_name_uppercase_rejection()
+{
+    /* all-lowercase regular field name -> accepted */
+    const unsigned char ua_lc[] = "user-agent";
+    CU_ASSERT(xqc_qpack_field_name_has_uppercase(ua_lc, sizeof(ua_lc) - 1)
+              == XQC_FALSE);
+
+    /* mixed case regular field name -> rejected */
+    const unsigned char ua_mc[] = "User-Agent";
+    CU_ASSERT(xqc_qpack_field_name_has_uppercase(ua_mc, sizeof(ua_mc) - 1)
+              == XQC_TRUE);
+
+    /* single uppercase byte -> rejected */
+    const unsigned char single_u[] = "X";
+    CU_ASSERT(xqc_qpack_field_name_has_uppercase(single_u, sizeof(single_u) - 1)
+              == XQC_TRUE);
+
+    /* all-uppercase -> rejected */
+    const unsigned char all_u[] = "ACCEPT";
+    CU_ASSERT(xqc_qpack_field_name_has_uppercase(all_u, sizeof(all_u) - 1)
+              == XQC_TRUE);
+
+    /* empty name -> accepted (the helper is name-only; empty-name
+     * malformed handling lives elsewhere) */
+    CU_ASSERT(xqc_qpack_field_name_has_uppercase((const unsigned char *)"", 0)
+              == XQC_FALSE);
+
+    /* lowercase pseudo-header -> accepted */
+    const unsigned char pseudo_lc[] = ":method";
+    CU_ASSERT(xqc_qpack_field_name_has_uppercase(pseudo_lc, sizeof(pseudo_lc) - 1)
+              == XQC_FALSE);
+
+    /* uppercase in pseudo-header -> rejected (RFC 9114 4.3 routes
+     * this through "undefined pseudo-header" but the byte scan
+     * catches it first) */
+    const unsigned char pseudo_uc[] = ":Method";
+    CU_ASSERT(xqc_qpack_field_name_has_uppercase(pseudo_uc, sizeof(pseudo_uc) - 1)
+              == XQC_TRUE);
+
+    /* boundary characters around A-Z -> not flagged */
+    const unsigned char at_sign[] = "@";  /* 0x40, just below 'A' */
+    CU_ASSERT(xqc_qpack_field_name_has_uppercase(at_sign, sizeof(at_sign) - 1)
+              == XQC_FALSE);
+    const unsigned char open_bracket[] = "[";  /* 0x5B, just above 'Z' */
+    CU_ASSERT(xqc_qpack_field_name_has_uppercase(open_bracket,
+                                                 sizeof(open_bracket) - 1)
+              == XQC_FALSE);
+
+    /* high-bit byte (0xff) -> not flagged. Such a byte is invalid in
+     * an HTTP/3 field name per RFC 9110 token rules, but that is a
+     * separate validation -- the helper is scoped to A-Z. */
+    const unsigned char high_bit[] = { 0xff, 0x00 };
+    CU_ASSERT(xqc_qpack_field_name_has_uppercase(high_bit, 1) == XQC_FALSE);
+
+    /* uppercase deep inside an otherwise lowercase name -> rejected.
+     * Catches the off-by-one of an early-exit-only-on-first-byte loop. */
+    const unsigned char trailing_uc[] = "x-forwarded-For";
+    CU_ASSERT(xqc_qpack_field_name_has_uppercase(trailing_uc,
+                                                 sizeof(trailing_uc) - 1)
+              == XQC_TRUE);
+
+    /*
+     * Drive xqc_h3_request_on_recv_header with fake header data containing
+     * an uppercase field name.  This exercises the full error propagation
+     * path (helper -> H3_MESSAGE_ERROR -> -XQC_H3_EMALFORMED_HEADER)
+     * without touching the sender path or requiring a real wire exchange.
+     */
+    xqc_connection_t *conn = test_engine_connect();
+    CU_ASSERT_FATAL(conn != NULL);
+
+    if (conn->alpn) {
+        xqc_free(conn->alpn);
+    }
+    conn->alpn_len = strlen(XQC_ALPN_H3);
+    conn->alpn = xqc_calloc(1, conn->alpn_len + 1);
+    xqc_memcpy(conn->alpn, XQC_ALPN_H3, conn->alpn_len);
+
+    xqc_h3_conn_t *h3c = xqc_h3_conn_create(conn, NULL);
+    CU_ASSERT_FATAL(h3c != NULL);
+
+    conn->conn_flow_ctl.fc_max_streams_uni_can_send = 16;
+
+    xqc_stream_t *stream = xqc_create_stream_with_conn(conn,
+                                                       XQC_UNDEFINE_STREAM_ID,
+                                                       XQC_CLI_UNI, NULL, NULL);
+    CU_ASSERT_FATAL(stream != NULL);
+
+    xqc_h3_stream_t *h3s = xqc_h3_stream_create(h3c, stream,
+                                                XQC_H3_STREAM_TYPE_CONTROL,
+                                                NULL);
+    CU_ASSERT_FATAL(h3s != NULL);
+
+    xqc_h3_request_t *h3r = xqc_calloc(1, sizeof(xqc_h3_request_t));
+    CU_ASSERT_FATAL(h3r != NULL);
+    h3r->h3_stream  = h3s;
+    h3r->request_if = &h3c->h3_request_callbacks;
+    xqc_init_list_head(&h3r->body_buf);
+
+    xqc_http_header_t fake_hdrs[1];
+    fake_hdrs[0].name.iov_base  = (void *)"X-Bad-Name";
+    fake_hdrs[0].name.iov_len   = 10;
+    fake_hdrs[0].value.iov_base = (void *)"ok";
+    fake_hdrs[0].value.iov_len  = 2;
+    fake_hdrs[0].flags          = 0;
+
+    xqc_http_headers_t *hdr = &h3r->h3_header[0];
+    hdr->headers   = fake_hdrs;
+    hdr->count     = 1;
+    hdr->total_len = 12;
+    hdr->capacity  = 1;
+
+    h3r->completed_header_count = 0;
+    h3r->read_flag      = 0;
+    xqc_int_t ret = xqc_h3_request_on_recv_header(h3r);
+    CU_ASSERT_EQUAL(ret, -XQC_H3_EMALFORMED_HEADER);
+
+    /* all-lowercase header passes the check */
+    fake_hdrs[0].name.iov_base = (void *)"x-good-name";
+    fake_hdrs[0].name.iov_len  = 11;
+    hdr->total_len = 13;
+    h3r->completed_header_count = 0;
+    h3r->read_flag      = 0;
+    ret = xqc_h3_request_on_recv_header(h3r);
+    CU_ASSERT_EQUAL(ret, XQC_OK);
+
+    hdr->headers = NULL;
+    for (size_t i = 0; i < XQC_H3_REQUEST_MAX_HEADERS_CNT; i++) {
+        xqc_h3_headers_free(&h3r->h3_header[i]);
+    }
+    xqc_list_buf_list_free(&h3r->body_buf);
+    xqc_free(h3r);
+
+    h3s->h3r = NULL;
+    stream->stream_flag |= XQC_STREAM_FLAG_DISCARDED;
+    xqc_h3_stream_destroy(h3s);
+    xqc_destroy_stream(stream);
+
+    xqc_h3_conn_destroy(h3c);
+    xqc_engine_destroy(conn->engine);
+}
+
+
+/*
+ * RFC 9114 Sections 4.2 and 4.1.2: lowercase field names remain valid,
+ * while an uppercase field name resets only the malformed request stream.
+ * These QPACK literals exercise the request-stream parser and error
+ * propagation instead of only testing the byte-scanning helper.
+ */
+void
+xqc_test_h3_lowercase_field_name_stream_accepted()
+{
+    const unsigned char lowercase[] = {
+        0x01, 0x06, 0x00, 0x00, 0x21, 0x78, 0x01, 0x76
+    };
+    xqc_connection_t *conn = NULL;
+    xqc_h3_conn_t *h3c = NULL;
+    xqc_h3_stream_t *h3s = xqc_h3_msgerr_setup(&conn, &h3c);
+    CU_ASSERT_FATAL(h3s != NULL);
+
+    unsigned char buf[sizeof(lowercase)];
+    xqc_memcpy(buf, lowercase, sizeof(buf));
+
+    xqc_int_t ret = xqc_h3_stream_process_in(h3s, buf, sizeof(buf),
+                                             XQC_TRUE);
+
+    CU_ASSERT_EQUAL(ret, XQC_OK);
+    CU_ASSERT_EQUAL(xqc_h3_stream_get_err(h3s), 0);
+    CU_ASSERT_EQUAL(h3s->stream->stream_err, 0);
+    CU_ASSERT_EQUAL(conn->conn_err, 0);
+    CU_ASSERT((conn->conn_flag & XQC_CONN_FLAG_ERROR) == 0);
+
+    xqc_h3_msgerr_teardown(h3s, h3c, conn);
+}
+
+
+void
+xqc_test_h3_uppercase_field_name_stream_rejected()
+{
+    const unsigned char uppercase[] = {
+        0x01, 0x06, 0x00, 0x00, 0x21, 0x58, 0x01, 0x76
+    };
+    xqc_connection_t *conn = NULL;
+    xqc_h3_conn_t *h3c = NULL;
+    xqc_h3_stream_t *h3s = xqc_h3_msgerr_setup(&conn, &h3c);
+    CU_ASSERT_FATAL(h3s != NULL);
+
+    unsigned char buf[sizeof(uppercase)];
+    xqc_memcpy(buf, uppercase, sizeof(buf));
+
+    xqc_int_t ret = xqc_h3_stream_process_in(h3s, buf, sizeof(buf),
+                                             XQC_TRUE);
+
+    CU_ASSERT_EQUAL(ret, XQC_OK);
+    CU_ASSERT_EQUAL(xqc_h3_stream_get_err(h3s), H3_MESSAGE_ERROR);
+    CU_ASSERT_EQUAL(h3s->stream->stream_err, H3_MESSAGE_ERROR);
+    CU_ASSERT(h3s->stream->stream_state_send
+              >= XQC_SEND_STREAM_ST_RESET_SENT);
+    CU_ASSERT_EQUAL(conn->conn_err, 0);
+    CU_ASSERT((conn->conn_flag & XQC_CONN_FLAG_ERROR) == 0);
+
+    xqc_h3_msgerr_teardown(h3s, h3c, conn);
+}
+
+
+/*
+ * RFC 9114 Section 4.3 requires pseudo-header fields to precede regular
+ * fields. These field sections contain the same otherwise valid request
+ * fields and differ only in the position of :authority relative to x: v.
+ */
+void
+xqc_test_h3_pseudo_header_order_accepted()
+{
+    const unsigned char pseudo_before_regular[] = {
+        0x01, 0x0a, 0x00, 0x00, 0xd1, 0xd7,
+        0xc1, 0xc0, 0x21, 0x78, 0x01, 0x76
+    };
+    xqc_connection_t *conn = NULL;
+    xqc_h3_conn_t *h3c = NULL;
+    xqc_h3_stream_t *h3s = xqc_h3_msgerr_setup(&conn, &h3c);
+    CU_ASSERT_FATAL(h3s != NULL);
+
+    unsigned char buf[sizeof(pseudo_before_regular)];
+    xqc_memcpy(buf, pseudo_before_regular, sizeof(buf));
+
+    xqc_int_t ret = xqc_h3_stream_process_in(h3s, buf, sizeof(buf),
+                                             XQC_TRUE);
+
+    CU_ASSERT_EQUAL(ret, XQC_OK);
+    CU_ASSERT_EQUAL(xqc_h3_stream_get_err(h3s), 0);
+    CU_ASSERT_EQUAL(h3s->stream->stream_err, 0);
+    CU_ASSERT_EQUAL(conn->conn_err, 0);
+    CU_ASSERT((conn->conn_flag & XQC_CONN_FLAG_ERROR) == 0);
+    CU_ASSERT_EQUAL(h3s->h3r->completed_header_count, 1);
+    CU_ASSERT(h3s->h3r->read_flag & XQC_REQ_NOTIFY_READ_HEADER);
+
+    xqc_h3_msgerr_teardown(h3s, h3c, conn);
+}
+
+
+void
+xqc_test_h3_pseudo_header_after_regular_rejected()
+{
+    const unsigned char pseudo_after_regular[] = {
+        0x01, 0x0a, 0x00, 0x00, 0xd1, 0xd7,
+        0xc1, 0x21, 0x78, 0x01, 0x76, 0xc0
+    };
+    xqc_connection_t *conn = NULL;
+    xqc_h3_conn_t *h3c = NULL;
+    xqc_h3_stream_t *h3s = xqc_h3_msgerr_setup(&conn, &h3c);
+    CU_ASSERT_FATAL(h3s != NULL);
+
+    unsigned char buf[sizeof(pseudo_after_regular)];
+    xqc_memcpy(buf, pseudo_after_regular, sizeof(buf));
+
+    xqc_int_t ret = xqc_h3_stream_process_in(h3s, buf, sizeof(buf),
+                                             XQC_TRUE);
+
+    CU_ASSERT_EQUAL(ret, XQC_OK);
+    CU_ASSERT_EQUAL(xqc_h3_stream_get_err(h3s), H3_MESSAGE_ERROR);
+    CU_ASSERT_EQUAL(h3s->stream->stream_err, H3_MESSAGE_ERROR);
+    CU_ASSERT(h3s->stream->stream_state_send
+              >= XQC_SEND_STREAM_ST_RESET_SENT);
+    CU_ASSERT_EQUAL(conn->conn_err, 0);
+    CU_ASSERT((conn->conn_flag & XQC_CONN_FLAG_ERROR) == 0);
+    CU_ASSERT_EQUAL(h3s->h3r->completed_header_count, 0);
+    CU_ASSERT_EQUAL(h3s->h3r->read_flag, 0);
+
+    xqc_h3_msgerr_teardown(h3s, h3c, conn);
+}
+
+
+void
+xqc_test_h3_priority_bounded_parse()
+{
+    const uint8_t priority[] = {'u', '=', '1', ',', ' ', 'i', '=', '?', '1'};
+    const uint8_t malformed[] = {'u', '='};
+    const uint8_t overflow[] = {'u', '=', '2', '5', '6'};
+    xqc_h3_priority_t parsed;
+
+    CU_ASSERT_EQUAL(xqc_parse_http_priority(&parsed, priority, sizeof(priority)), XQC_OK);
+    CU_ASSERT_EQUAL(parsed.urgency, 1);
+    CU_ASSERT_EQUAL(parsed.incremental, XQC_TRUE);
+
+    CU_ASSERT_EQUAL(xqc_parse_http_priority(&parsed, malformed, sizeof(malformed)),
+                    -XQC_H3_INVALID_PRIORITY);
+    CU_ASSERT_EQUAL(xqc_parse_http_priority(&parsed, overflow, sizeof(overflow)),
+                    -XQC_H3_INVALID_PRIORITY);
+
+    CU_ASSERT_EQUAL(xqc_parse_http_priority(&parsed, NULL, 0), XQC_OK);
+    CU_ASSERT_EQUAL(parsed.urgency, XQC_DEFAULT_HTTP_PRIORITY_URGENCY);
+    CU_ASSERT_EQUAL(parsed.incremental, XQC_FALSE);
+}
+
+static int xqc_test_h3_schedule_order[2];
+static int xqc_test_h3_schedule_count;
+static int xqc_test_h3_urgent_check_cwnd;
+static int xqc_test_h3_normal_check_cwnd;
+
+static xqc_path_ctx_t *
+xqc_test_h3_priority_get_path(void *scheduler, xqc_connection_t *conn,
+                              xqc_packet_out_t *packet_out, int check_cwnd,
+                              int reinject, xqc_bool_t *cc_blocked)
+{
+    uintptr_t marker = (uintptr_t)packet_out->po_user_data;
+    if (marker == 1) {
+        xqc_test_h3_urgent_check_cwnd = check_cwnd;
+        xqc_test_h3_schedule_order[xqc_test_h3_schedule_count++] = 1;
+
+    } else if (marker == 2) {
+        xqc_test_h3_normal_check_cwnd = check_cwnd;
+        xqc_test_h3_schedule_order[xqc_test_h3_schedule_count++] = 2;
+    }
+
+    if (cc_blocked != NULL) {
+        *cc_blocked = XQC_FALSE;
+    }
+    return conn->conn_initial_path;
+}
+
+static const xqc_scheduler_callback_t xqc_test_h3_priority_scheduler = {
+    .xqc_scheduler_get_path = xqc_test_h3_priority_get_path,
+};
+
+
+void
+xqc_test_h3_priority_queue_class()
+{
+    xqc_connection_t *conn = test_engine_connect();
+    CU_ASSERT_PTR_NOT_NULL_FATAL(conn);
+
+    xqc_stream_t *urgent_stream = xqc_create_stream_with_conn(
+        conn, XQC_UNDEFINE_STREAM_ID, XQC_CLI_BID, NULL, NULL);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(urgent_stream);
+
+    xqc_h3_stream_t urgent_h3s = {0};
+    xqc_h3_request_t urgent_h3r = {0};
+    urgent_h3s.stream = urgent_stream;
+    urgent_h3s.h3r = &urgent_h3r;
+    urgent_h3r.h3_stream = &urgent_h3s;
+
+    xqc_h3_priority_t priority;
+    xqc_h3_priority_init(&priority);
+    priority.urgency = 1;
+    xqc_h3_stream_set_priority(&urgent_h3s, &priority);
+    CU_ASSERT_EQUAL(urgent_stream->stream_priority, XQC_STREAM_PRI_URGENT);
+
+    xqc_packet_out_t *packet = xqc_send_queue_get_packet_out_for_stream(
+        conn->conn_send_queue, 1, XQC_PTYPE_SHORT_HEADER, urgent_stream);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(packet);
+    CU_ASSERT_PTR_EQUAL(packet, xqc_list_entry(
+        conn->conn_send_queue->sndq_send_packets_urgent.prev,
+        xqc_packet_out_t, po_list));
+    packet->po_user_data = (void *)(uintptr_t)1;
+
+    xqc_stream_t *fast_stream = xqc_create_stream_with_conn(
+        conn, XQC_UNDEFINE_STREAM_ID, XQC_CLI_BID, NULL, NULL);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(fast_stream);
+
+    xqc_h3_stream_t fast_h3s = {0};
+    xqc_h3_request_t fast_h3r = {0};
+    fast_h3s.stream = fast_stream;
+    fast_h3s.h3r = &fast_h3r;
+    fast_h3r.h3_stream = &fast_h3s;
+    priority.fastpath = 1;
+    xqc_h3_stream_set_priority(&fast_h3s, &priority);
+    CU_ASSERT_EQUAL(fast_stream->stream_priority, XQC_STREAM_PRI_HIGH);
+
+    packet = xqc_send_queue_get_packet_out_for_stream(
+        conn->conn_send_queue, 1, XQC_PTYPE_SHORT_HEADER, fast_stream);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(packet);
+    CU_ASSERT_PTR_EQUAL(packet, xqc_list_entry(
+        conn->conn_send_queue->sndq_send_packets_high_pri.prev,
+        xqc_packet_out_t, po_list));
+
+    xqc_stream_t *normal_stream = xqc_create_stream_with_conn(
+        conn, XQC_UNDEFINE_STREAM_ID, XQC_CLI_BID, NULL, NULL);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(normal_stream);
+    packet = xqc_send_queue_get_packet_out_for_stream(
+        conn->conn_send_queue, 1, XQC_PTYPE_SHORT_HEADER, normal_stream);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(packet);
+    packet->po_user_data = (void *)(uintptr_t)2;
+
+    const xqc_scheduler_callback_t *saved_scheduler = conn->scheduler_callback;
+    conn->scheduler_callback = &xqc_test_h3_priority_scheduler;
+    xqc_test_h3_schedule_count = 0;
+    xqc_test_h3_urgent_check_cwnd = -1;
+    xqc_test_h3_normal_check_cwnd = -1;
+    xqc_conn_schedule_packets_to_paths(conn);
+    conn->scheduler_callback = saved_scheduler;
+
+    CU_ASSERT_EQUAL(xqc_test_h3_schedule_count, 2);
+    CU_ASSERT_EQUAL(xqc_test_h3_schedule_order[0], 1);
+    CU_ASSERT_EQUAL(xqc_test_h3_schedule_order[1], 2);
+    CU_ASSERT_EQUAL(xqc_test_h3_urgent_check_cwnd, XQC_TRUE);
+    CU_ASSERT_EQUAL(xqc_test_h3_normal_check_cwnd, XQC_TRUE);
+    CU_ASSERT(!xqc_list_empty(&conn->conn_initial_path
+                                   ->path_schedule_buf[XQC_SEND_TYPE_NORMAL_URGENT]));
+
+    xqc_engine_destroy(conn->engine);
+}
+
 
 void
 xqc_test_h3_backpressure_api(void)
