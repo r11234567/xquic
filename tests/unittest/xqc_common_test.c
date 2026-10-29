@@ -88,6 +88,7 @@ xqc_test_connection_closed_log_with_error(void)
     xqc_send_ctl_t     send_ctl = {0};
 
     xqc_init_list_head(&conn.conn_paths_list);
+    xqc_init_list_head(&conn.conn_closed_paths_list);
     path.path_id = 7;
     path.path_send_ctl = &send_ctl;
     xqc_list_add_tail(&path.path_list, &conn.conn_paths_list);
@@ -100,6 +101,53 @@ xqc_test_connection_closed_log_with_error(void)
         &conn,
         "|xqc_test|err_code:4294967298|mtu_updatad_count:4294967295|"
         "pkt_dropped:4294967300|recent_congestion:<path:7, (0,0,0)>|");
+}
+
+void
+xqc_test_connection_closed_log_closed_paths(void)
+{
+    xqc_connection_t  conn = {0};
+    xqc_path_ctx_t     live_path = {0};
+    xqc_path_ctx_t     closed_path = {0};
+    xqc_send_ctl_t     live_ctl = {0};
+    xqc_send_ctl_t     closed_ctl = {0};
+
+    xqc_init_list_head(&conn.conn_paths_list);
+    xqc_init_list_head(&conn.conn_closed_paths_list);
+    live_path.path_id = 7;
+    live_path.path_send_ctl = &live_ctl;
+    closed_path.path_id = 8;
+    closed_path.path_state = XQC_PATH_STATE_CLOSED;
+    closed_path.path_send_ctl = &closed_ctl;
+    conn.conn_err = 1;
+    xqc_list_add_tail(&closed_path.path_list, &conn.conn_closed_paths_list);
+
+    xqc_test_connection_closed_log(
+        &conn,
+        "|xqc_test|err_code:1|mtu_updatad_count:0|"
+        "pkt_dropped:0|recent_congestion:<path:8, (0,0,0)>|");
+
+    xqc_list_add_tail(&live_path.path_list, &conn.conn_paths_list);
+    xqc_test_connection_closed_log(
+        &conn,
+        "|xqc_test|err_code:1|mtu_updatad_count:0|"
+        "pkt_dropped:0|recent_congestion:<path:7, (0,0,0)>"
+        "<path:8, (0,0,0)>|");
+}
+
+void
+xqc_test_connection_closed_log_empty_paths(void)
+{
+    xqc_connection_t  conn = {0};
+
+    xqc_init_list_head(&conn.conn_paths_list);
+    xqc_init_list_head(&conn.conn_closed_paths_list);
+    conn.conn_err = 1;
+
+    xqc_test_connection_closed_log(
+        &conn,
+        "|xqc_test|err_code:1|mtu_updatad_count:0|"
+        "pkt_dropped:0|recent_congestion:|");
 }
 
 static inline void

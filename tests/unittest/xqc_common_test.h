@@ -15,6 +15,8 @@ void xqc_test_common();
 void xqc_test_murmur_hash2_high_bytes(void);
 void xqc_test_connection_closed_log_no_error(void);
 void xqc_test_connection_closed_log_with_error(void);
+void xqc_test_connection_closed_log_closed_paths(void);
+void xqc_test_connection_closed_log_empty_paths(void);
 const xqc_cid_t *test_cid_connect(xqc_engine_t *engine);
 xqc_connection_t *test_engine_connect();
 xqc_engine_t *test_create_engine();

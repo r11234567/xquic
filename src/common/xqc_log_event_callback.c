@@ -57,7 +57,7 @@ xqc_log_CON_CONNECTION_CLOSED_callback(xqc_log_t *log, const char *func,
 {
     if (conn->conn_err != 0) {
         xqc_path_ctx_t *path = NULL;
-        unsigned char log_buf[500];
+        unsigned char log_buf[500] = {0};
         unsigned char *p = log_buf;
         unsigned char *last = log_buf + sizeof(log_buf);
         for (path = xqc_conn_all_paths_first(conn); path != NULL;
