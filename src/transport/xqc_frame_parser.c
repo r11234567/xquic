@@ -484,9 +484,8 @@ xqc_parse_crypto_frame(xqc_packet_in_t *packet_in, xqc_connection_t *conn,
     }
     frame->data_length = length;
     p += vlen;
-    if (p + length > end) {
+    if (length > (uint64_t)(end - p)) {
         return -XQC_EILLEGAL_FRAME;
-        ;
     }
     if (frame->data_length > 0) {
         frame->data = xqc_malloc(frame->data_length);

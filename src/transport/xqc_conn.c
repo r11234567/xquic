@@ -7504,6 +7504,12 @@ xqc_conn_tls_transport_params_cb(const uint8_t *tp, size_t len, void *user_data)
            first node and copy the sr token to that cid */
         xqc_cid_set_inner_t *inner_set =
             xqc_get_path_cid_set(&conn->dcid_set, XQC_INITIAL_PATH_ID);
+        if (inner_set == NULL) {
+            xqc_log(conn->log, XQC_LOG_ERROR,
+                    "|initial dcid set missing while sr token present|");
+            XQC_CONN_ERR(conn, TRA_INTERNAL_ERROR);
+            return;
+        }
         node = inner_set->cid_list.next;
         if (NULL != node) {
             cid_node = xqc_list_entry(node, xqc_cid_inner_t, list);
@@ -8432,6 +8438,9 @@ xqc_ping_record_t *
 xqc_conn_create_ping_record(xqc_connection_t *conn)
 {
     xqc_ping_record_t *pr = xqc_calloc(1, sizeof(xqc_ping_record_t));
+    if (pr == NULL) {
+        return NULL;
+    }
     xqc_init_list_head(&pr->list);
     xqc_list_add_tail(&pr->list, &conn->ping_notification_list);
     return pr;

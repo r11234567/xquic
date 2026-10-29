@@ -1411,6 +1411,11 @@ xqc_process_new_conn_id_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_in
          * connection IDs.
          */
         inner_set = xqc_get_path_cid_set(&conn->dcid_set, XQC_INITIAL_PATH_ID);
+        if (inner_set == NULL) {
+            xqc_log(conn->log, XQC_LOG_ERROR, "|initial dcid set missing|");
+            XQC_CONN_ERR(conn, TRA_INTERNAL_ERROR);
+            return -XQC_EPROTO;
+        }
         xqc_list_for_each_safe(pos, next, &inner_set->cid_list)
         {
             inner_cid = xqc_list_entry(pos, xqc_cid_inner_t, list);
@@ -2630,6 +2635,11 @@ xqc_process_mp_new_conn_id_frame(xqc_connection_t *conn, xqc_packet_in_t *packet
          * connection IDs.
          */
         inner_set = xqc_get_path_cid_set(&conn->dcid_set, path_id);
+        if (inner_set == NULL) {
+            xqc_log(conn->log, XQC_LOG_ERROR, "|dcid set missing|path:%ui|", path_id);
+            XQC_CONN_ERR(conn, TRA_INTERNAL_ERROR);
+            return -XQC_EPROTO;
+        }
         xqc_list_for_each_safe(pos, next, &inner_set->cid_list)
         {
             inner_cid = xqc_list_entry(pos, xqc_cid_inner_t, list);
