@@ -1,93 +1,97 @@
-# Biweekly sync of fork main with upstream alibaba/xquic, then ensure a PR
-# from main → mqvpn-dev exists for human review.
-name: Sync upstream main and ensure PR to mqvpn-dev
+# The downstream main is a product branch, not an Alibaba mirror.
+# Preserve mp0rta/mqvpn-main history in a draft PR; never update main here.
+name: Propose upstream mqvpn-main sync
 
 on:
   schedule:
-    - cron: '0 0 * * 1'      # Every Monday 09:00 JST (00:00 UTC); biweekly via parity gate below
-  workflow_dispatch:          # Manual runs bypass the parity gate
+    - cron: '0 0 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
 
 jobs:
-  sync:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
+  propose-sync:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - name: Biweekly gate (skip odd ISO weeks for scheduled runs)
-        id: parity
-        run: |
-          if [ "${{ github.event_name }}" != "schedule" ]; then
-            echo "Manual run — bypassing parity gate."
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          week=$(date -u +%V)
-          if [ $((10#$week % 2)) -ne 0 ]; then
-            echo "ISO week $week is odd — biweekly schedule skips this run."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "ISO week $week is even — proceeding."
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Checkout fork main
-        if: steps.parity.outputs.skip != 'true'
+      - name: Checkout downstream main
         uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
 
-      - name: Sync fork main with upstream (fast-forward only)
-        if: steps.parity.outputs.skip != 'true'
+      - name: Propose missing upstream history
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Equivalent to clicking "Sync fork" in the GitHub UI.
-          # The next step still reports the gap if this fails (e.g. non-fast-forward).
-          resp=$(gh api -X POST "repos/${{ github.repository }}/merge-upstream" \
-            -f branch=main 2>&1) || true
-          echo "$resp"
-
-      - name: Check whether main has commits not in mqvpn-dev
-        if: steps.parity.outputs.skip != 'true'
-        id: gap
-        run: |
-          git fetch origin main mqvpn-dev
-          if git merge-base --is-ancestor origin/main origin/mqvpn-dev; then
-            echo "has_gap=false" >> "$GITHUB_OUTPUT"
-            echo "main is fully contained in mqvpn-dev — nothing to PR."
-          else
-            echo "has_gap=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Ensure a PR main → mqvpn-dev exists
-        if: steps.parity.outputs.skip != 'true' && steps.gap.outputs.has_gap == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # Reuse an existing open PR if any; GitHub auto-updates its diff as main advances.
-          existing=$(gh pr list --base mqvpn-dev --head main --state open \
-                      --json number -q '.[0].number')
-          if [ -n "$existing" ]; then
-            echo "PR #$existing already open — it will refresh automatically as main advances."
+          set -euo pipefail
+          git fetch --no-tags https://github.com/mp0rta/xquic.git mqvpn-main
+          upstream_sha=$(git rev-parse FETCH_HEAD)
+          if git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            echo "Upstream mqvpn-main is already contained in main."
             exit 0
           fi
-          gh pr create \
-            --base mqvpn-dev \
-            --head main \
-            --title "chore(upstream): sync main → mqvpn-dev ($(date -u +%Y-%m-%d))" \
-            --body "$(cat <<'BODY'
-          ## Auto upstream sync
 
-          Brings the latest commits from upstream alibaba/xquic (mirrored on `main`)
-          into `mqvpn-dev`. Triggered biweekly on Monday 09:00 JST by
-          `.github/workflows/sync-upstream.yml`.
+          # An existing integration PR may already include this upstream head.
+          # Query failures or a concurrently changed head must not look empty.
+          open_prs=$(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/pulls?state=open&base=main&per_page=100" \
+            --jq '.[] | "\(.number) \(.head.sha)"')
+          while read -r number head_sha; do
+            [ -n "$number" ] || continue
+            if ! git cat-file -e "$head_sha^{commit}" 2>/dev/null; then
+              git fetch --no-tags origin "refs/pull/$number/head"
+              if [ "$(git rev-parse FETCH_HEAD)" != "$head_sha" ]; then
+                echo "::error::PR #$number changed while inspecting its history."
+                exit 1
+              fi
+            fi
+            if git merge-base --is-ancestor "$upstream_sha" "$head_sha"; then
+              echo "PR #$number already includes the upstream head."
+              exit 0
+            fi
+          done <<< "$open_prs"
 
-          ### Review checklist
-          - [ ] Inspect upstream changes for breaking API / frame / transport-param changes
-          - [ ] Resolve conflicts with mqvpn-specific patches (MASQUE / multipath fixes, etc.)
-          - [ ] Run xquic unit / integration tests
-          - [ ] Verify the mqvpn build against this xquic SHA (bump submodule pin to test)
+          branch="sync/upstream-${upstream_sha:0:12}"
+          remote_sha=$(git ls-remote --heads origin "refs/heads/$branch" \
+            | awk '{print $1}')
+          if [ -n "$remote_sha" ]; then
+            if [ "$remote_sha" != "$upstream_sha" ]; then
+              echo "::error::Existing sync branch differs; refusing to overwrite it."
+              exit 1
+            fi
+          else
+            git push origin "$upstream_sha:refs/heads/$branch"
+          fi
+
+          body_file=$(mktemp)
+          trap 'rm -f "$body_file"' EXIT
+          cat > "$body_file" <<'BODY'
+          ### Mechanism
+
+          Proposes the complete history from mp0rta/xquic:mqvpn-main against
+          this fork's custom main. No automatic merge or direct main update.
+          Resolve conflicts by retaining upstream implementations and only
+          the downstream features that are still needed.
+
+          ### Validation Cases
+
+          Pending maintainer review of the upstream delta and consumer build.
+
+          ### CONTRIBUTING.md
+
+          - Overall: Pending
+          - Local regression: Incomplete
+          - CI: Pending — run Build and CodeQL for this branch before merge;
+            GITHUB_TOKEN-authored events do not normally start other workflows.
           BODY
-          )"
+          gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$branch" \
+            --draft --title "chore(sync): synchronize mp0rta mqvpn-main" \
+            --body-file "$body_file"

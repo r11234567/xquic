@@ -1,15 +1,26 @@
 name: CodeQL
 
 on:
+  workflow_dispatch:
   push:
-    branches: [ main, mqvpn-main, mqvpn-dev ]
+    branches: [ main, "sync/**" ]
   pull_request:
-    branches: [ mqvpn-main, mqvpn-dev ]
+    branches: [ main ]
+
+permissions:
+  contents: read
+  actions: read
+  security-events: write
+
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   analyze:
     name: Analyze
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
 
     steps:
     - name: Checkout repository
@@ -31,7 +42,7 @@ jobs:
       run: |
         sudo apt-get install -y python3-pip
         sudo apt-get install -y python3-lxml
-        sudo pip3 install gcovr
+        pipx install gcovr
 
     - name: Update Submodule
       run: |
@@ -42,14 +53,15 @@ jobs:
         cd ./third_party/boringssl
         mkdir -p build
         cd build
-        cmake -DBUILD_SHARED_LIBS=0 -DCMAKE_C_FLAGS="-fPIC" -DCMAKE_CXX_FLAGS="-fPIC" ..
+        cmake -DBUILD_SHARED_LIBS=0 -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS="-fPIC" -DCMAKE_CXX_FLAGS="-fPIC" ..
         make ssl crypto
 
     # Initializes the CodeQL tools for scanning.
     - name: Initialize CodeQL
-      uses: github/codeql-action/init@v2
+      uses: github/codeql-action/init@v4
       with:
-        languages: cpp
+        languages: c-cpp
+        build-mode: manual
 
     - name: Build XQUIC
       run: |
@@ -63,4 +75,4 @@ jobs:
         make -j
 
     - name: Perform CodeQL Analysis
-      uses: github/codeql-action/analyze@v2
+      uses: github/codeql-action/analyze@v4

@@ -8,6 +8,9 @@ This is the **r11234567/xquic** fork of [alibaba/xquic](https://github.com/aliba
 >
 > Upstream copyright, licensing, and attribution remain unchanged.
 
+Branch ownership, full-history synchronization and maintenance automation are
+documented in [downstream branch maintenance](docs/fork-maintenance.md).
+
 ---
 
 ## Synchronized fork fixes
