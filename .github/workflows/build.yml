@@ -7,6 +7,9 @@ on:
   pull_request:
     branches: [ main ]
 
+permissions:
+  contents: read
+
 concurrency:
   group: build-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -18,10 +21,11 @@ jobs:
     name: Build on Ubuntu
 
     runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 45
 
     strategy:
       matrix:
-        runs-on: [ubuntu-latest]
+        runs-on: [ubuntu-24.04]
 
     steps:
     - name: Checkout repository
@@ -43,7 +47,7 @@ jobs:
       run: |
         sudo apt-get install -y python3-pip
         sudo apt-get install -y python3-lxml
-        sudo pip3 install gcovr
+        pipx install gcovr
 
     - name: Fuzz MASQUE smoke (libFuzzer)
       run: |
@@ -58,7 +62,7 @@ jobs:
         cd ./third_party/boringssl
         mkdir -p build
         cd build
-        cmake -DBUILD_SHARED_LIBS=0 -DCMAKE_C_FLAGS="-fPIC" -DCMAKE_CXX_FLAGS="-fPIC" ..
+        cmake -DBUILD_SHARED_LIBS=0 -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS="-fPIC" -DCMAKE_CXX_FLAGS="-fPIC" ..
         make ssl crypto
 
     - name: Build XQUIC

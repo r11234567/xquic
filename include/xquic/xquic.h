@@ -340,6 +340,20 @@ typedef void (*xqc_conn_update_cid_notify_pt)(xqc_connection_t *conn,
 typedef int (*xqc_cert_verify_pt)(const unsigned char *certs[], const size_t cert_len[],
                                   size_t certs_len, void *conn_user_data);
 
+/**
+ * @brief client certificate rejected notify, for the library-side verification
+ * path (XQC_TLS_CERT_FLAG_NEED_VERIFY without XQC_TLS_CERT_FLAG_APP_VERIFY).
+ * Notify only: it cannot change the decision, which is already final; the
+ * connection closes as before. Called at most once per handshake, only when
+ * the library actually rejected the peer's certificate; never under APP_VERIFY
+ * (the application made the decision itself) and never when verification is
+ * off.
+ *
+ * @param x509_err the X509 verify error of the rejection (X509_V_ERR_*)
+ */
+typedef void (*xqc_cert_verify_failed_notify_pt)(int x509_err,
+                                                 void *conn_user_data);
+
 
 /**
  * @brief server peer addr changed notify
@@ -761,6 +775,11 @@ typedef struct xqc_transport_callbacks_s {
      */
     xqc_socket_write_pt conn_send_packet_before_accept;
 
+    /**
+     * library-side certificate rejection notify. OPTIONAL for client
+     */
+    xqc_cert_verify_failed_notify_pt cert_verify_failed_notify;
+
 } xqc_transport_callbacks_t;
 
 
@@ -1170,6 +1189,29 @@ XQC_EXPORT_PUBLIC_API
 xqc_int_t xqc_conn_set_path_pmtu(xqc_connection_t *conn, uint64_t path_id,
     size_t udp_payload_size);
 
+/** Field bits for xqc_conn_reapply_settings(). */
+#define XQC_CONN_REAPPLY_SCHEDULER (1u << 0)
+
+/**
+ * @brief Re-apply selected settings on a live connection.
+ * Only XQC_CONN_REAPPLY_SCHEDULER exists: it replaces the connection's scheduler
+ * (vtable and state) with settings->scheduler_callback, and normalizes
+ * settings->scheduler_params (a zero field keeps the current value). All other
+ * fields of settings are ignored. Scheduler state is dropped, so this is only
+ * allowed while the connection has exactly one path ever created and at most one
+ * active, and it is refused when datagram redundancy is enabled (that mode pins
+ * the scheduler). A call with the same vtable only updates the params. Each swap
+ * that changes the scheduler keeps the previous state allocation in the
+ * connection's pool until the connection is destroyed, so use it once, e.g. right
+ * after authentication.
+ * @return XQC_OK, -XQC_EPARAM (NULL argument, bad fields, incomplete vtable),
+ * -XQC_ESTATE (more than one path, or datagram redundancy enabled), -XQC_EMALLOC. Errors leave conn unchanged.
+ */
+XQC_EXPORT_PUBLIC_API
+xqc_int_t xqc_conn_reapply_settings(xqc_connection_t *conn,
+                                    const xqc_conn_settings_t *settings,
+                                    uint32_t fields);
+
 typedef enum {
     XQC_REINJ_UNACK_AFTER_SCHED = 1 << 0,
     XQC_REINJ_UNACK_BEFORE_SCHED = 1 << 1,
@@ -1460,6 +1502,16 @@ typedef struct xqc_conn_settings_s {
      */
     uint64_t sndq_packets_used_max;
     /**
+     * Cap on packets that are framed but not yet sent, checked before a
+     * stream write frames more data. 0 (default) = no cap. At the cap,
+     * xqc_stream_send returns -XQC_EAGAIN; the stream stays on the write
+     * list and is notified on later engine passes as before. DATAGRAM
+     * writes are not gated. Stream flow control bounds what a stream has
+     * outstanding, sent or not, and must be large enough for throughput;
+     * this bounds the part of it that waits locally behind the pacer.
+     */
+    uint32_t max_stream_unsent_packets;
+    /**
      * Max buffered out-of-order STREAM frame nodes per stream (reassembly
      * cap, CWE-770 mitigation per RFC 9000 §21.7).
      *
@@ -1710,11 +1762,15 @@ typedef struct xqc_conn_settings_s {
      * When the peer sends PATHS_BLOCKED, the local endpoint MAY grant
      * additional path-id credit by emitting a MAX_PATH_ID frame. Granting
      * is permissive per spec ("can" in §2.1 / §4.6), so default 0 means
-     * grant is disabled (initial_max_path_id is never grown). Operators
+     * PATHS_BLOCKED auto-grant is disabled. Operators
      * that want auto-grant set this to the desired hard cap (typically
      * <= 2^32-1); each grant is sized by XQC_MAX_PATH_ID_GRANT_INCREMENT
      * (default 8) and rate-limited to one grant per PTO. Append-only
      * field — zero-initialized for ABI-compat with pre-L2 consumers.
+     *
+     * Also bounds how far a received MAX_PATH_ID raises the local limit
+     * in return (reciprocal grant); when 0, that bound is
+     * XQC_MAX_PATH_ID_MIRROR_DEFAULT (128).
      */
     uint64_t                    max_path_id_grant_max_value;
 
@@ -1930,6 +1986,11 @@ typedef struct xqc_conn_stats_s {
 
     /**
      * Active path metrics. Dynamically allocated by xquic.
+     *
+     * One entry per path in the ACTIVE, CLOSING or CLOSED state: first the
+     * paths that are not CLOSED, in the order they were created, then the
+     * CLOSED ones, in the order they reached CLOSED. Once a path has
+     * closed, the entries are no longer in creation order.
      *
      * Ownership: xquic allocates the buffer; caller MUST free() (libc free,
      * not xqc_free) the paths_info pointer after use to avoid leaking. On

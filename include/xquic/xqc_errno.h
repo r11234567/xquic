@@ -177,7 +177,7 @@ typedef enum {
      * other by a caller comparing error codes. Numbered here at the end of the
      * block instead of renumbering the codes above it, which are upstream
      * values that applications compare against. */
-    XQC_EAEAD_LIMIT = 644, /**< AEAD confidentiality or integrity limit */
+    XQC_EAEAD_LIMIT                     = 644,      /**< AEAD integrity limit reached per RFC 9001 §6.6 */
 
     XQC_EMP_NOT_SUPPORT_MP = 650,   /**< Multipath - don't support multipath */
     XQC_EMP_NO_AVAIL_PATH_ID = 651, /**< Multipath - no available path id */

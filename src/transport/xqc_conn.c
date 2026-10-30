@@ -58,7 +58,7 @@ xqc_conn_settings_t internal_default_conn_settings = {
     .anti_amplification_limit = XQC_DEFAULT_ANTI_AMPLIFICATION_LIMIT,
     .keyupdate_pkt_threshold = 0,
     .max_pkt_out_size = XQC_PACKET_OUT_SIZE,
-    .probing_pkt_out_size = XQC_MAX_PACKET_OUT_SIZE,
+    .probing_pkt_out_size = XQC_QUIC_MAX_MSS,
     .max_datagram_frame_size = 0,
     .mp_enable_reinjection = 0,
     .mp_ack_on_any_path = 0,
@@ -190,6 +190,8 @@ xqc_server_set_conn_settings(xqc_engine_t *engine, const xqc_conn_settings_t *se
     engine->default_conn_settings.ping_on = settings->ping_on;
     engine->default_conn_settings.so_sndbuf = settings->so_sndbuf;
     engine->default_conn_settings.sndq_packets_used_max = settings->sndq_packets_used_max;
+    engine->default_conn_settings.max_stream_unsent_packets =
+        settings->max_stream_unsent_packets;
     engine->default_conn_settings.max_stream_frame_buffered_cnt =
         settings->max_stream_frame_buffered_cnt;
     engine->default_conn_settings.linger = settings->linger;
@@ -871,8 +873,43 @@ xqc_conn_create(xqc_engine_t *engine, xqc_cid_t *dcid, xqc_cid_t *scid,
 
     xc = xqc_pcalloc(pool, sizeof(xqc_connection_t));
     if (xc == NULL) {
-        goto fail;
+        xqc_destroy_pool(pool);
+        return NULL;
     }
+
+    /* Every failure below ends in xqc_conn_destroy(): set up what it walks
+     * and dereferences before anything else can fail. */
+    xc->conn_pool = pool;
+    xc->engine = engine;
+    xc->log = xqc_log_init(engine->log->log_level, engine->log->log_event,
+                           engine->log->qlog_importance, engine->log->log_timestamp,
+                           engine->log->log_level_name, engine,
+                           engine->log->log_callbacks, engine->log->user_data);
+    if (xc->log == NULL) {
+        xqc_destroy_pool(pool);
+        return NULL;
+    }
+    xc->log->scid = xc->scid_set.original_scid_str;
+
+    xqc_init_list_head(&xc->conn_paths_list);
+    xqc_init_list_head(&xc->conn_write_streams);
+    xqc_init_list_head(&xc->conn_read_streams);
+    xqc_init_list_head(&xc->conn_closing_streams);
+    xqc_init_list_head(&xc->conn_all_streams);
+    xqc_init_list_head(&xc->initial_crypto_data_list);
+    xqc_init_list_head(&xc->hsk_crypto_data_list);
+    xqc_init_list_head(&xc->application_crypto_data_list);
+    for (xqc_encrypt_level_t encrypt_level = XQC_ENC_LEV_INIT;
+         encrypt_level < XQC_ENC_LEV_MAX; encrypt_level++) {
+        xqc_init_list_head(&xc->undecrypt_packet_in[encrypt_level]);
+    }
+    xqc_init_list_head(&xc->dgram_0rtt_buffer_list);
+    xqc_init_list_head(&xc->ping_notification_list);
+    xqc_init_list_head(&xc->conn_timer_manager.gp_timer_list);
+
+    /* Every failure below ends in xqc_conn_destroy(), which walks
+     * conn_closed_paths_list. */
+    xqc_init_list_head(&xc->conn_closed_paths_list);
 
     xc->conn_settings = *settings;
 
@@ -1091,8 +1128,6 @@ xqc_conn_create(xqc_engine_t *engine, xqc_cid_t *dcid, xqc_cid_t *scid,
     xqc_conn_init_flow_ctl(xc);
     xqc_conn_init_key_update_ctx(xc);
 
-    xc->conn_pool = pool;
-
     xqc_init_cid_set(&xc->dcid_set);
     xqc_init_cid_set(&xc->scid_set);
 
@@ -1137,12 +1172,6 @@ xqc_conn_create(xqc_engine_t *engine, xqc_cid_t *dcid, xqc_cid_t *scid,
                                        scid->cid_seq_num);
     xqc_cid_copy(&(xc->initial_scid), scid);
 
-    xc->engine = engine;
-    xc->log = xqc_log_init(engine->log->log_level, engine->log->log_event,
-                           engine->log->qlog_importance, engine->log->log_timestamp,
-                           engine->log->log_level_name, engine,
-                           engine->log->log_callbacks, engine->log->user_data);
-    xc->log->scid = xc->scid_set.original_scid_str;
     xc->transport_cbs = engine->transport_cbs;
     xc->user_data = user_data;
     xc->conn_type = type;
@@ -1157,22 +1186,9 @@ xqc_conn_create(xqc_engine_t *engine, xqc_cid_t *dcid, xqc_cid_t *scid,
     xc->max_stream_id_bidi_remote = -1;
     xc->max_stream_id_uni_remote = -1;
     xc->last_dgram = NULL;
-    xc->pkt_out_size_base =
+    xc->pkt_out_size =
         xqc_min(xc->conn_settings.max_pkt_out_size,
                 xc->conn_settings.max_udp_payload_size - XQC_PACKET_OUT_EXT_SPACE);
-    /* conn_settings.max_pkt_out_size is where the search starts, not where it
-     * may end: PMTUD climbs from it toward probing_pkt_out_size. The ceiling is
-     * therefore the probing size, bounded by what a packet buffer holds. */
-    xc->pkt_out_size_limit =
-        xqc_min(xc->conn_settings.probing_pkt_out_size, XQC_MAX_PACKET_OUT_SIZE);
-    xc->pkt_out_size_limit =
-        xqc_min(xc->pkt_out_size_limit,
-                xc->conn_settings.max_udp_payload_size - XQC_PACKET_OUT_EXT_SPACE);
-    /* A probing size configured below the starting size would otherwise put the
-     * ceiling under the floor and make the application's own setting
-     * unreachable. */
-    xc->pkt_out_size_limit = xqc_max(xc->pkt_out_size_limit, xc->pkt_out_size_base);
-    xc->pkt_out_size = xc->pkt_out_size_base;
     xc->max_pkt_out_size = xc->conn_settings.probing_pkt_out_size;
     xc->probing_pkt_out_size = xc->conn_settings.probing_pkt_out_size;
     xc->probing_cnt = 0;
@@ -1211,18 +1227,6 @@ xqc_conn_create(xqc_engine_t *engine, xqc_cid_t *dcid, xqc_cid_t *scid,
         }
     }
 
-    xqc_init_list_head(&xc->conn_write_streams);
-    xqc_init_list_head(&xc->conn_read_streams);
-    xqc_init_list_head(&xc->conn_closing_streams);
-    xqc_init_list_head(&xc->conn_all_streams);
-
-    xqc_init_list_head(&xc->initial_crypto_data_list);
-    xqc_init_list_head(&xc->hsk_crypto_data_list);
-    xqc_init_list_head(&xc->application_crypto_data_list);
-    for (xqc_encrypt_level_t encrypt_level = XQC_ENC_LEV_INIT;
-         encrypt_level < XQC_ENC_LEV_MAX; encrypt_level++) {
-        xqc_init_list_head(&xc->undecrypt_packet_in[encrypt_level]);
-    }
     xc->crypto_data_total_len = 0;
 
     /* create streams_hash */
@@ -1291,8 +1295,6 @@ xqc_conn_create(xqc_engine_t *engine, xqc_cid_t *dcid, xqc_cid_t *scid,
 
     /* for datagram */
     xc->next_dgram_id = 0;
-    xqc_init_list_head(&xc->dgram_0rtt_buffer_list);
-    xqc_init_list_head(&xc->ping_notification_list);
 
     xqc_log(xc->log, XQC_LOG_DEBUG, "|success|scid:%s|dcid:%s|conn:%p|",
             xqc_scid_str(engine, &xc->scid_set.user_scid),
@@ -1850,7 +1852,9 @@ xqc_conn_destroy(xqc_connection_t *xc)
     /* destroy gp_timer list */
     xqc_timer_destroy_gp_timer_list(&xc->conn_timer_manager);
 
-    xqc_send_queue_destroy(xc->conn_send_queue);
+    if (xc->conn_send_queue) {
+        xqc_send_queue_destroy(xc->conn_send_queue);
+    }
 #ifdef XQC_ENABLE_FEC
     if (xc->fec_ctl) {
         xqc_fec_ctl_destroy(xc->fec_ctl);
@@ -2116,98 +2120,474 @@ xqc_conn_try_to_update_mss(xqc_connection_t *conn)
 {
     xqc_path_ctx_t *path;
     xqc_list_head_t *pos, *next;
-    size_t confirmed_pkt_out_size = 0;
-    size_t bounded_pkt_out_size = 0;
+    size_t min_pkt_out_size = 0;
     size_t max_pkt_out_size = 0;
-    size_t new_pkt_out_size;
 
-    /* One size is used to build every packet, and any packet may be scheduled
-     * onto any path, so that size has to be one every live path carries. Two
-     * separate minima say what the paths know:
-     *
-     *   confirmed -- the least any path has had *acked*. This is what lets the
-     *     size rise: once every path has confirmed a larger size, the
-     *     connection can use it. It cannot lower the connection on its own,
-     *     because a path that has not probed yet has confirmed only the base
-     *     and that is an absence of evidence, not a limit.
-     *
-     *   bounded -- the least among paths whose search has *excluded* larger
-     *     sizes. This is evidence, so it does lower the connection.
-     *
-     * Absent either, the size stays at what the application asked for, which
-     * is also the whole behaviour when the peer does not negotiate PMTUD.
-     */
+    /* try to update conn MTU */
     xqc_list_for_each_safe(pos, next, &conn->conn_paths_list)
     {
         path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
 
-        if (path->path_state >= XQC_PATH_STATE_CLOSING) {
+        /* only paths that carry data: a path still being validated sends
+         * nothing but PATH_CHALLENGE and PATH_RESPONSE, at 1200 bytes, and
+         * brings the size down once validated (xqc_conn_pmtud_on_new_path).
+         * Counting it here would hold the connection at its starting size
+         * for as long as it does not validate. */
+        if (path->path_state != XQC_PATH_STATE_ACTIVE) {
             continue;
         }
 
-        /* The probing ceiling is the largest size any live path might still
-         * reach, so it is a maximum over paths. It used to be captured inside
-         * the branch that tracked the minimum, which took it from whichever
-         * path held the *smallest* packet size and so stalled the search on
-         * every other path. */
-        if (path->path_max_pkt_out_size > max_pkt_out_size) {
+        if (min_pkt_out_size == 0 || path->curr_pkt_out_size < min_pkt_out_size) {
+            min_pkt_out_size = path->curr_pkt_out_size;
             max_pkt_out_size = path->path_max_pkt_out_size;
         }
+    }
 
-        if (confirmed_pkt_out_size == 0
-            || path->curr_pkt_out_size < confirmed_pkt_out_size)
-        {
-            confirmed_pkt_out_size = path->curr_pkt_out_size;
+    if (min_pkt_out_size > conn->pkt_out_size) {
+        conn->pkt_out_size = min_pkt_out_size;
+        /* try to update PMTUD probing info: binary search, the next probe
+         * halfway between the size that got through and the upper bound */
+        conn->max_pkt_out_size = max_pkt_out_size;
+        conn->probing_pkt_out_size = (min_pkt_out_size + max_pkt_out_size + 1) >> 1;
+        conn->probing_cnt = 0;
+        /* launch new probing immediately */
+        conn->conn_flag |= XQC_CONN_FLAG_PMTUD_PROBING;
+        xqc_timer_unset(&conn->conn_timer_manager, XQC_TIMER_PMTUD_PROBING);
+        /* update datagram mss */
+        xqc_datagram_record_mss(conn);
+    }
+}
+
+/* the data of stream frame @f in @po: skip the type, stream id, offset and
+ * length fields */
+static const unsigned char *
+xqc_conn_stream_frame_data(xqc_packet_out_t *po, xqc_po_stream_frame_t *f)
+{
+    const unsigned char *p = po->po_buf + f->ps_type_offset;
+    unsigned char type = *p++;
+
+    p += xqc_vint_len(*p >> 6);
+    if (type & 0x04) {
+        p += xqc_vint_len(*p >> 6);
+    }
+    if (type & 0x02) {
+        p += xqc_vint_len(*p >> 6);
+    }
+    return p;
+}
+
+/*
+ * Report the DATAGRAM in @po lost, once: its origin is marked done, so
+ * none of its other copies reports it again, or later as acked.
+ */
+static void
+xqc_conn_pmtud_dgram_lost(xqc_connection_t *conn, xqc_packet_out_t *po)
+{
+    xqc_packet_out_t *origin = po->po_origin ? po->po_origin : po;
+
+    xqc_datagram_notify_loss(conn, po);
+    origin->po_acked = 1;
+}
+
+/*
+ * The repairable frames of @po other than STREAM, in a packet of their own
+ * that fits: a copy of @po with its STREAM frames, ACK and padding cut out.
+ * It is not tied to @po as a copy, because @po is marked done once its
+ * stream data is split, and a copy of a done packet is never sent.
+ */
+static xqc_int_t
+xqc_conn_pmtud_rest_packet(xqc_connection_t *conn, xqc_packet_out_t *po)
+{
+    xqc_send_queue_t *sq = conn->conn_send_queue;
+    xqc_packet_out_t *rest = xqc_packet_out_get(sq);
+    xqc_po_stream_frame_t *f;
+    int n = 0;
+
+    if (rest == NULL) {
+        return -XQC_EMALLOC;
+    }
+
+    xqc_packet_out_copy(rest, po);
+    rest->po_origin->po_origin_ref_cnt--;
+    rest->po_origin = NULL;
+    xqc_packet_out_remove_ack_frame(rest);
+    if (rest->po_padding != NULL
+        && rest->po_padding < rest->po_buf + rest->po_used_size)
+    {
+        rest->po_used_size = rest->po_padding - rest->po_buf;
+    }
+    rest->po_padding = NULL;
+
+    /* last first, so the offsets of the earlier ones still hold */
+    for (int i = XQC_MAX_STREAM_FRAME_IN_PO - 1; i >= 0; i--) {
+        f = &rest->po_stream_frames[i];
+        if (!f->ps_is_used || f->ps_is_reset) {
+            continue;
+        }
+        size_t start = f->ps_type_offset;
+        size_t end = (xqc_conn_stream_frame_data(rest, f) - rest->po_buf)
+                     + f->ps_length;
+        if (end > rest->po_used_size) {
+            end = rest->po_used_size;
+        }
+        memmove(rest->po_buf + start, rest->po_buf + end,
+                rest->po_used_size - end);
+        rest->po_used_size -= end - start;
+        for (int j = i + 1; j < XQC_MAX_STREAM_FRAME_IN_PO; j++) {
+            if (rest->po_stream_frames[j].ps_is_used
+                && rest->po_stream_frames[j].ps_type_offset > start)
+            {
+                rest->po_stream_frames[j].ps_type_offset -= end - start;
+                rest->po_stream_frames[j].ps_length_offset -= end - start;
+            }
+        }
+        f->ps_is_used = 0;
+    }
+
+    /* the RESET_STREAM entries stay, packed at the front */
+    for (int i = 0; i < XQC_MAX_STREAM_FRAME_IN_PO; i++) {
+        if (rest->po_stream_frames[i].ps_is_used) {
+            rest->po_stream_frames[n++] = rest->po_stream_frames[i];
+        }
+    }
+    for (int i = n; i < XQC_MAX_STREAM_FRAME_IN_PO; i++) {
+        memset(&rest->po_stream_frames[i], 0, sizeof(xqc_po_stream_frame_t));
+    }
+    rest->po_frame_types &= ~(XQC_FRAME_BIT_STREAM | XQC_FRAME_BIT_PADDING);
+
+    if (!XQC_NEED_REPAIR(rest->po_frame_types)) {
+        /* xqc_packet_out_get did not count it, insert_free uncounts it */
+        sq->sndq_packets_used++;
+        xqc_send_queue_insert_free(rest, &sq->sndq_free_packets, sq);
+        return XQC_OK;
+    }
+
+    xqc_send_queue_insert_lost(&rest->po_list, &sq->sndq_lost_packets);
+    sq->sndq_packets_used++;
+    xqc_log(conn->log, XQC_LOG_DEBUG, "|PMTUD|lost packet rest|pkt_num:%ui|size:%ud|frame:%s|",
+            po->po_pkt.pkt_num, rest->po_used_size,
+            xqc_frame_type_2_str(conn->engine, rest->po_frame_types));
+    return XQC_OK;
+}
+
+/*
+ * PMTUD shrank the packet size after @po was sent, so a copy of the lost
+ * @po would not fit any more: write its stream data into new packets of
+ * the current size instead, and its other repairable frames into one more
+ * (xqc_conn_pmtud_rest_packet). Not for packets with a DATAGRAM, which is
+ * not resent. The new packets take the stream refs before @po gives its
+ * own back, and @po is marked acked so that none of its other copies
+ * counts them again. XQC_OK if @po can be dropped.
+ */
+xqc_int_t
+xqc_conn_pmtud_split_lost(xqc_connection_t *conn, xqc_packet_out_t *po)
+{
+    xqc_packet_out_t *origin = po->po_origin ? po->po_origin : po;
+    xqc_frame_type_bit_t allowed = XQC_FRAME_BIT_STREAM | XQC_FRAME_BIT_ACK
+        | XQC_FRAME_BIT_ACK_MP | XQC_FRAME_BIT_PING | XQC_FRAME_BIT_PADDING;
+
+    /* built at a larger size (po_buf_size), and does not fit the current one */
+    if (!conn->enable_pmtud
+        || po->po_buf_size <= conn->pkt_out_size
+        || po->po_used_size <= conn->pkt_out_size
+        || po->po_pkt.pkt_type != XQC_PTYPE_SHORT_HEADER
+        || (po->po_frame_types & XQC_FRAME_BIT_DATAGRAM)
+        || !XQC_NEED_REPAIR(po->po_frame_types))
+    {
+        return -XQC_EPARAM;
+    }
+
+    if (po->po_frame_types & ~allowed) {
+        xqc_int_t ret = xqc_conn_pmtud_rest_packet(conn, po);
+        if (ret != XQC_OK) {
+            return ret;
+        }
+    }
+
+    for (int i = 0; i < XQC_MAX_STREAM_FRAME_IN_PO; i++) {
+        xqc_po_stream_frame_t *f = &po->po_stream_frames[i];
+        const unsigned char *data;
+        uint64_t offset;
+        size_t left, written;
+
+        if (!f->ps_is_used) {
+            break;
+        }
+        /* a RESET_STREAM, carried by the rest packet */
+        if (f->ps_is_reset) {
+            continue;
+        }
+        if (xqc_find_stream_by_id(f->ps_stream_id, conn->streams_hash) == NULL) {
+            continue; /* the stream is gone, its data with it */
         }
 
-        if (path->path_pmtu_bounded
-            && (bounded_pkt_out_size == 0
-                || path->curr_pkt_out_size < bounded_pkt_out_size))
-        {
-            bounded_pkt_out_size = path->curr_pkt_out_size;
+        data = xqc_conn_stream_frame_data(po, f);
+        offset = f->ps_offset;
+        left = f->ps_length;
+        do {
+            xqc_packet_out_t *npo = xqc_write_new_packet(conn, XQC_PTYPE_SHORT_HEADER);
+            int n;
+
+            if (npo == NULL) {
+                return -XQC_EWRITE_PKT;
+            }
+            n = xqc_gen_stream_frame(npo, f->ps_stream_id, offset, f->ps_has_fin,
+                                     data, left, &written);
+            if (n < 0) {
+                xqc_maybe_recycle_packet_out(npo, conn);
+                return n;
+            }
+            npo->po_used_size += n;
+            npo->po_stream_id = f->ps_stream_id;
+            npo->po_stream_offset = offset + written;
+            xqc_conn_increase_unacked_stream_ref(conn, npo);
+
+            /* sent ahead of new data, as a retransmission */
+            xqc_send_queue_remove_send(&npo->po_list);
+            xqc_send_queue_insert_lost(&npo->po_list,
+                                       &conn->conn_send_queue->sndq_lost_packets);
+
+            data += written;
+            offset += written;
+            left -= written;
+        } while (left > 0);
+    }
+
+    xqc_conn_decrease_unacked_stream_ref(conn, po);
+    origin->po_acked = 1;
+    xqc_log(conn->log, XQC_LOG_DEBUG, "|PMTUD|split lost packet|pkt_num:%ui|size:%uz|to:%uz|",
+            po->po_pkt.pkt_num, po->po_buf_size, conn->pkt_out_size);
+    return XQC_OK;
+}
+
+/*
+ * @po is about to be sent, but was built before a PMTUD black hole brought
+ * the packet size down: it would be lost, and a pacing congestion
+ * controller can take seconds to drain such a backlog. A DATAGRAM packet
+ * cannot be split, so drop it as the path would; write the data of a
+ * STREAM packet into packets that fit. XQC_TRUE if @po is gone.
+ */
+xqc_bool_t
+xqc_conn_pmtud_drop_oversize(xqc_connection_t *conn, xqc_packet_out_t *po)
+{
+    xqc_frame_type_bit_t dgram = XQC_PMTUD_DGRAM_ONLY;
+    xqc_path_ctx_t *path;
+
+    if (!conn->enable_pmtud
+        || po->po_buf_size <= conn->pkt_out_size
+        || po->po_used_size <= conn->pkt_out_size
+        || (po->po_flag & XQC_POF_PMTUD_PROBING)
+        || po->po_pkt.pkt_type != XQC_PTYPE_SHORT_HEADER)
+    {
+        return XQC_FALSE;
+    }
+
+    if (po->po_acked || (po->po_origin && po->po_origin->po_acked)) {
+        /* a copy of a packet already acked or reported lost: just drop it */
+
+    } else if ((po->po_frame_types & XQC_FRAME_BIT_DATAGRAM)
+               && !(po->po_frame_types & ~dgram))
+    {
+        xqc_conn_pmtud_dgram_lost(conn, po);
+
+    } else if (xqc_conn_pmtud_split_lost(conn, po) != XQC_OK) {
+        return XQC_FALSE;
+    }
+
+    xqc_log(conn->log, XQC_LOG_DEBUG, "|PMTUD|oversize packet not sent|pn:%ui|copy:%d|refs:%ud|flag:%ud|inbuf:%d|size:%uz|used:%ud|to:%uz|frame:%s|",
+            po->po_pkt.pkt_num, po->po_origin != NULL, po->po_origin_ref_cnt, po->po_flag,
+            !!(po->po_flag & XQC_POF_IN_PATH_BUF_LIST),
+            po->po_buf_size, po->po_used_size, conn->pkt_out_size,
+            xqc_frame_type_2_str(conn->engine, po->po_frame_types));
+    path = xqc_conn_find_path_by_path_id(conn, po->po_path_id);
+    xqc_send_queue_maybe_remove_unacked(po, conn->conn_send_queue, path);
+    return XQC_TRUE;
+}
+
+/*
+ * After a black hole, the packets queued but not sent yet that do not fit
+ * the new size: drop or split them all now. Left to the send loop, they
+ * would go one congestion window per tick, and with a pacing congestion
+ * controller the backlog at the old size can be thousands of packets, in
+ * front of everything new.
+ */
+static void
+xqc_conn_pmtud_drop_unsent(xqc_connection_t *conn)
+{
+    xqc_send_queue_t *sq = conn->conn_send_queue;
+    xqc_list_head_t *lists[] = {
+        &sq->sndq_send_packets, &sq->sndq_send_packets_high_pri,
+        &sq->sndq_send_packets_urgent, &sq->sndq_lost_packets,
+    };
+    xqc_list_head_t *pos, *next, *ppos, *pnext;
+    xqc_path_ctx_t *path;
+    xqc_packet_out_t *po;
+
+    for (size_t i = 0; i < sizeof(lists) / sizeof(lists[0]); i++) {
+        xqc_list_for_each_safe(pos, next, lists[i]) {
+            po = xqc_list_entry(pos, xqc_packet_out_t, po_list);
+            xqc_conn_pmtud_drop_oversize(conn, po);
         }
     }
 
-    new_pkt_out_size = conn->pkt_out_size_base;
-
-    if (confirmed_pkt_out_size > new_pkt_out_size) {
-        new_pkt_out_size = confirmed_pkt_out_size;
+    xqc_list_for_each_safe(ppos, pnext, &conn->conn_paths_list) {
+        path = xqc_list_entry(ppos, xqc_path_ctx_t, path_list);
+        for (int t = 0; t < XQC_SEND_TYPE_N; t++) {
+            xqc_list_for_each_safe(pos, next, &path->path_schedule_buf[t]) {
+                po = xqc_list_entry(pos, xqc_packet_out_t, po_list);
+                xqc_conn_pmtud_drop_oversize(conn, po);
+            }
+        }
     }
+}
 
-    if (bounded_pkt_out_size != 0 && bounded_pkt_out_size < new_pkt_out_size) {
-        new_pkt_out_size = bounded_pkt_out_size;
+/*
+ * After a black hole on @path, the packets in flight there that do not fit
+ * the new size will never arrive. Nothing marks them lost either: that
+ * needs a later packet acked, and new packets wait behind them in the
+ * congestion window, while the PTO resends them at the size that fails.
+ * Take them out of flight now: report lost datagrams, and resend the data
+ * of the others in packets that fit.
+ */
+static void
+xqc_conn_pmtud_drop_inflight(xqc_connection_t *conn, xqc_path_ctx_t *path)
+{
+    xqc_send_queue_t *sq = conn->conn_send_queue;
+    xqc_list_head_t *pos, *next;
+    xqc_packet_out_t *po;
+
+    xqc_list_for_each_safe(pos, next, &sq->sndq_unacked_packets[XQC_PNS_APP_DATA]) {
+        po = xqc_list_entry(pos, xqc_packet_out_t, po_list);
+
+        if (po->po_path_id != path->path_id
+            || !(po->po_flag & XQC_POF_IN_FLIGHT)
+            || po->po_used_size <= conn->pkt_out_size
+            || po->po_acked || (po->po_origin && po->po_origin->po_acked))
+        {
+            continue;
+        }
+
+        xqc_send_ctl_decrease_inflight(conn, po);
+        if (po->po_flag & XQC_POF_PMTUD_PROBING) {
+            xqc_send_queue_remove_unacked(po, sq);
+            xqc_send_queue_insert_free(po, &sq->sndq_free_packets, sq);
+
+        } else if ((po->po_frame_types & XQC_FRAME_BIT_DATAGRAM)
+                   && !(po->po_frame_types & ~XQC_PMTUD_DGRAM_ONLY))
+        {
+            /* a packet with only a DATAGRAM (and ACK, PING, PADDING):
+             * nothing in it is resent, report it lost */
+            xqc_conn_pmtud_dgram_lost(conn, po);
+            xqc_send_queue_maybe_remove_unacked(po, sq, NULL);
+
+        } else if (xqc_conn_pmtud_split_lost(conn, po) == XQC_OK) {
+            xqc_send_queue_maybe_remove_unacked(po, sq, NULL);
+
+        } else if (XQC_NEED_REPAIR(po->po_frame_types)) {
+            xqc_send_queue_copy_to_lost(po, sq, XQC_TRUE);
+        }
     }
+}
 
-    /* Never above what the peer and the buffer allow, never below the size
-     * QUIC requires every path to carry. */
-    new_pkt_out_size = xqc_min(new_pkt_out_size, conn->pkt_out_size_limit);
-    new_pkt_out_size = xqc_max(new_pkt_out_size, XQC_PACKET_OUT_SIZE);
-
-    if (max_pkt_out_size < new_pkt_out_size) {
-        max_pkt_out_size = new_pkt_out_size;
-    }
-
-    if (new_pkt_out_size == conn->pkt_out_size) {
+/*
+ * @path is validated and starts at the base size: until a probe shows it
+ * carries more, the connection sends at that size, and searches the whole
+ * range again. Queued packets built at the old size are dropped or split
+ * as after a black hole, since any of them could go to the new path.
+ */
+void
+xqc_conn_pmtud_on_new_path(xqc_connection_t *conn, xqc_path_ctx_t *path)
+{
+    if (path->curr_pkt_out_size >= conn->pkt_out_size) {
         return;
     }
 
-    xqc_log(conn->log, XQC_LOG_INFO,
-            "|PMTU|conn pkt_out_size:%uz->%uz|probing_ceiling:%uz|",
-            conn->pkt_out_size, new_pkt_out_size, max_pkt_out_size);
+    xqc_log(conn->log, XQC_LOG_INFO, "|PMTUD|new path|path:%ui|size:%uz|was:%uz|",
+            path->path_id, path->curr_pkt_out_size, conn->pkt_out_size);
 
-    conn->pkt_out_size = new_pkt_out_size;
-    /* try to update PMTUD probing info */
-    conn->max_pkt_out_size = max_pkt_out_size;
-    conn->probing_pkt_out_size = max_pkt_out_size;
+    conn->pkt_out_size = path->curr_pkt_out_size;
+    conn->max_pkt_out_size = conn->conn_settings.probing_pkt_out_size;
+    conn->probing_pkt_out_size = (conn->pkt_out_size + conn->max_pkt_out_size) >> 1;
     conn->probing_cnt = 0;
-    /* launch new probing immediately */
     conn->conn_flag |= XQC_CONN_FLAG_PMTUD_PROBING;
-    /* An event-driven reopen, not the raise timer: the round this arms must not
-     * also lift every other path's ceiling. */
-    conn->pmtu_search_converged = XQC_FALSE;
     xqc_timer_unset(&conn->conn_timer_manager, XQC_TIMER_PMTUD_PROBING);
-    /* update datagram mss */
     xqc_datagram_record_mss(conn);
+    xqc_conn_pmtud_drop_unsent(conn);
+}
+
+/*
+ * Packets above the base size no longer get through @path: go back to the
+ * base size on it, so the connection sends what every path carries, and
+ * search again from there, below the size that failed.
+ */
+void
+xqc_conn_pmtud_on_blackhole(xqc_connection_t *conn, xqc_path_ctx_t *path,
+    const char *reason)
+{
+    xqc_path_ctx_t *p;
+    xqc_list_head_t *pos, *next;
+    size_t failed = path->curr_pkt_out_size;
+    size_t back_to = xqc_pmtud_big_size(conn, failed);
+    size_t min_pkt_out_size = 0;
+
+    if (failed <= back_to) {
+        /* already at the floor: nothing lower to go to */
+        xqc_send_ctl_pmtud_bh_reset(path->path_send_ctl);
+        return;
+    }
+
+    xqc_log(conn->log, XQC_LOG_WARN, "|PMTUD black hole|path:%ui|size:%uz|back to:%uz|"
+            "reason:%s|big_lost:%ud|probes:%ud/%ud|pto:%ud|srtt:%ui|",
+            path->path_id, failed, back_to, reason,
+            path->path_send_ctl->ctl_big_lost_cnt, path->path_send_ctl->ctl_bh_probes_lost,
+            path->path_send_ctl->ctl_bh_probes_sent, path->path_send_ctl->ctl_pto_count,
+            path->path_send_ctl->ctl_srtt);
+
+    path->curr_pkt_out_size = back_to;
+    xqc_send_ctl_pmtud_bh_reset(path->path_send_ctl);
+    conn->pmtud_blackhole_time = xqc_monotonic_timestamp();
+
+    xqc_list_for_each_safe(pos, next, &conn->conn_paths_list) {
+        p = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
+        if (p->path_state >= XQC_PATH_STATE_CLOSING) {
+            continue;
+        }
+        if (min_pkt_out_size == 0 || p->curr_pkt_out_size < min_pkt_out_size) {
+            min_pkt_out_size = p->curr_pkt_out_size;
+        }
+    }
+    if (min_pkt_out_size == 0 || min_pkt_out_size >= conn->pkt_out_size) {
+        /* another path is smaller still: the connection already sends at
+         * that size, keep the search below what failed here */
+        if (failed - 1 < conn->max_pkt_out_size) {
+            conn->max_pkt_out_size = xqc_max(failed - 1, conn->pkt_out_size);
+        }
+        /* and no probe above the new upper bound */
+        if (conn->probing_pkt_out_size > conn->max_pkt_out_size) {
+            conn->probing_pkt_out_size =
+                (conn->pkt_out_size + conn->max_pkt_out_size) >> 1;
+            conn->probing_cnt = 0;
+        }
+        return;
+    }
+
+    conn->pkt_out_size = min_pkt_out_size;
+    conn->max_pkt_out_size = failed - 1;
+    conn->probing_pkt_out_size = (conn->pkt_out_size + conn->max_pkt_out_size) >> 1;
+    conn->probing_cnt = 0;
+    conn->conn_flag |= XQC_CONN_FLAG_PMTUD_PROBING;
+    xqc_timer_unset(&conn->conn_timer_manager, XQC_TIMER_PMTUD_PROBING);
+    xqc_datagram_record_mss(conn);
+
+    xqc_conn_pmtud_drop_inflight(conn, path);
+    xqc_conn_pmtud_drop_unsent(conn);
+
+    /* a small ack-eliciting packet, so ACKs flow again on this path */
+    if (xqc_path_send_ping_to_probe(path, XQC_PNS_APP_DATA,
+                                    XQC_PATH_SPECIFIED_BY_PTMUD) != XQC_OK)
+    {
+        xqc_log(conn->log, XQC_LOG_ERROR, "|PMTUD black hole|ping failed|");
+    }
 }
 
 
@@ -2237,7 +2617,7 @@ xqc_conn_set_path_pmtu(xqc_connection_t *conn, uint64_t path_id,
     /* Never below what QUIC requires every path to carry: a first hop claiming
      * less than that is not something the connection can honour by shrinking. */
     reported = xqc_max(udp_payload_size, (size_t)XQC_PACKET_OUT_SIZE);
-    reported = xqc_min(reported, conn->pkt_out_size_limit);
+    reported = xqc_min(reported, conn->conn_settings.max_pkt_out_size);
 
     /* Lowers only. The caller's source is the local route cache, which knows
      * the first hop and assumes the rest; it is grounds for excluding larger
@@ -2252,20 +2632,20 @@ xqc_conn_set_path_pmtu(xqc_connection_t *conn, uint64_t path_id,
             path_id, reported, path->curr_pkt_out_size,
             path->path_max_pkt_out_size);
 
-    /* Treated exactly as a probe failure would be: everything above `reported`
-     * is excluded, and `reported` itself becomes the next size to confirm. If
-     * the report was pessimistic the probe at it is acked and the path settles
-     * there; if it was optimistic the existing 3-strike bisect walks down. */
     path->path_max_pkt_out_size = reported;
     path->curr_pkt_out_size = xqc_min(path->curr_pkt_out_size, reported);
-    path->path_probing_pkt_out_size = reported;
-    path->path_probing_cnt = 0;
-    path->path_pmtu_bounded = XQC_TRUE;
 
     /* Arming the search needs PMTUD actually negotiated. The size reduction
      * above does not: it is the whole value of this call when the peer
      * declined PMTUD, and it is what stops the black hole. */
     if (conn->enable_pmtud) {
+        if (conn->max_pkt_out_size > reported) {
+            conn->max_pkt_out_size = xqc_max(reported, conn->pkt_out_size);
+        }
+        if (conn->probing_pkt_out_size > conn->max_pkt_out_size) {
+            conn->probing_pkt_out_size = (conn->pkt_out_size + conn->max_pkt_out_size) >> 1;
+            conn->probing_cnt = 0;
+        }
         conn->conn_flag |= XQC_CONN_FLAG_PMTUD_PROBING;
         xqc_timer_unset(&conn->conn_timer_manager, XQC_TIMER_PMTUD_PROBING);
     }
@@ -2274,7 +2654,6 @@ xqc_conn_set_path_pmtu(xqc_connection_t *conn, uint64_t path_id,
 
     return XQC_OK;
 }
-
 
 ssize_t
 xqc_send_burst(xqc_connection_t *conn, xqc_path_ctx_t *path, struct iovec *iov, int cnt)
@@ -2350,6 +2729,10 @@ xqc_check_acked_or_dropped_pkt(xqc_connection_t *conn, xqc_packet_out_t *packet_
                                xqc_send_type_t send_type)
 {
     if (xqc_send_ctl_indirectly_ack_or_drop_po(conn, packet_out)) {
+        return XQC_TRUE;
+    }
+
+    if (xqc_conn_pmtud_drop_oversize(conn, packet_out)) {
         return XQC_TRUE;
     }
 
@@ -3605,6 +3988,12 @@ xqc_path_send_one_or_two_ack_elicit_pkts(xqc_path_ctx_t *path, xqc_pkt_num_space
             continue;
         }
 
+        /* PMTUD: no copy larger than this path is known to carry, which a
+         * path not yet validated is not */
+        if (c->enable_pmtud && packet_out->po_used_size > path->curr_pkt_out_size) {
+            continue;
+        }
+
         if (XQC_IS_ACK_ELICITING(packet_out->po_frame_types) &&
             (XQC_NEED_REPAIR(packet_out->po_frame_types) ||
              (packet_out->po_flag & XQC_POF_NOTIFY) ||
@@ -4091,7 +4480,6 @@ xqc_conn_info_print(xqc_connection_t *conn, xqc_conn_stats_t *conn_stats)
     size_t curr_size = 0;
     int ret = 0;
     int i = 0;
-    xqc_list_head_t *pos, *next;
     xqc_path_ctx_t *path = NULL;
     xqc_path_info_t path_info;
     char mp_settings[XQC_MP_SETTINGS_STR_LEN] = {0};
@@ -4163,10 +4551,9 @@ xqc_conn_info_print(xqc_connection_t *conn, xqc_conn_stats_t *conn_stats)
     }
 
     /* path layer 自定义 */
-    xqc_list_for_each_safe(pos, next, &conn->conn_paths_list)
+    for (path = xqc_conn_all_paths_first(conn); path != NULL;
+         path = xqc_conn_all_paths_next(conn, path))
     {
-        path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
-
         xqc_path_record_info(path, &path_info);
 
         sock_err_flag = (path->path_flag & XQC_PATH_FLAG_SOCKET_ERROR) != 0;
@@ -4272,17 +4659,11 @@ xqc_conn_get_stats_internal(xqc_connection_t *conn, xqc_conn_stats_t *conn_stats
 
 
     /* 3. 遍历路径，获取各个路径count加和 */
-    xqc_list_head_t *pos, *next;
     xqc_path_ctx_t *path = NULL;
     xqc_send_ctl_t *send_ctl;
-    xqc_list_for_each_safe(pos, next, &conn->conn_paths_list)
+    for (path = xqc_conn_all_paths_first(conn); path != NULL;
+         path = xqc_conn_all_paths_next(conn, path))
     {
-        path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
-        if (path == NULL) {
-            xqc_log(conn->log, XQC_LOG_WARN, "|path NULL|");
-            continue;
-        }
-
         send_ctl = path->path_send_ctl;
         if (send_ctl == NULL) {
             xqc_log(conn->log, XQC_LOG_WARN, "|path_send_ctl NULL|path%ui|",
@@ -4338,6 +4719,58 @@ xqc_conn_set_dgram_flow_hash(xqc_connection_t *conn, uint32_t flow_hash)
     conn->next_dgram_flow_hash = flow_hash;
 }
 
+xqc_int_t
+xqc_conn_reapply_settings(xqc_connection_t *conn, const xqc_conn_settings_t *settings,
+                          uint32_t fields)
+{
+    if (conn == NULL || settings == NULL || fields == 0
+        || (fields & ~XQC_CONN_REAPPLY_SCHEDULER)
+        || settings->scheduler_callback.xqc_scheduler_size == NULL
+        || settings->scheduler_callback.xqc_scheduler_init == NULL
+        || settings->scheduler_callback.xqc_scheduler_get_path == NULL)
+    {
+        return -XQC_EPARAM;
+    }
+
+    /* datagram redundancy pins rap/minrtt and the dgram reinjection controller */
+    if (conn->create_path_count != 1 || conn->active_path_count > 1
+        || conn->conn_settings.datagram_redundancy != 0)
+    {
+        return -XQC_ESTATE;
+    }
+
+    /* read only the scheduler fields of the caller's settings */
+    xqc_conn_settings_t tmp;
+    xqc_memzero(&tmp, sizeof(tmp));
+    tmp.scheduler_callback = settings->scheduler_callback;
+    tmp.scheduler_params = settings->scheduler_params;
+    xqc_conn_set_default_sched_params(&conn->conn_settings, &tmp);
+
+    if (memcmp(&tmp.scheduler_callback, conn->scheduler_callback,
+               sizeof(tmp.scheduler_callback)) == 0)
+    {
+        conn->conn_settings.scheduler_callback = tmp.scheduler_callback;
+        conn->conn_settings.scheduler_params = tmp.scheduler_params;
+        conn->scheduler_callback = &conn->conn_settings.scheduler_callback;
+        return XQC_OK;
+    }
+
+    void *state = xqc_pcalloc(conn->conn_pool, tmp.scheduler_callback.xqc_scheduler_size());
+    if (state == NULL) {
+        return -XQC_EMALLOC;
+    }
+
+    conn->conn_settings.scheduler_callback = tmp.scheduler_callback;
+    conn->conn_settings.scheduler_params = tmp.scheduler_params;
+    conn->scheduler_callback = &conn->conn_settings.scheduler_callback;
+    /* the old state block stays in conn_pool until the connection is destroyed */
+    conn->scheduler = state;
+    conn->scheduler_callback->xqc_scheduler_init(conn->scheduler, conn->log,
+                                                 &conn->conn_settings.scheduler_params);
+    xqc_log(conn->log, XQC_LOG_INFO, "|reapply scheduler|");
+    return XQC_OK;
+}
+
 xqc_conn_qos_stats_t
 xqc_conn_get_qos_stats(xqc_engine_t *engine, const xqc_cid_t *cid)
 {
@@ -4365,16 +4798,11 @@ xqc_conn_get_qos_stats(xqc_engine_t *engine, const xqc_cid_t *cid)
         }
     }
 
-    xqc_list_head_t *pos, *next;
     xqc_path_ctx_t *path = NULL;
     xqc_send_ctl_t *send_ctl;
-    xqc_list_for_each_safe(pos, next, &conn->conn_paths_list)
+    for (path = xqc_conn_all_paths_first(conn); path != NULL;
+         path = xqc_conn_all_paths_next(conn, path))
     {
-        path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
-        if (path == NULL) {
-            continue;
-        }
-
         send_ctl = path->path_send_ctl;
         if (send_ctl == NULL) {
             continue;
@@ -4924,7 +5352,7 @@ xqc_int_t
 xqc_conn_add_path_cid_sets(xqc_connection_t *conn, uint32_t start, uint32_t end)
 {
     if (conn->enable_multipath) {
-        uint32_t path_id;
+        uint64_t path_id; /* wider than end, so end == UINT32_MAX terminates */
         xqc_int_t ret;
         /* add cid_set_inner for all paths */
         for (path_id = start; path_id <= end; path_id++) {
@@ -5926,7 +6354,6 @@ xqc_conn_destroy_cids(xqc_connection_t *conn)
     xqc_cid_inner_t *cid = NULL;
     xqc_list_head_t *pos, *next;
     xqc_cid_set_inner_t *inner_set = NULL;
-    xqc_list_head_t *pos_set, *next_set;
 
     if (conn->engine->conns_hash) {
         if (xqc_find_conns_hash(conn->engine->conns_hash, conn,
@@ -5944,10 +6371,9 @@ xqc_conn_destroy_cids(xqc_connection_t *conn)
                                       conn->retry_scid.cid_buf, conn->retry_scid.cid_len);
             }
         }
-        xqc_list_for_each_safe(pos_set, next_set, &conn->scid_set.cid_set_list)
+        for (inner_set = xqc_cid_set_first(&conn->scid_set); inner_set != NULL;
+             inner_set = xqc_cid_set_next(&conn->scid_set, inner_set))
         {
-            inner_set = xqc_list_entry(pos_set, xqc_cid_set_inner_t, next);
-
             xqc_list_for_each_safe(pos, next, &inner_set->cid_list)
             {
                 cid = xqc_list_entry(pos, xqc_cid_inner_t, list);
@@ -5960,9 +6386,9 @@ xqc_conn_destroy_cids(xqc_connection_t *conn)
         }
     }
 
-    xqc_list_for_each_safe(pos_set, next_set, &conn->dcid_set.cid_set_list)
+    for (inner_set = xqc_cid_set_first(&conn->dcid_set); inner_set != NULL;
+         inner_set = xqc_cid_set_next(&conn->dcid_set, inner_set))
     {
-        inner_set = xqc_list_entry(pos_set, xqc_cid_set_inner_t, next);
         xqc_list_for_each_safe(pos, next, &inner_set->cid_list)
         {
             cid = xqc_list_entry(pos, xqc_cid_inner_t, list);
@@ -6093,60 +6519,15 @@ xqc_conn_try_add_new_conn_id(xqc_connection_t *conn, uint64_t retire_prior_to)
     return XQC_OK;
 }
 
-/* Reopen a converged search to look for a larger size (RFC 8899 §5.3).
- *
- * Raises each path's search ceiling back to the connection's limit and aims the
- * next probe between the confirmed size and that ceiling. What it deliberately
- * does NOT do is clear path_pmtu_bounded: that flag is what holds the
- * connection at the size probing proved, and clearing it to "reopen the search"
- * would release the connection back up to the base size immediately -- exactly
- * the black hole the per-path search exists to close, reintroduced every raise
- * interval. The bound instead lifts on its own when a larger probe is acked,
- * because xqc_conn_try_to_update_mss() reads a bounded path's
- * curr_pkt_out_size, which is what an acked probe raises.
- *
- * So the reopen costs a few probe packets and no throughput: the connection
- * keeps using the proven size throughout, and a search that finds nothing new
- * bisects straight back down to it.
- */
-void
-xqc_conn_pmtud_reopen_search(xqc_connection_t *conn)
-{
-    xqc_list_head_t *pos, *next;
-    xqc_path_ctx_t *path;
-    size_t midpoint;
-
-    xqc_list_for_each_safe(pos, next, &conn->conn_paths_list)
-    {
-        path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
-        if (path->path_state != XQC_PATH_STATE_ACTIVE) {
-            continue;
-        }
-
-        /* Already as high as this connection can go: nothing above to find. */
-        if (path->curr_pkt_out_size >= conn->pkt_out_size_limit) {
-            continue;
-        }
-
-        path->path_max_pkt_out_size = conn->pkt_out_size_limit;
-        midpoint = (conn->pkt_out_size_limit + path->curr_pkt_out_size) >> 1;
-        path->path_probing_pkt_out_size =
-            xqc_max(midpoint, path->curr_pkt_out_size + 1);
-        path->path_probing_cnt = 0;
-
-        xqc_log(conn->log, XQC_LOG_DEBUG,
-                "|PMTU|raise timer reopened search|path:%ui|curr:%uz|probe:%uz|",
-                path->path_id, path->curr_pkt_out_size,
-                path->path_probing_pkt_out_size);
-    }
-}
 
 void
 xqc_conn_ptmud_probing(xqc_connection_t *conn)
 {
     if (conn->conn_state >= XQC_CONN_STATE_CLOSING) {
         xqc_log(conn->log, XQC_LOG_INFO, "|conn closing, cannot send PMTUD probing|");
+        return;
     }
+    /* RFC 9000 Section 14.3.1: defer DPLPMTUD until handshake completion. */
     if (!(conn->conn_flag & XQC_CONN_FLAG_HANDSHAKE_COMPLETED)
         || !(conn->conn_flag & XQC_CONN_FLAG_CAN_SEND_1RTT))
     {
@@ -6154,134 +6535,70 @@ xqc_conn_ptmud_probing(xqc_connection_t *conn)
     }
 
     xqc_pkt_type_t pkt_type = XQC_PTYPE_SHORT_HEADER;
+
+    /* generate PING packets */
+    if (conn->probing_cnt >= 3) {
+        /* if the current MSS has been already probed for 3 times
+         * while the MSS is not updated, we need to shrink the probing size
+         */
+        conn->max_pkt_out_size =
+            xqc_max(conn->probing_pkt_out_size - 1, conn->pkt_out_size);
+        conn->probing_pkt_out_size = xqc_max(
+            conn->pkt_out_size, (conn->max_pkt_out_size + conn->pkt_out_size) >> 1);
+        conn->probing_cnt = 0;
+    }
+
+    /* stop probing once the size is known closely enough */
+    if ((conn->max_pkt_out_size - conn->pkt_out_size) < XQC_PMTUD_SEARCH_PRECISION) {
+        xqc_log_event(conn->log, CON_MTU_UPDATED, conn, 1);
+        conn->conn_flag &= ~XQC_CONN_FLAG_PMTUD_PROBING;
+        /* RFC 8899 s5.1.1: below the cap, search again from the top later,
+         * in case the path got larger */
+        if (conn->pkt_out_size + XQC_PMTUD_SEARCH_PRECISION
+            <= conn->conn_settings.probing_pkt_out_size)
+        {
+            conn->max_pkt_out_size = conn->conn_settings.probing_pkt_out_size;
+            conn->probing_pkt_out_size = conn->max_pkt_out_size;
+            conn->probing_cnt = 0;
+            uint64_t raise_interval = conn->conn_settings.pmtud_raise_interval
+                ? conn->conn_settings.pmtud_raise_interval : XQC_PMTUD_RAISE_INTERVAL;
+            xqc_timer_set(&conn->conn_timer_manager, XQC_TIMER_PMTUD_PROBING,
+                          xqc_monotonic_timestamp(), raise_interval);
+        }
+        return;
+    }
+    xqc_log_event(conn->log, CON_MTU_UPDATED, conn, 0);
+    conn->MTU_updated_count++;
+
+
+    size_t probing_size = conn->probing_pkt_out_size;
     xqc_list_head_t *pos, *next;
     xqc_path_ctx_t *path;
     xqc_int_t ret = XQC_OK;
-    xqc_usec_t probing_interval = conn->conn_settings.pmtud_probing_interval;
-    uint32_t min_probing_cnt = XQC_MAX_UINT32_VALUE;
-    uint32_t backoff = 0;
-    int probing_paths = 0;
-    int active_paths = 0;
-    int unconverged_paths = 0;
-    xqc_bool_t newly_bounded = XQC_FALSE;
+    /* RFC 8899 s5.1.1: the probe timer is at least 1 s. It only matters
+     * when nothing is acked: a probe that QUIC declares lost brings the
+     * next attempt one RTT later (xqc_send_ctl_detect_lost). */
+    xqc_usec_t probing_interval =
+        xqc_max(conn->conn_settings.pmtud_probing_interval, XQC_PMTUD_PROBE_TIMER);
 
-    /* The timer that woke us was the raise timer, not a probe interval: every
-     * path had converged when it was armed. Reopen before the sweep below, so
-     * the paths it walks have range to cover again. */
-    if (conn->pmtu_search_converged) {
-        conn->pmtu_search_converged = XQC_FALSE;
-        xqc_conn_pmtud_reopen_search(conn);
-    }
-
-    /* The search runs per path. A connection-wide cursor converges on neither
-     * path when the two differ -- a probe acked on the wide path reset the
-     * range for the narrow one, and a probe lost on the narrow path shrank the
-     * range for the wide one -- which is why a 1500-MTU link paired with a
-     * 1400-MTU link never discovered either size.
-     *
-     * Only active paths are probed; a path still validating has no send
-     * capacity to spend on probes. */
+    /* only probing on active paths */
     xqc_list_for_each_safe(pos, next, &conn->conn_paths_list)
     {
         path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
         if (path->path_state != XQC_PATH_STATE_ACTIVE) {
             continue;
         }
-        active_paths++;
-
-        if (path->path_probing_cnt >= 3) {
-            /* the current probing size went unacked three times: exclude it
-             * and everything above, then bisect what is left */
-            path->path_max_pkt_out_size = xqc_max(path->path_probing_pkt_out_size - 1,
-                                                  path->curr_pkt_out_size);
-            path->path_probing_pkt_out_size =
-                xqc_max(path->curr_pkt_out_size,
-                        (path->path_max_pkt_out_size + path->curr_pkt_out_size) >> 1);
-            path->path_probing_cnt = 0;
-        }
-
-        /* Once the search has excluded the size the connection is currently
-         * building packets at, this path is proven unable to carry it. Bound it
-         * now instead of waiting for convergence: the connection stops feeding
-         * the path packets it will drop after one probe cycle rather than
-         * several, at the cost of a temporary dip while the search climbs back
-         * to whatever the path does support. */
-        if (!path->path_pmtu_bounded
-            && path->path_max_pkt_out_size < conn->pkt_out_size)
-        {
-            path->path_pmtu_bounded = XQC_TRUE;
-            newly_bounded = XQC_TRUE;
-        }
-
-        /* stop probing this path once the remaining range is under 10B */
-        if ((path->path_max_pkt_out_size - path->curr_pkt_out_size) < 10) {
-            if (!path->path_pmtu_bounded) {
-                /* The search has now excluded every size above
-                 * curr_pkt_out_size, so this path has a limit the connection
-                 * has to respect. */
-                path->path_pmtu_bounded = XQC_TRUE;
-                newly_bounded = XQC_TRUE;
-            }
-            continue;
-        }
-
-        /* Past the convergence check, so this path still has range to cover.
-         * Counted before the write is attempted: a write that fails leaves the
-         * search outstanding, and must not be mistaken for a finished one. */
-        unconverged_paths++;
-
-        ret = xqc_write_pmtud_ping_to_packet(path, path->path_probing_pkt_out_size,
-                                             pkt_type);
+        ret = xqc_write_pmtud_ping_to_packet(path, probing_size, pkt_type);
         if (ret < 0) {
             xqc_log(conn->log, XQC_LOG_ERROR, "|genrate PMTUD ping packet error|ret:%d|",
                     ret);
-            continue;
         }
-
-        min_probing_cnt = xqc_min(min_probing_cnt, path->path_probing_cnt);
-        path->path_probing_cnt++;
-        probing_paths++;
     }
 
-    if (newly_bounded) {
-        xqc_conn_try_to_update_mss(conn);
-    }
-
-    /* Done only when there is something to be done with: every active path has
-     * converged. "No probe went out this round" is not the same thing -- every
-     * write can fail transiently, and the timer can fire while all paths are
-     * still validating after a failover. Treating either as convergence would
-     * leave the connection with no armed timer and PMTUD off for the rest of
-     * its life, which is precisely the case this search exists to handle. */
-    if (active_paths > 0 && unconverged_paths == 0) {
-        xqc_log_event(conn->log, CON_MTU_UPDATED, conn, 1);
-        conn->conn_flag &= ~XQC_CONN_FLAG_PMTUD_PROBING;
-        /* Converged, but not finished: rearm as the raise timer so a PMTU that
-         * GROWS later is still discovered (RFC 8899 §5.3). Leaving no timer
-         * armed here is what made the search a one-shot -- a connection that
-         * settled low stayed low for its whole life, and only a brand-new path
-         * or a black hole ever reopened anything. */
-        conn->pmtu_search_converged = XQC_TRUE;
-        xqc_timer_set(&conn->conn_timer_manager, XQC_TIMER_PMTUD_PROBING,
-                      xqc_monotonic_timestamp(),
-                      conn->conn_settings.pmtud_raise_interval);
-        return;
-    }
-
-    if (probing_paths > 0) {
-        xqc_log_event(conn->log, CON_MTU_UPDATED, conn, 0);
-        conn->MTU_updated_count++;
-    }
-
-    /* set timer: default 500ms, 1000ms, or 2000ms according to how many
-     * attempts the least advanced path has made at its current size. When
-     * nothing went out, retry at the base interval rather than backing off:
-     * the cause is transient and the search has made no progress to pace. */
-    backoff = (min_probing_cnt == XQC_MAX_UINT32_VALUE)
-                  ? 0 : xqc_min(min_probing_cnt, 2);
     xqc_timer_set(&conn->conn_timer_manager, XQC_TIMER_PMTUD_PROBING,
-                  xqc_monotonic_timestamp(), probing_interval * (1u << backoff));
+                  xqc_monotonic_timestamp(), probing_interval);
 
+    conn->probing_cnt++;
     conn->conn_flag &= ~XQC_CONN_FLAG_PMTUD_PROBING;
 }
 
@@ -6390,12 +6707,10 @@ xqc_conn_update_user_scid(xqc_connection_t *conn)
     xqc_list_head_t *pos, *next;
 
     xqc_cid_set_inner_t *inner_set;
-    xqc_list_head_t *pos_set, *next_set;
 
-    xqc_list_for_each_safe(pos_set, next_set, &conn->scid_set.cid_set_list)
+    for (inner_set = xqc_cid_set_first(&conn->scid_set); inner_set != NULL;
+         inner_set = xqc_cid_set_next(&conn->scid_set, inner_set))
     {
-        inner_set = xqc_list_entry(pos_set, xqc_cid_set_inner_t, next);
-
         xqc_list_for_each_safe(pos, next, &inner_set->cid_list)
         {
             scid = xqc_list_entry(pos, xqc_cid_inner_t, list);
@@ -6745,15 +7060,8 @@ xqc_conn_set_remote_transport_params(xqc_connection_t *conn,
 
     if (conn->conn_type == XQC_CONN_TYPE_SERVER &&
         settings->max_udp_payload_size >= XQC_PACKET_OUT_SIZE) {
-        /* The peer's limit binds the ceiling and the base, not just the current
-         * size: both feed the recomputation, so leaving either above what the
-         * peer said it can receive would let a later update raise the size back
-         * over that limit. */
-        size_t peer_limit =
-            settings->max_udp_payload_size - XQC_PACKET_OUT_EXT_SPACE;
-        conn->pkt_out_size_limit = xqc_min(conn->pkt_out_size_limit, peer_limit);
-        conn->pkt_out_size_base = xqc_min(conn->pkt_out_size_base, peer_limit);
-        conn->pkt_out_size = xqc_min(conn->pkt_out_size, conn->pkt_out_size_limit);
+        conn->pkt_out_size = xqc_min(conn->pkt_out_size, settings->max_udp_payload_size -
+                                                             XQC_PACKET_OUT_EXT_SPACE);
     }
 
     return XQC_OK;
@@ -7196,6 +7504,12 @@ xqc_conn_tls_transport_params_cb(const uint8_t *tp, size_t len, void *user_data)
            first node and copy the sr token to that cid */
         xqc_cid_set_inner_t *inner_set =
             xqc_get_path_cid_set(&conn->dcid_set, XQC_INITIAL_PATH_ID);
+        if (inner_set == NULL) {
+            xqc_log(conn->log, XQC_LOG_ERROR,
+                    "|initial dcid set missing while sr token present|");
+            XQC_CONN_ERR(conn, TRA_INTERNAL_ERROR);
+            return;
+        }
         node = inner_set->cid_list.next;
         if (NULL != node) {
             cid_node = xqc_list_entry(node, xqc_cid_inner_t, list);
@@ -7480,6 +7794,16 @@ xqc_conn_tls_cert_verify_cb(const unsigned char *certs[], const size_t cert_len[
                                               conn->user_data);
 }
 
+void
+xqc_conn_tls_cert_verify_failed_cb(int x509_err, void *user_data)
+{
+    xqc_connection_t *conn = (xqc_connection_t *)user_data;
+    if (conn->transport_cbs.cert_verify_failed_notify) {
+        conn->transport_cbs.cert_verify_failed_notify(x509_err,
+                                                      conn->user_data);
+    }
+}
+
 
 void
 xqc_conn_tls_session_cb(const char *data, size_t data_len, void *user_data)
@@ -7576,6 +7900,7 @@ const xqc_tls_callbacks_t xqc_conn_tls_cbs = {
     .tp_cb = xqc_conn_tls_transport_params_cb,
     .alpn_select_cb = xqc_conn_tls_alpn_select_cb,
     .cert_verify_cb = xqc_conn_tls_cert_verify_cb,
+    .cert_verify_failed_cb = xqc_conn_tls_cert_verify_failed_cb,
     .session_cb = xqc_conn_tls_session_cb,
     .keylog_cb = xqc_conn_tls_keylog_cb,
     .error_cb = xqc_conn_tls_error_cb,
@@ -8113,6 +8438,9 @@ xqc_ping_record_t *
 xqc_conn_create_ping_record(xqc_connection_t *conn)
 {
     xqc_ping_record_t *pr = xqc_calloc(1, sizeof(xqc_ping_record_t));
+    if (pr == NULL) {
+        return NULL;
+    }
     xqc_init_list_head(&pr->list);
     xqc_list_add_tail(&pr->list, &conn->ping_notification_list);
     return pr;
@@ -8270,7 +8598,6 @@ xqc_conn_handle_stateless_reset(xqc_connection_t *conn, const uint8_t *sr_token)
     xqc_list_head_t *pos, *next;
     xqc_cid_inner_t *cid;
     xqc_cid_set_inner_t *inner_set;
-    xqc_list_head_t *pos_set, *next_set;
 
     if (NULL == conn || NULL == sr_token) {
         return -XQC_EPARAM;
@@ -8282,10 +8609,9 @@ xqc_conn_handle_stateless_reset(xqc_connection_t *conn, const uint8_t *sr_token)
     }
 
     /* compare received stateless reset token with the ones peer sent */
-    xqc_list_for_each_safe(pos_set, next_set, &conn->dcid_set.cid_set_list)
+    for (inner_set = xqc_cid_set_first(&conn->dcid_set); inner_set != NULL;
+         inner_set = xqc_cid_set_next(&conn->dcid_set, inner_set))
     {
-        inner_set = xqc_list_entry(pos_set, xqc_cid_set_inner_t, next);
-
         xqc_list_for_each_safe(pos, next, &inner_set->cid_list)
         {
             cid = xqc_list_entry(pos, xqc_cid_inner_t, list);

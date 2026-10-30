@@ -2986,7 +2986,7 @@ xqc_test_h3_priority_queue_class()
 
 
 void
-xqc_test_h3_backpressure_api()
+xqc_test_h3_backpressure_api(void)
 {
     xqc_connection_t *conn = test_engine_connect();
     CU_ASSERT_PTR_NOT_NULL_FATAL(conn);

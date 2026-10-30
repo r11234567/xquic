@@ -1411,6 +1411,11 @@ xqc_process_new_conn_id_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_in
          * connection IDs.
          */
         inner_set = xqc_get_path_cid_set(&conn->dcid_set, XQC_INITIAL_PATH_ID);
+        if (inner_set == NULL) {
+            xqc_log(conn->log, XQC_LOG_ERROR, "|initial dcid set missing|");
+            XQC_CONN_ERR(conn, TRA_INTERNAL_ERROR);
+            return -XQC_EPROTO;
+        }
         xqc_list_for_each_safe(pos, next, &inner_set->cid_list)
         {
             inner_cid = xqc_list_entry(pos, xqc_cid_inner_t, list);
@@ -2630,6 +2635,11 @@ xqc_process_mp_new_conn_id_frame(xqc_connection_t *conn, xqc_packet_in_t *packet
          * connection IDs.
          */
         inner_set = xqc_get_path_cid_set(&conn->dcid_set, path_id);
+        if (inner_set == NULL) {
+            xqc_log(conn->log, XQC_LOG_ERROR, "|dcid set missing|path:%ui|", path_id);
+            XQC_CONN_ERR(conn, TRA_INTERNAL_ERROR);
+            return -XQC_EPROTO;
+        }
         xqc_list_for_each_safe(pos, next, &inner_set->cid_list)
         {
             inner_cid = xqc_list_entry(pos, xqc_cid_inner_t, list);
@@ -2837,12 +2847,18 @@ xqc_process_max_path_id_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_in
 
     /* Implementation policy: mirror peer's cap so curr_max_path_id can
      * advance (draft-21 §3.2.1 — peer MUST NOT issue CIDs above our limit).
-     * Inherits peer's grant bound (max_path_id_grant_max_value). */
-    if (max_path_id > conn->local_max_path_id) {
-        conn->local_max_path_id = max_path_id;
-        (void)xqc_write_max_path_id_to_packet(conn, max_path_id);
+     * Bounded by our own grant bound: every path ID up to the mirrored
+     * value gets CID sets, so the peer's value alone must not size them. */
+    uint64_t mirror_cap = conn->conn_settings.max_path_id_grant_max_value;
+    if (mirror_cap == 0) {
+        mirror_cap = XQC_MAX_PATH_ID_MIRROR_DEFAULT;
+    }
+    uint64_t mirror = xqc_min(max_path_id, mirror_cap);
+    if (mirror > conn->local_max_path_id) {
+        conn->local_max_path_id = mirror;
+        (void)xqc_write_max_path_id_to_packet(conn, mirror);
         xqc_log(conn->log, XQC_LOG_INFO,
-                "|MAX_PATH_ID reciprocal grant|new_local_max:%ui|", max_path_id);
+                "|MAX_PATH_ID reciprocal grant|new_local_max:%ui|", mirror);
     }
 
     new_max_path_id = xqc_min(conn->local_max_path_id, conn->remote_max_path_id);

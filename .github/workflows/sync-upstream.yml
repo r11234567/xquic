@@ -1,7 +1,6 @@
-# Biweekly audit of alibaba/xquic commits after the last manually reviewed
-# upstream SHA. Clean commits are staged on a draft PR to this fork's main;
-# conflicts are reported for selective integration instead of modifying main.
-name: Audit and stage Alibaba upstream sync
+# The downstream main is a product branch, not an Alibaba mirror.
+# Preserve mp0rta/mqvpn-main history in a draft PR; never update main here.
+name: Propose upstream mqvpn-main sync
 
 on:
   schedule:
@@ -9,177 +8,90 @@ on:
   workflow_dispatch:
 
 permissions:
-  actions: write
   contents: write
-  issues: write
   pull-requests: write
 
 concurrency:
-  group: sync-alibaba-upstream
+  group: sync-upstream
   cancel-in-progress: false
 
 jobs:
-  sync:
-    runs-on: ubuntu-latest
+  propose-sync:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - name: Biweekly gate
-        id: parity
-        run: |
-          set -euo pipefail
-          if [ "${{ github.event_name }}" != "schedule" ]; then
-            echo "Manual run: bypassing parity gate."
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          week=$(date -u +%V)
-          if [ $((10#$week % 2)) -ne 0 ]; then
-            echo "ISO week $week is odd: skipping this scheduled run."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "ISO week $week is even: checking upstream."
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Checkout fork main
-        if: steps.parity.outputs.skip != 'true'
-        uses: actions/checkout@v5
+      - name: Checkout downstream main
+        uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
 
-      - name: Fetch Alibaba upstream
-        if: steps.parity.outputs.skip != 'true'
-        run: |
-          set -euo pipefail
-          git remote add alibaba https://github.com/alibaba/xquic.git
-          git fetch --no-tags alibaba main:refs/remotes/alibaba/main
-
-      - name: Resolve unaudited commits
-        if: steps.parity.outputs.skip != 'true'
-        id: gap
-        run: |
-          set -euo pipefail
-          audited=$(tr -d '[:space:]' < .github/upstream-sync-base)
-          if ! printf '%s\n' "$audited" | grep -Eq '^[0-9a-f]{40}$'; then
-            echo "::error::.github/upstream-sync-base is not a full commit SHA"
-            exit 1
-          fi
-          if ! git merge-base --is-ancestor "$audited" alibaba/main; then
-            echo "::error::audited SHA $audited is not in alibaba/main"
-            exit 1
-          fi
-
-          upstream=$(git rev-parse alibaba/main)
-          count=$(git rev-list --count --no-merges "$audited"..alibaba/main)
-          echo "audited=$audited" >> "$GITHUB_OUTPUT"
-          echo "upstream=$upstream" >> "$GITHUB_OUTPUT"
-          echo "count=$count" >> "$GITHUB_OUTPUT"
-          if [ "$count" -eq 0 ]; then
-            echo "has_gap=false" >> "$GITHUB_OUTPUT"
-            echo "Fork audit marker already matches Alibaba main."
-          else
-            echo "has_gap=true" >> "$GITHUB_OUTPUT"
-            echo "$count Alibaba commit(s) require review."
-          fi
-
-      - name: Stage clean upstream commits
-        if: steps.parity.outputs.skip != 'true' && steps.gap.outputs.has_gap == 'true'
-        id: stage
+      - name: Propose missing upstream history
+        shell: bash
         env:
-          AUDITED: ${{ steps.gap.outputs.audited }}
-          UPSTREAM: ${{ steps.gap.outputs.upstream }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          branch="perf/upstream-sync-${UPSTREAM:0:12}"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git switch -c "$branch" origin/main
+          git fetch --no-tags https://github.com/mp0rta/xquic.git mqvpn-main
+          upstream_sha=$(git rev-parse FETCH_HEAD)
+          if git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            echo "Upstream mqvpn-main is already contained in main."
+            exit 0
+          fi
 
-          mapfile -t commits < <(git rev-list --reverse --no-merges "$AUDITED"..alibaba/main)
-          for commit in "${commits[@]}"; do
-            if ! git cherry-pick "$commit"; then
-              failed=$(git rev-parse CHERRY_PICK_HEAD)
-              conflicts=$(git diff --name-only --diff-filter=U)
-              git cherry-pick --abort
-              echo "ready=false" >> "$GITHUB_OUTPUT"
-              echo "failed=$failed" >> "$GITHUB_OUTPUT"
-              {
-                echo 'conflicts<<EOF'
-                printf '%s\n' "$conflicts"
-                echo EOF
-              } >> "$GITHUB_OUTPUT"
-              {
-                echo "## Alibaba upstream sync needs manual integration"
-                echo
-                echo "Commit \`$failed\` conflicts with fork \`main\` in:"
-                echo '```text'
-                printf '%s\n' "$conflicts"
-                echo '```'
-              } >> "$GITHUB_STEP_SUMMARY"
+          # An existing integration PR may already include this upstream head.
+          # Query failures or a concurrently changed head must not look empty.
+          open_prs=$(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/pulls?state=open&base=main&per_page=100" \
+            --jq '.[] | "\(.number) \(.head.sha)"')
+          while read -r number head_sha; do
+            [ -n "$number" ] || continue
+            if ! git cat-file -e "$head_sha^{commit}" 2>/dev/null; then
+              git fetch --no-tags origin "refs/pull/$number/head"
+              if [ "$(git rev-parse FETCH_HEAD)" != "$head_sha" ]; then
+                echo "::error::PR #$number changed while inspecting its history."
+                exit 1
+              fi
+            fi
+            if git merge-base --is-ancestor "$upstream_sha" "$head_sha"; then
+              echo "PR #$number already includes the upstream head."
               exit 0
             fi
-          done
+          done <<< "$open_prs"
 
-          printf '%s\n' "$UPSTREAM" > .github/upstream-sync-base
-          git add .github/upstream-sync-base
-          git commit -m "[=]: Record audited Alibaba upstream revision"
-          remote_sha=$(git ls-remote --heads origin "$branch" | awk '{print $1}')
+          branch="sync/upstream-${upstream_sha:0:12}"
+          remote_sha=$(git ls-remote --heads origin "refs/heads/$branch" \
+            | awk '{print $1}')
           if [ -n "$remote_sha" ]; then
-            git push --force-with-lease="refs/heads/$branch:$remote_sha" \
-              origin "HEAD:refs/heads/$branch"
+            if [ "$remote_sha" != "$upstream_sha" ]; then
+              echo "::error::Existing sync branch differs; refusing to overwrite it."
+              exit 1
+            fi
           else
-            git push origin "HEAD:refs/heads/$branch"
-          fi
-          echo "ready=true" >> "$GITHUB_OUTPUT"
-          echo "branch=$branch" >> "$GITHUB_OUTPUT"
-
-      - name: Report conflicts for manual selection
-        if: steps.parity.outputs.skip != 'true' && steps.stage.outputs.ready == 'false'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          FAILED: ${{ steps.stage.outputs.failed }}
-          CONFLICTS: ${{ steps.stage.outputs.conflicts }}
-          UPSTREAM: ${{ steps.gap.outputs.upstream }}
-          COUNT: ${{ steps.gap.outputs.count }}
-        run: |
-          set -euo pipefail
-          title="Alibaba upstream sync requires manual integration"
-          body=$(printf '%s\n' \
-            "Alibaba main is at \`$UPSTREAM\` with $COUNT unaudited non-merge commit(s)." \
-            "Automatic staging stopped at \`$FAILED\`." \
-            "" \
-            'Conflicting paths:' \
-            '```text' \
-            "$CONFLICTS" \
-            '```' \
-            "Review the commits selectively, then advance \`.github/upstream-sync-base\` in the sync PR.")
-          existing=$(gh issue list --state open --search "in:title $title" \
-                     --json number --jq '.[0].number // empty')
-          if [ -n "$existing" ]; then
-            gh issue comment "$existing" --body "$body"
-          else
-            gh issue create --title "$title" --body "$body"
+            git push origin "$upstream_sha:refs/heads/$branch"
           fi
 
-      - name: Ensure a draft sync PR exists
-        if: steps.parity.outputs.skip != 'true' && steps.stage.outputs.ready == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          BRANCH: ${{ steps.stage.outputs.branch }}
-          COUNT: ${{ steps.gap.outputs.count }}
-          UPSTREAM: ${{ steps.gap.outputs.upstream }}
-        run: |
-          set -euo pipefail
-          existing=$(gh pr list --base main --head "$BRANCH" --state open \
-                     --json number --jq '.[0].number // empty')
-          if [ -z "$existing" ]; then
-            gh pr create \
-              --base main \
-              --head "$BRANCH" \
-              --draft \
-              --title "[~]: Stage Alibaba upstream sync" \
-              --body "Stages $COUNT Alibaba non-merge commit(s) through \`$UPSTREAM\` for fork-specific review. Build and CodeQL are dispatched explicitly."
-          fi
-          gh workflow run build.yml --ref "$BRANCH"
-          gh workflow run codeql-analysis.yml --ref "$BRANCH"
+          body_file=$(mktemp)
+          trap 'rm -f "$body_file"' EXIT
+          cat > "$body_file" <<'BODY'
+          ### Mechanism
+
+          Proposes the complete history from mp0rta/xquic:mqvpn-main against
+          this fork's custom main. No automatic merge or direct main update.
+          Resolve conflicts by retaining upstream implementations and only
+          the downstream features that are still needed.
+
+          ### Validation Cases
+
+          Pending maintainer review of the upstream delta and consumer build.
+
+          ### CONTRIBUTING.md
+
+          - Overall: Pending
+          - Local regression: Incomplete
+          - CI: Pending — run Build and CodeQL for this branch before merge;
+            GITHUB_TOKEN-authored events do not normally start other workflows.
+          BODY
+          gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$branch" \
+            --draft --title "chore(sync): synchronize mp0rta mqvpn-main" \
+            --body-file "$body_file"

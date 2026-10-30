@@ -32,11 +32,8 @@
  *      WLB_STEADY_FLOOR_PCT afterwards -- so a new or recovering path always
  *      carries enough payload to be measured (wlb_normalize_weights).
  *   4. Distribute packets with smooth weighted round robin (wlb_wrr_select).
- *      A round boundary starts a new round unconditionally, but only
- *      re-measures the weights once WLB_GOODPUT_SAMPLE_MIN_US has passed
- *      since the last measurement (wlb_refresh_weights); a change to the set
- *      of schedulable paths rebuilds the cache immediately
- *      (wlb_refresh_paths).
+ *      Weights are recomputed at round boundaries (wlb_start_round) and
+ *      immediately when the set of schedulable paths changes.
  *   5. Pin inner TCP flows to paths via hash table to prevent TCP
  *      reordering.  The pin target comes from a second smooth WRR over the
  *      same weights that ignores cwnd (wlb_pick_pin_path), so the packet
@@ -93,6 +90,7 @@
 #include "src/transport/xqc_send_ctl.h"
 #include "src/transport/xqc_multipath.h"
 #include "src/common/xqc_time.h"
+#include "src/congestion_control/xqc_window_filter.h"
 
 /* ---------- constants ---------- */
 
@@ -127,6 +125,9 @@
 /* Minimum wall-clock span for one goodput sample. Sampling faster than this
  * measures the inside of an ACK burst rather than sustained rate. */
 #define WLB_GOODPUT_SAMPLE_MIN_US (200ULL * 1000)
+/* Window for the per-path floor of smoothed RTT, the queue-free reference
+ * for the estimate credit. */
+#define WLB_SRTT_FLOOR_WIN_US (10ULL * 1000000)
 
 /*
  * Tombstone marker for deleted flow table entries.
@@ -163,6 +164,7 @@ typedef struct {
     uint64_t    warmup_active_us;
     uint64_t    last_payload_schedule_us;
     xqc_bool_t  warmup;
+    xqc_win_filter_t srtt_floor; /* lowest srtt over WLB_SRTT_FLOOR_WIN_US */
 } wlb_path_weight_t;
 
 /** Top-level scheduler state, allocated by xquic via xqc_wlb_scheduler_size(). */
@@ -323,7 +325,8 @@ wlb_flow_expire(xqc_wlb_scheduler_t *s, uint64_t now_us, xqc_connection_t *conn)
         /* Blackholed paths can stay ACTIVE without socket error. Treat a path
          * with repeated PTOs as unhealthy for recovery-detection purposes. */
         if (scan_path->path_send_ctl
-            && scan_path->path_send_ctl->ctl_pto_count >= WLB_PTO_EVICT_THRESH)
+            && xqc_send_ctl_get_effective_pto_count(scan_path->path_send_ctl)
+               >= WLB_PTO_EVICT_THRESH)
         {
             continue;
         }
@@ -419,8 +422,7 @@ wlb_flow_expire(xqc_wlb_scheduler_t *s, uint64_t now_us, xqc_connection_t *conn)
             s->recovery_prefer_path_id = newly_seen_path_id;
             xqc_log(conn->log, XQC_LOG_INFO,
                     "|wlb|recovery_detected|new_path_id:%ui|healthy_prev:%d|healthy_now:%d|",
-                    newly_seen_path_id, s->last_healthy_paths,
-                    active_healthy_paths);
+                    newly_seen_path_id, s->last_healthy_paths, active_healthy_paths);
         } else {
             s->recovery_prefer_path_id = WLB_NO_PATH_ID;
             xqc_log(conn->log, XQC_LOG_INFO,
@@ -493,26 +495,33 @@ static xqc_bool_t
 wlb_path_blackholed(xqc_path_ctx_t *path)
 {
     return path->path_send_ctl != NULL
-           && path->path_send_ctl->ctl_pto_count >= WLB_PTO_EVICT_THRESH;
+           && xqc_send_ctl_get_effective_pto_count(path->path_send_ctl)
+              >= WLB_PTO_EVICT_THRESH;
 }
 
-/* The PTO guard is a preference between paths, not permission to deadlock a
- * connection. If every transport-usable path has crossed the threshold, one
- * of them still has to carry control and application traffic so an ACK can
- * clear ctl_pto_count. */
+/* The consecutive-PTO blackhole guard acts as a preference between paths rather
+ * than permission to deadlock a connection. When multiple transport-usable paths
+ * exist, traffic is kept off blackholed paths so evicted-path probes can test them
+ * safely. Only when at most one transport-usable path remains does WLB allow
+ * traffic onto it so the connection does not deadlock on PTO. */
 static xqc_bool_t
 wlb_any_path_responsive(xqc_connection_t *conn)
 {
     xqc_list_head_t *pos, *next;
     xqc_path_ctx_t  *path;
+    int n_transport_ok = 0;
+    xqc_bool_t has_responsive = XQC_FALSE;
 
     xqc_list_for_each_safe(pos, next, &conn->conn_paths_list) {
         path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
-        if (wlb_path_transport_ok(path) && !wlb_path_blackholed(path)) {
-            return XQC_TRUE;
+        if (wlb_path_transport_ok(path)) {
+            n_transport_ok++;
+            if (!wlb_path_blackholed(path)) {
+                has_responsive = XQC_TRUE;
+            }
         }
     }
-    return XQC_FALSE;
+    return (has_responsive || n_transport_ok > 1);
 }
 
 static xqc_bool_t
@@ -556,6 +565,7 @@ wlb_compute_goodput_weight(wlb_path_weight_t *entry, xqc_path_ctx_t *path,
      * idle. A bursty high-latency link therefore out-weighted links that
      * were genuinely carrying more, and the aggregate fell below a single
      * path. Zero-delivery samples are included precisely so idle decays. */
+    xqc_bool_t loaded = XQC_FALSE;
     if (now_us >= entry->prior_delivered_time_us
         && now_us - entry->prior_delivered_time_us >= WLB_GOODPUT_SAMPLE_MIN_US)
     {
@@ -570,6 +580,9 @@ wlb_compute_goodput_weight(wlb_path_weight_t *entry, xqc_path_ctx_t *path,
         entry->warmup_acked_bytes += delivered;
         entry->prior_delivered = entry->app_delivered;
         entry->prior_delivered_time_us = now_us;
+        /* An empty sample is never load: BBR's estimate is 0 before its first
+         * bandwidth sample, and 0 B/s is a quarter of that. */
+        loaded = delivered > 0 && sample_Bps >= xqc_send_ctl_get_est_bw(ctl) / 4;
     }
 
     if (entry->warmup
@@ -578,6 +591,19 @@ wlb_compute_goodput_weight(wlb_path_weight_t *entry, xqc_path_ctx_t *path,
     {
         entry->warmup = XQC_FALSE;
     }
+
+    /* Not min_rtt: on a jittery link min_rtt is the luckiest single sample,
+     * often well under the queue-free srtt. The floor learns only from
+     * samples past warm-up in which the path delivered a quarter of its
+     * estimate; every other refresh feeds UINT64_MAX. A link that delivers
+     * in order delays packets more as their rate rises, so a floor learned
+     * idle or mid-ramp would read the loaded srtt as a queue. Within about a
+     * window, a queue that persists under load becomes the floor and a floor
+     * without loaded samples ages out; the 2*min_rtt haircut below still
+     * applies. */
+    xqc_usec_t srtt = xqc_send_ctl_get_srtt(ctl);
+    uint64_t srtt_floor = xqc_win_filter_min(&entry->srtt_floor, WLB_SRTT_FLOOR_WIN_US, now_us,
+                                             loaded && !entry->warmup ? srtt : UINT64_MAX);
 
     uint64_t weight = entry->goodput_ewma_Bps;
     if (weight > 0) {
@@ -599,7 +625,21 @@ wlb_compute_goodput_weight(wlb_path_weight_t *entry, xqc_path_ctx_t *path,
         if (xqc_send_ctl_is_app_limited(ctl)) {
             uint64_t capacity_Bps = xqc_send_ctl_get_est_bw(ctl);
             if (capacity_Bps > weight) {
-                weight = capacity_Bps;
+                /* An app-limited path holding a standing queue is fed past
+                 * its rate: BBR ignores app-limited samples below its
+                 * estimate, so the estimate stays at the old rate. Fade the
+                 * credit out with the queue beyond RTT jitter (rttvar). */
+                uint64_t credit = capacity_Bps - weight;
+                /* No floor (none yet, or aged out), or srtt under it: no queue. */
+                uint64_t queue = srtt > srtt_floor ? srtt - srtt_floor : 0;
+                uint64_t fade_lo = xqc_max(srtt_floor / 8, 2 * ctl->ctl_rttvar);
+                uint64_t fade_hi = xqc_max(srtt_floor / 2, 4 * ctl->ctl_rttvar);
+                if (queue > fade_lo) {
+                    credit = queue < fade_hi
+                             ? credit * (fade_hi - queue) / (fade_hi - fade_lo)
+                             : 0;
+                }
+                weight += credit;
             }
         }
         /* Measured acked goodput is already net of every lost packet, so
@@ -668,12 +708,9 @@ wlb_compute_goodput_weight(wlb_path_weight_t *entry, xqc_path_ctx_t *path,
  *
  *  Smooth deficit-counter WRR. Each opportunity adds the normalized
  *  quantum to every sendable path. The selected path subtracts the total
- *  sendable quantum. A round ends after max(WLB_QUANTUM_TOTAL, n_paths)
- *  payload opportunities (see wlb_start_round). That boundary always starts
- *  a new round; it re-measures the weights only once
- *  WLB_GOODPUT_SAMPLE_MIN_US has elapsed, because a round can end thousands
- *  of times per second and a shorter interval carries no new delivery
- *  information. A change to the schedulable path set refreshes immediately.
+ *  sendable quantum. Goodput weights are refreshed at round boundaries --
+ *  every max(WLB_QUANTUM_TOTAL, n_paths) payload opportunities, see
+ *  wlb_start_round -- and whenever the schedulable path set changes.
  * ================================================================ */
 
 /**
@@ -826,7 +863,9 @@ wlb_refresh_paths(xqc_wlb_scheduler_t *s, xqc_connection_t *conn)
         memset(&entry, 0, sizeof(entry));
         entry.path_id = path->path_id;
         entry.warmup = XQC_TRUE;
-        entry.prior_delivered_time_us = now_us;
+        entry.prior_delivered_time_us = xqc_monotonic_timestamp();
+        /* Start above any srtt so the first sample becomes the floor. */
+        xqc_win_filter_reset(&entry.srtt_floor, 0, UINT64_MAX);
         for (int j = 0; j < old_n; j++) {
             if (old[j].path_id == path->path_id) {
                 entry = old[j];
@@ -850,13 +889,13 @@ wlb_refresh_paths(xqc_wlb_scheduler_t *s, xqc_connection_t *conn)
     }
 }
 
-/* Refresh learned weights without rebuilding the path cache. A scheduling
- * round is only 100 payload opportunities and can end thousands of times per
- * second on a fast connection, while a meaningful goodput sample needs at
- * least WLB_GOODPUT_SAMPLE_MIN_US. Reusing wlb_refresh_paths at every round
- * used to allocate, copy, and free the full path state on that packet hot
- * path. Topology changes still use wlb_refresh_paths; routine sampling keeps
- * both deficit ledgers and performs no allocation. */
+/**
+ * Refresh acknowledged-goodput weights for the current schedulable paths.
+ *
+ * Keeps deficits and path IDs intact; only re-measures delivery samples and
+ * updates raw_weights. Avoids memory allocations and deficit resets on routine
+ * round rollovers.
+ */
 static void
 wlb_refresh_weights(xqc_wlb_scheduler_t *s, xqc_connection_t *conn,
                     uint64_t now_us)
@@ -1272,7 +1311,6 @@ xqc_wlb_scheduler_get_path(void *scheduler,
     xqc_bool_t pin_flow = (packet_out->po_flow_hash != WLB_FLOW_HASH_UNPINNED);
 
     uint64_t now_us = xqc_monotonic_timestamp();
-    xqc_bool_t round_started = XQC_FALSE;
 
     /* Recovery probe for evicted paths — see wlb_pick_evicted_probe. Only an
      * unreliable DATAGRAM may be used here. Sending a unique reliable STREAM
@@ -1316,6 +1354,7 @@ xqc_wlb_scheduler_get_path(void *scheduler,
         s->force_refresh_paths = 1;
     }
 
+    xqc_bool_t round_started = XQC_FALSE;
     if (s->force_refresh_paths) {
         xqc_log(conn->log, XQC_LOG_INFO,
                 "|wlb|refresh|reason:topology|old_n_paths:%d|",
@@ -1458,8 +1497,7 @@ xqc_wlb_scheduler_get_path(void *scheduler,
             wlb_flow_insert(s, packet_out->po_flow_hash, pin_path_id, now_us);
             xqc_log(conn->log, XQC_LOG_INFO,
                     "|wlb|flow_pin|flow:%ui|pin:%ui|send:%ui|",
-                    (uint64_t)packet_out->po_flow_hash, pin_path_id,
-                    sel_path_id);
+                    (uint64_t)packet_out->po_flow_hash, pin_path_id, sel_path_id);
         }
         xqc_path_ctx_t *path = wlb_find_path_ctx(conn, sel_path_id);
         xqc_log(conn->log, XQC_LOG_DEBUG,

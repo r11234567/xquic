@@ -3,8 +3,10 @@
 # third_party/boringssl, open a PR bumping the submodule pin so the maintainer
 # notices it.
 #
-# The workflow explicitly dispatches Build and CodeQL for a changed pin because
-# events created by GITHUB_TOKEN do not recursively start other workflows.
+# The downstream main contains product changes; propose dependency updates by
+# PR, never by a direct main push. GITHUB_TOKEN-authored pushes and PR events
+# do not normally start other workflows, so this workflow explicitly
+# dispatches validation for the proposed branch before maintainer review.
 name: Bump BoringSSL submodule
 
 on:
@@ -25,7 +27,8 @@ concurrency:
 
 jobs:
   bump:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - name: Checkout main (with submodules)
         uses: actions/checkout@v5

@@ -52,6 +52,37 @@ xqc_send_queue_release_enough_space(xqc_send_queue_t *send_queue)
 }
 uint64_t xqc_send_queue_get_unsent_packets_num(xqc_send_queue_t *send_queue);
 
+/*
+ * Upper bound on the bytes this connection still has to put on the wire:
+ * every packet the send queue owns except the ones already sent and waiting
+ * to be acknowledged.
+ *
+ * In-flight bytes are deliberately excluded. They are the congestion
+ * controller's budget, not a queue an application can drain, and a
+ * connection running at its BDP holds a cwnd's worth of them at all times.
+ * An application watermark that counted them would latch closed on exactly
+ * the fast, well-filled connections it is meant to pace, which is what the
+ * first version of this helper did.
+ *
+ * The estimate is packet-granular and uses pkt_out_size (the current minimum
+ * across paths), not max_pkt_out_size: a partially filled packet is counted
+ * as full, so the result never under-reports the queue.
+ */
+static inline uint64_t
+xqc_send_queue_get_unsent_bytes(xqc_send_queue_t *send_queue)
+{
+    uint64_t packets = xqc_send_queue_get_unsent_packets_num(send_queue);
+    uint64_t packet_size = send_queue->sndq_conn->pkt_out_size;
+
+    if (packet_size == 0) {
+        return 0;
+    }
+    if (packets > UINT64_MAX / packet_size) {
+        return UINT64_MAX;
+    }
+    return packets * packet_size;
+}
+
 
 xqc_send_queue_t *xqc_send_queue_create(xqc_connection_t *conn);
 void xqc_send_queue_destroy(xqc_send_queue_t *send_queue);
@@ -89,36 +120,6 @@ void xqc_send_queue_move_to_tail(xqc_list_head_t *pos, xqc_list_head_t *head);
 void xqc_send_queue_move_to_high_pri(xqc_list_head_t *pos, xqc_send_queue_t *send_queue);
 void xqc_send_queue_move_to_urgent(xqc_list_head_t *pos, xqc_send_queue_t *send_queue);
 
-/*
- * Upper bound on the bytes this connection still has to put on the wire:
- * every packet the send queue owns except the ones already sent and waiting
- * to be acknowledged.
- *
- * In-flight bytes are deliberately excluded. They are the congestion
- * controller's budget, not a queue an application can drain, and a
- * connection running at its BDP holds a cwnd's worth of them at all times.
- * An application watermark that counted them would latch closed on exactly
- * the fast, well-filled connections it is meant to pace, which is what the
- * first version of this helper did.
- *
- * The estimate is packet-granular and uses pkt_out_size (the current minimum
- * across paths), not max_pkt_out_size: a partially filled packet is counted
- * as full, so the result never under-reports the queue.
- */
-static inline uint64_t
-xqc_send_queue_get_unsent_bytes(xqc_send_queue_t *send_queue)
-{
-    uint64_t packets = xqc_send_queue_get_unsent_packets_num(send_queue);
-    uint64_t packet_size = send_queue->sndq_conn->pkt_out_size;
-
-    if (packet_size == 0) {
-        return 0;
-    }
-    if (packets > UINT64_MAX / packet_size) {
-        return UINT64_MAX;
-    }
-    return packets * packet_size;
-}
 
 void xqc_send_queue_copy_to_lost(xqc_packet_out_t *packet_out, xqc_send_queue_t *send_queue, xqc_bool_t mark_retrans);
 void xqc_send_queue_copy_to_probe(xqc_packet_out_t *packet_out, xqc_send_queue_t *send_queue, xqc_path_ctx_t *path);
