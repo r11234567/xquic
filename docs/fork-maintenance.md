@@ -13,8 +13,9 @@ has a better replacement. Keep STREAM traffic on the measured MinRTT path.
 Use a merge commit for the final synchronization PR; squash and rebase merges
 would discard the history relationship that the consumer needs.
 
-`sync/**` names integration PR branches. Build and CodeQL run on their pushes
-and on PRs targeting main. Fix work starts on a scoped `fix/` branch and is
+`sync/**` names integration PR branches. Build and CodeQL run once per PR
+update targeting main; push checks are reserved for integration branches
+such as main. Fix work starts on a scoped `fix/` branch and is
 added to an already-open integration PR without a force push.
 
 The upstream maintenance workflow proposes missing mp0rta history as a draft
