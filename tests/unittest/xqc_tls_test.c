@@ -545,9 +545,28 @@ xqc_test_tls_ctx_register_alpn()
     uint8_t *alpn_list = NULL;
     size_t alpn_list_len = 0;
 
+    /* A fresh list has no source buffer, including after rejected input. */
+    xqc_tls_ctx_get_alpn_list(ctx_cli, &alpn_list, &alpn_list_len);
+    CU_ASSERT_PTR_NULL(alpn_list);
+    CU_ASSERT(alpn_list_len == 0);
+    ret = xqc_tls_ctx_register_alpn(ctx_cli, NULL, 1);
+    CU_ASSERT(ret == -XQC_EPARAM);
+    ret = xqc_tls_ctx_register_alpn(ctx_cli, TEST_ALPN_1, 0);
+    CU_ASSERT(ret == -XQC_EPARAM);
+    xqc_tls_ctx_get_alpn_list(ctx_cli, &alpn_list, &alpn_list_len);
+    CU_ASSERT_PTR_NULL(alpn_list);
+    CU_ASSERT(alpn_list_len == 0);
+
     /* register alpn in tls context */
     ret = xqc_tls_ctx_register_alpn(ctx_cli, TEST_ALPN_1, sizeof(TEST_ALPN_1) - 1);
     CU_ASSERT(ret == XQC_OK);
+
+    xqc_tls_ctx_get_alpn_list(ctx_cli, &alpn_list, &alpn_list_len);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(alpn_list);
+    CU_ASSERT(alpn_list_len == sizeof(TEST_ALPN_1));
+    CU_ASSERT(alpn_list[0] == sizeof(TEST_ALPN_1) - 1);
+    CU_ASSERT(memcmp(alpn_list + 1, TEST_ALPN_1,
+                     sizeof(TEST_ALPN_1) - 1) == 0);
 
     ret = xqc_tls_ctx_register_alpn(ctx_cli, TEST_ALPN_2, sizeof(TEST_ALPN_2) - 1);
     CU_ASSERT(ret == XQC_OK);

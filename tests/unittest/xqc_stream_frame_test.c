@@ -271,6 +271,16 @@ xqc_test_stream_frame_fin_only_no_accumulation()
     CU_ASSERT(stream->stream_data_in.stream_determined == XQC_TRUE);
     CU_ASSERT(stream->stream_data_in.buffered_frame_count <= 1);
 
+    /* A FIN-only frame has no data allocation. Drain it without forming a
+     * pointer into NULL, and still expose the end of stream to the caller. */
+    unsigned char byte = 0xa5;
+    uint8_t fin = 0;
+    ret = xqc_stream_recv(stream, &byte, sizeof(byte), &fin);
+    CU_ASSERT_EQUAL(ret, 0);
+    CU_ASSERT_EQUAL(fin, 1);
+    CU_ASSERT_EQUAL(byte, 0xa5);
+    CU_ASSERT_EQUAL(stream->stream_data_in.buffered_frame_count, 0);
+
     xqc_engine_destroy(conn->engine);
 }
 

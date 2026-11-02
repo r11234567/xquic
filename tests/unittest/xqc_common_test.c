@@ -10,6 +10,7 @@
 #include "src/common/xqc_object_manager.h"
 #include "src/common/xqc_rbtree.h"
 #include "src/common/xqc_fifo.h"
+#include "src/common/xqc_memory_pool.h"
 #include "src/common/xqc_log_event_callback.h"
 #include "src/transport/xqc_conn.h"
 #include "src/transport/xqc_multipath.h"
@@ -21,6 +22,47 @@ typedef struct person_s {
     char name[20];
     xqc_queue_t queue;
 } person_t;
+
+static xqc_memory_pool_t *
+xqc_test_small_pool(void)
+{
+#ifdef XQC_PROTECT_POOL_MEM
+    return xqc_create_pool(128, 0);
+#else
+    return xqc_create_pool(128);
+#endif
+}
+
+void
+xqc_test_memory_pool_alignment(void)
+{
+    xqc_memory_pool_t *pool = xqc_test_small_pool();
+    CU_ASSERT_PTR_NOT_NULL_FATAL(pool);
+    size_t sizes[] = {1, 15, 16, 17, 4095, 4096, 4097};
+    for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
+        unsigned char *p = xqc_pcalloc(pool, sizes[i]);
+        CU_ASSERT_PTR_NOT_NULL_FATAL(p);
+        CU_ASSERT_EQUAL((uintptr_t)p % XQC_ALIGNMENT, 0);
+        CU_ASSERT_EQUAL(p[0], 0);
+        CU_ASSERT_EQUAL(p[sizes[i] - 1], 0);
+        memset(p, 0xa5, sizes[i]);
+    }
+    xqc_destroy_pool(pool);
+}
+
+void
+xqc_test_memory_pool_overflow(void)
+{
+    xqc_memory_pool_t *pool = xqc_test_small_pool();
+    CU_ASSERT_PTR_NOT_NULL_FATAL(pool);
+    CU_ASSERT_PTR_NULL(xqc_palloc_large(pool, SIZE_MAX));
+#ifdef XQC_PROTECT_POOL_MEM
+    CU_ASSERT_PTR_NULL(xqc_mempool_malloc_protected(SIZE_MAX, 4096));
+#endif
+    CU_ASSERT_PTR_NULL(pool->large);
+    CU_ASSERT_PTR_NOT_NULL(xqc_palloc(pool, 16));
+    xqc_destroy_pool(pool);
+}
 
 typedef struct xqc_item_s {
     xqc_object_id_t object_id;

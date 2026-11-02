@@ -111,6 +111,10 @@ main(int argc, char *argv[])
         || !CU_add_test(pSuite, "xqc_test_get_random", xqc_test_get_random)
         || !CU_add_test(pSuite, "xqc_test_engine_create", xqc_test_engine_create)
         || !CU_add_test(pSuite, "xqc_test_conn_create", xqc_test_conn_create)
+        || !CU_add_test(pSuite, "xqc_test_token_unaligned_accept",
+                        xqc_test_token_unaligned_accept)
+        || !CU_add_test(pSuite, "xqc_test_token_unaligned_reject",
+                        xqc_test_token_unaligned_reject)
         || !CU_add_test(pSuite, "xqc_test_datagram_transport_param_65536",
                         xqc_test_datagram_transport_param_65536)
         || !CU_add_test(pSuite,
@@ -166,6 +170,10 @@ main(int argc, char *argv[])
         || !CU_add_test(pSuite, "xqc_test_connection_closed_log_empty_paths",
                         xqc_test_connection_closed_log_empty_paths)
         || !CU_add_test(pSuite, "xqc_test_common", xqc_test_common)
+        || !CU_add_test(pSuite, "xqc_test_memory_pool_alignment",
+                        xqc_test_memory_pool_alignment)
+        || !CU_add_test(pSuite, "xqc_test_memory_pool_overflow",
+                        xqc_test_memory_pool_overflow)
         || !CU_add_test(pSuite, "xqc_test_murmur_hash2_high_bytes",
                         xqc_test_murmur_hash2_high_bytes)
         || !CU_add_test(pSuite, "xqc_test_vint", xqc_test_vint)

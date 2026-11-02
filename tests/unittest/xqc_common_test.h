@@ -12,6 +12,8 @@
 #include "src/transport/xqc_engine.h"
 
 void xqc_test_common();
+void xqc_test_memory_pool_alignment(void);
+void xqc_test_memory_pool_overflow(void);
 void xqc_test_murmur_hash2_high_bytes(void);
 void xqc_test_connection_closed_log_no_error(void);
 void xqc_test_connection_closed_log_with_error(void);
