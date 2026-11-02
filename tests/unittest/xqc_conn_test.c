@@ -153,6 +153,40 @@ xqc_test_conn_create()
     xqc_engine_destroy(engine);
 }
 
+static void
+xqc_test_unaligned_token(int wrong_address)
+{
+    xqc_connection_t *conn = test_engine_connect();
+    CU_ASSERT_PTR_NOT_NULL_FATAL(conn);
+    struct sockaddr_in peer = {0};
+    peer.sin_family = AF_INET;
+    peer.sin_addr.s_addr = htonl(0x7f000001);
+    memcpy(conn->peer_addr, &peer, sizeof(peer));
+    unsigned char storage[XQC_MAX_TOKEN_LEN + 1];
+    unsigned char *token = storage + 1;
+    unsigned length = XQC_MAX_TOKEN_LEN;
+    CU_ASSERT_EQUAL(xqc_conn_gen_token(conn, token, &length), XQC_OK);
+    if (wrong_address) {
+        peer.sin_addr.s_addr = htonl(0x7f000002);
+        memcpy(conn->peer_addr, &peer, sizeof(peer));
+    }
+    CU_ASSERT_EQUAL(xqc_conn_check_token(conn, token, length),
+                    wrong_address ? XQC_ERROR : XQC_OK);
+    xqc_engine_destroy(conn->engine);
+}
+
+void
+xqc_test_token_unaligned_accept(void)
+{
+    xqc_test_unaligned_token(0);
+}
+
+void
+xqc_test_token_unaligned_reject(void)
+{
+    xqc_test_unaligned_token(1);
+}
+
 
 void
 xqc_test_datagram_transport_param_65536(void)

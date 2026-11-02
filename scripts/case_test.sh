@@ -625,10 +625,14 @@ clear_log
 echo -e "alpn negotiation success ...\c"
 rm -f test_session
 ${CLIENT_BIN} -s 1024 -l e -t 1 -T 1 > stdlog
+client_status=$?
 alpn_ok=`grep "alpn:transport" stdlog`
 conn_err_zero=`grep -E "conn_err:0[^0-9]" stdlog`
+transfer_ok=`grep -F "send_body_size:1024, recv_body_size:1024" stdlog`
 errlog=`grep_err_log`
-if [ -n "$alpn_ok" ] && [ -n "$conn_err_zero" ] && [ -z "$errlog" ]; then
+if [ "$client_status" -eq 0 ] && [ -n "$alpn_ok" ] \
+    && [ -n "$conn_err_zero" ] && [ -n "$transfer_ok" ] \
+    && [ -z "$errlog" ]; then
     echo ">>>>>>>> pass:1"
     case_print_result "alpn_negotiation_success" "pass"
 else
@@ -642,7 +646,9 @@ rm -f test_session
 ${CLIENT_BIN} -l e -t 1 -T 1 -x 43 > stdlog
 alpn_res=`grep "xqc_ssl_alpn_select_cb|select proto error" slog`
 conn_err_178=`grep "conn_err:376" stdlog`
-if [ -n "$alpn_res" ] && [ -n "$conn_err_178" ]; then
+unexpected_success=`grep -F ">>>>>>>> pass:1" stdlog`
+if [ -n "$alpn_res" ] && [ -n "$conn_err_178" ] \
+    && [ -z "$unexpected_success" ]; then
     echo ">>>>>>>> pass:1"
     case_print_result "alpn_negotiation_failure_0x178" "pass"
 else
