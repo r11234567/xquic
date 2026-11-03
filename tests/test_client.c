@@ -5907,14 +5907,40 @@ xqc_client_epoch_callback(int fd, short what, void *arg)
         }
     }
 
-    /* 次路径验证成功后关闭初始路径。 */
+    /* Local validation does not prove that the peer validated the spare.
+     * Keep the initial path until application data returns on an active
+     * spare path; otherwise PATH_ABANDON can close the peer's only active
+     * path when its PATH_RESPONSE was lost. */
     if (g_test_case == 100 && g_cur_epoch > 1) {
         xqc_conn_stats_t stats = xqc_conn_get_stats(ctx.engine, &user_conn->cid);
+        xqc_bool_t peer_ready = XQC_FALSE;
+        xqc_bool_t initial_active = XQC_FALSE;
+        for (uint32_t i = 0; i < stats.paths_info_count; i++) {
+            xqc_path_metrics_t *path = &stats.paths_info[i];
+            if (path->path_id == XQC_INITIAL_PATH_ID
+                && path->path_state == XQC_PATH_STATE_ACTIVE)
+            {
+                initial_active = XQC_TRUE;
+            }
+            if (path->path_id != XQC_INITIAL_PATH_ID
+                && path->path_state == XQC_PATH_STATE_ACTIVE
+                && path->path_recv_bytes > 0)
+            {
+                peer_ready = XQC_TRUE;
+            }
+        }
         if (stats.mp_state == 1) {
-            if (g_cur_epoch > 5) {
-                ret = xqc_conn_close_path(ctx.engine, &user_conn->cid, 0);
-                if (ret < 0) {
-                    printf("xqc_conn_close_path err = %d\n", ret);
+            if (g_cur_epoch > 5 && initial_active) {
+                /* Prefer the spare for the next echo while retaining
+                 * the initial path as a fallback during peer validation. */
+                xqc_conn_mark_path_standby(ctx.engine, &user_conn->cid, 0);
+                if (peer_ready) {
+                    printf("[mpns-close-initial]|peer_ready|epoch:%d|\n",
+                           g_cur_epoch);
+                    ret = xqc_conn_close_path(ctx.engine, &user_conn->cid, 0);
+                    if (ret < 0) {
+                        printf("xqc_conn_close_path err = %d\n", ret);
+                    }
                 }
             }
 
@@ -5923,6 +5949,7 @@ xqc_client_epoch_callback(int fd, short what, void *arg)
                    g_cur_epoch, stats.mp_state);
             xqc_client_ready_to_create_path(&user_conn->cid, user_conn);
         }
+        free(stats.paths_info);
     }
 
     /* close new path */
