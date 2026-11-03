@@ -101,6 +101,77 @@ make -j$(nproc)
 make test
 ```
 
+### Build with BabaSSL(Tongsuo)
+
+```bash
+sudo apt-get install -y build-essential libevent-dev
+
+# get XQUIC source code
+git clone https://github.com/alibaba/xquic.git; cd xquic
+
+# get and build BabaSSL(Tongsuo)
+git clone -b 8.3-stable https://github.com/Tongsuo-Project/Tongsuo.git ./third_party/babassl; cd ./third_party/babassl/
+./config --prefix=/usr/local/babassl
+make -j
+SSL_TYPE_STR="babassl"
+SSL_PATH_STR="${PWD}"
+cd -
+
+# build XQUIC with BabaSSL
+# When build XQUIC with babassl, /usr/local/babassl directory will be searched
+# as default. If babassl is deployed in other directories, SSL_PATH could be
+# used to specify the search path of babassl
+git submodule update --init --recursive
+mkdir -p build; cd build
+cmake -DGCOV=on -DCMAKE_BUILD_TYPE=Debug -DXQC_ENABLE_TESTING=1 -DXQC_SUPPORT_SENDMMSG_BUILD=1 -DXQC_ENABLE_EVENT_LOG=1 -DXQC_ENABLE_BBR2=1 -DXQC_ENABLE_RENO=1 -DSSL_TYPE=${SSL_TYPE_STR} -DSSL_PATH=${SSL_PATH_STR} ..
+
+# exit if cmake error
+if [ $? -ne 0 ]; then
+    echo "cmake failed"
+    exit 1
+fi
+
+make -j
+```
+
+### Run testcases
+
+```bash
+sh ../scripts/xquic_test.sh
+```
+
+## Optional WebTransport
+
+Native WebTransport is disabled by default. Configure with
+`-DXQC_ENABLE_WEBTRANSPORT=ON` to enable it. Validation and CI builds enable
+it by default. Use `XQC_ENABLE_WEBTRANSPORT=OFF ./scripts/validate.sh test`
+for disabled local validation. See
+[the WebTransport specification](harness/spec/webtransport/spec.md) for APIs,
+demos and endpoint checks.
+
+## Documentation
+
+* For using the API, see the [API docs](./docs/API.md).
+* For platform support details, see the [Platforms docs](./docs/Platforms.md).
+* For Chinese Simplified (zh-CN) translation of the IETF QUIC Protocol, see the Translation docs.
+    - [RFC8999-invariants-zh](./docs/translation/rfc8999-invariants-zh.md)
+    - [RFC9000-transport-zh](./docs/translation/rfc9000-transport-zh.md)
+    - [RFC9001-tls-zh](./docs/translation/rfc9001-tls-zh.md)
+    - [RFC9002-recovery-zh](./docs/translation/rfc9002-recovery-zh.md)
+    - [draft-ietf-quic-http-34-zh](./docs/translation/draft-ietf-quic-http-34-zh.md)
+    - [draft-ietf-quic-qpack-21-zh](./docs/translation/draft-ietf-quic-qpack-21-zh.md)
+    - [RFC9221-datagram-zh](./docs/translation/rfc9221-datagram-zh.md)
+
+* For using quic-qlog, see the [Features: qlog](./docs/Features.md)
+* For testing the library, see the [Testing docs](./docs/docs-zh/Testing-zh.md).
+* For other frequently asked questions, see the [FAQs](./docs/docs-zh/FAQ-zh.md) and [Trouble Shooting Guide](./docs/docs-zh/Troubleshooting-zh.md).
+
+## Contributing
+
+We would love for you to contribute to XQUIC and help make it even better than it is today! All types of contributions are encouraged and valued. Thanks to [all contributors](https://github.com/alibaba/xquic/blob/main/CONTRIBUTING.md#all-contributors). See our [Contributing Guidelines](./CONTRIBUTING.md) for more information.
+
+If you have any questions, please feel free to open a new Discussion topic in our [discussion forums](https://github.com/alibaba/xquic/discussions).
+
 ## License
 
 XQUIC is released under the Apache 2.0 License.

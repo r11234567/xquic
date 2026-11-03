@@ -44,3 +44,10 @@ Record current-head results honestly. A ready-for-review PR is not an approval
 to merge, and pending Actions are not passing evidence. The downstream mqvpn
 gitlink must point to a reviewed commit retained on a long-lived branch when
 the paired synchronization PRs eventually merge.
+
+The mqvpn v0.19.1-beta1 synchronization merges mp0rta/xquic `1e117b5`
+with BoringSSL 0.20261020.0. It adopts the native case-test runner and its
+structured CI results while retaining the separate downstream CodeQL job.
+The urgent send queue follows reliable-reset prefix retention, including
+cleanup of abandoned suffix packets. Existing PATH_RESPONSE case 1302 keeps
+its meaning; imported MP_FROZEN rejection uses case 1303.

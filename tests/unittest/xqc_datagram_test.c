@@ -193,6 +193,7 @@ xqc_test_datagram_frame_path_pinning()
     xqc_engine_destroy(conn->engine);
 }
 
+
 void
 xqc_test_reject_dgram_at_invalid_encryption_level()
 {

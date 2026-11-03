@@ -570,6 +570,14 @@ typedef void (*xqc_stream_closing_notify_pt)(xqc_stream_t *stream, xqc_int_t err
                                              void *strm_user_data);
 
 /**
+ * Report a received STOP_SENDING error. Retransmissions can repeat this
+ * callback. The application does not need to submit additional stream data
+ * for a configured reliable reset after this notification.
+ */
+typedef void (*xqc_stream_stop_sending_notify_pt)(xqc_stream_t *stream,
+    uint64_t err_code, void *strm_user_data);
+
+/**
  * @brief the callback API to notify application that there is a datagram to be read
  *
  * @param conn the connection handle
@@ -864,6 +872,13 @@ typedef struct xqc_stream_callbacks_s {
      * this function will be triggered when a RESET_STREAM frame is received.
      */
     xqc_stream_closing_notify_pt stream_closing_notify;
+
+    /**
+     * Report a received STOP_SENDING with its application error. Duplicate
+     * frames can repeat this callback. A pending reliable reset is reduced to
+     * an ordinary reset; the application does not need to submit more data.
+     */
+    xqc_stream_stop_sending_notify_pt stream_stop_sending_notify;
 
 } xqc_stream_callbacks_t;
 
@@ -1415,12 +1430,11 @@ typedef enum {
 } xqc_dgram_red_setting_e;
 
 typedef enum {
-    XQC_PMTUD_DISABLE           = 0,
-    XQC_PMTUD_ENABLE_CLIENT     = 1 << 0,
-    XQC_PMTUD_ENABLE_SERVER     = 1 << 1,
-    XQC_PMTUD_ENABLE_MASK       = XQC_PMTUD_ENABLE_CLIENT
-                                  | XQC_PMTUD_ENABLE_SERVER,
-    XQC_PMTUD_FORCE_ENABLE      = 1 << 2,
+    XQC_PMTUD_DISABLE = 0,
+    XQC_PMTUD_ENABLE_CLIENT = 1 << 0,
+    XQC_PMTUD_ENABLE_SERVER = 1 << 1,
+    XQC_PMTUD_ENABLE_MASK = XQC_PMTUD_ENABLE_CLIENT | XQC_PMTUD_ENABLE_SERVER,
+    XQC_PMTUD_FORCE_ENABLE = 1 << 2,
 } xqc_pmtud_flag_e;
 
 typedef enum { XQC_FEC_CONN_LEVEL = 0, XQC_FEC_STREAM_LEVEL = 1 } xqc_fec_level_e;
@@ -1538,7 +1552,11 @@ typedef struct xqc_conn_settings_s {
     int32_t spurious_loss_detect_on;
     /** limit of anti-amplification, default 5 */
     uint32_t anti_amplification_limit;
-    /** optional early packet limit for a single 1-RTT key; 0 disables it */
+    /**
+     * Optional early key-update threshold for one 1-RTT key phase. Zero
+     * disables the early trigger; the selected AEAD's mandatory usage limit
+     * still applies.
+     */
     uint64_t keyupdate_pkt_threshold;
     size_t max_pkt_out_size;
     size_t probing_pkt_out_size;
@@ -1891,6 +1909,8 @@ typedef struct xqc_conn_settings_s {
      * — libxquic currently carries no SOVERSION.
      */
     uint8_t                     defer_send_flush;
+    /* draft-ietf-quic-reliable-stream-reset-09 Section 3; default off. */
+    xqc_bool_t                  enable_reset_stream_at;
 } xqc_conn_settings_t;
 
 
@@ -2434,6 +2454,24 @@ xqc_stream_id_t xqc_stream_id(xqc_stream_t *stream);
  */
 XQC_EXPORT_PUBLIC_API
 xqc_int_t xqc_stream_close(xqc_stream_t *stream);
+
+/**
+ * Select the reliable prefix for a later send-direction reset. A positive
+ * value requires current-handshake peer support. Before reset the value can
+ * be replaced; after RESET_STREAM_AT is sent it can only decrease. Zero
+ * selects ordinary RESET_STREAM.
+ */
+XQC_EXPORT_PUBLIC_API
+xqc_int_t xqc_stream_set_reliable_size(xqc_stream_t *stream,
+    uint64_t reliable_size);
+
+/**
+ * Reset only the send direction, preserving its configured reliable prefix.
+ * If the prefix exceeds bytes already accepted by XQUIC, returns
+ * -XQC_EAGAIN without recording a reset or blocking later writes.
+ */
+XQC_EXPORT_PUBLIC_API
+xqc_int_t xqc_stream_reset(xqc_stream_t *stream, uint64_t error_code);
 
 /**
  * Recv data in stream.
