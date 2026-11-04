@@ -195,6 +195,8 @@ xqc_packet_out_t *xqc_write_packet_for_stream(xqc_connection_t *conn, xqc_pkt_ty
 
 int xqc_write_packet_header(xqc_connection_t *conn, xqc_packet_out_t *packet_out);
 
+xqc_bool_t xqc_conn_has_pending_ack(xqc_connection_t *conn);
+
 xqc_int_t xqc_write_ack_or_mp_ack_or_ext_ack_to_packets(xqc_connection_t *conn);
 
 xqc_int_t xqc_write_ack_or_mp_ack_or_ext_ack_to_one_packet(xqc_connection_t *conn, xqc_packet_out_t *packet_out, 

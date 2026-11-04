@@ -411,7 +411,6 @@ struct xqc_connection_s {
     xqc_trans_settings_t remote_settings;
 
     /* a bitmap to record if ACKs should be generated for path[pns] */
-    uint64_t ack_flag;
     xqc_conn_flag_t conn_flag;
     xqc_conn_type_t conn_type;
 

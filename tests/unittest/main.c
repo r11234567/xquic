@@ -454,6 +454,8 @@ main(int argc, char *argv[])
         || !CU_add_test(pSuite, "xqc_test_conn_flow_ctl_clamp", xqc_test_conn_flow_ctl_clamp)
         || !CU_add_test(pSuite, "xqc_test_flow_ctl_normal_no_clamp", xqc_test_flow_ctl_normal_no_clamp)
         || !CU_add_test(pSuite, "xqc_test_recv_record", xqc_test_recv_record)
+        || !CU_add_test(pSuite, "xqc_test_ack_dynamic_path_ids", xqc_test_ack_dynamic_path_ids)
+        || !CU_add_test(pSuite, "xqc_test_ack_closed_path_isolation", xqc_test_ack_closed_path_isolation)
         || !CU_add_test(pSuite, "xqc_test_reno", xqc_test_reno)
         || !CU_add_test(pSuite, "xqc_test_reno_loss_ssthresh",
                         xqc_test_reno_loss_ssthresh)

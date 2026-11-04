@@ -440,7 +440,6 @@ xqc_write_ack_to_one_packet(xqc_connection_t *conn, xqc_packet_out_t *packet_out
         conn->conn_flag &= ~XQC_CONN_FLAG_ACK_HAS_GAP;
     }
     path->path_flag &= ~(XQC_PATH_FLAG_SHOULD_ACK_INIT << pns);
-    conn->ack_flag &= ~(1 << (pns + path->path_id * XQC_PNS_N));
 
     path->path_send_ctl->ctl_ack_sent_cnt++;
 
@@ -630,6 +629,29 @@ xqc_write_ack_or_mp_ack_or_ext_ack_to_one_packet(xqc_connection_t *conn, xqc_pac
         }
     }
     return ret;
+}
+
+/* draft-ietf-quic-multipath-21, Sections 3 and 4.1: path IDs are
+ * protocol identifiers, not bitmap offsets. Per-path flags are authoritative.
+ * Scan only retained paths; no work scales with the largest path ID. */
+xqc_bool_t
+xqc_conn_has_pending_ack(xqc_connection_t *conn)
+{
+    xqc_list_head_t *pos;
+    xqc_path_ctx_t *path;
+    const xqc_path_flag_t mask = XQC_PATH_FLAG_SHOULD_ACK_INIT
+        | XQC_PATH_FLAG_SHOULD_ACK_HSK | XQC_PATH_FLAG_SHOULD_ACK_01RTT;
+
+    xqc_list_for_each(pos, &conn->conn_paths_list) {
+        path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
+        if (path->path_state >= XQC_PATH_STATE_VALIDATING
+            && path->path_state < XQC_PATH_STATE_CLOSED
+            && (path->path_flag & mask))
+        {
+            return XQC_TRUE;
+        }
+    }
+    return XQC_FALSE;
 }
 
 xqc_int_t
@@ -1763,7 +1785,6 @@ xqc_write_ack_mp_to_one_packet(xqc_connection_t *conn, xqc_path_ctx_t *path,
         conn->conn_flag &= ~XQC_CONN_FLAG_ACK_HAS_GAP;
     }
     path->path_flag &= ~(XQC_PATH_FLAG_SHOULD_ACK_INIT << pns);
-    conn->ack_flag &= ~(1 << (pns + path->path_id * XQC_PNS_N));
 
     path->path_send_ctl->ctl_ack_sent_cnt++;
 
@@ -2132,7 +2153,6 @@ xqc_write_ack_ext_to_one_packet(xqc_connection_t *conn, xqc_packet_out_t *packet
         conn->conn_flag &= ~XQC_CONN_FLAG_ACK_HAS_GAP;
     }
     path->path_flag &= ~(XQC_PATH_FLAG_SHOULD_ACK_INIT << pns);
-    conn->ack_flag &= ~(1 << (pns + path->path_id * XQC_PNS_N));
 
     path->path_send_ctl->ctl_ack_sent_cnt++;
 

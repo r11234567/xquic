@@ -767,7 +767,7 @@ xqc_engine_process_conn(xqc_connection_t *conn, xqc_usec_t now)
     }
     XQC_CHECK_IMMEDIATE_CLOSE();
 
-    if (conn->ack_flag) {
+    if (xqc_conn_has_pending_ack(conn)) {
         ret = xqc_write_ack_or_mp_ack_or_ext_ack_to_packets(conn);
         if (ret) {
             xqc_log(conn->log, XQC_LOG_ERROR, "|xqc_write_ack_or_mp_ack_or_ext_ack_to_packets error|");

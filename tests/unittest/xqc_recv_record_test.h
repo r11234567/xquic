@@ -6,5 +6,7 @@
 #define _XQC_RECV_RECORD_TEST_H_INCLUDED_
 
 void xqc_test_recv_record ();
+void xqc_test_ack_dynamic_path_ids(void);
+void xqc_test_ack_closed_path_isolation(void);
 
 #endif /* _XQC_RECV_RECORD_TEST_H_INCLUDED_ */
