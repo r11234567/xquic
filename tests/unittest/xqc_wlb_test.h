@@ -12,6 +12,11 @@
 #ifndef XQC_WLB_TEST_H_INCLUDED
 #define XQC_WLB_TEST_H_INCLUDED
 
+void xqc_test_wlb_loss_eviction_avoids_repin(void);
+void xqc_test_wlb_loss_pin_threshold_and_recovery(void);
+void xqc_test_wlb_all_lossy_paths_keep_weighted_pin(void);
+void xqc_test_wlb_loss_pin_recovers_after_control_sends(void);
+
 /* I1 Asymmetric P=1: a freshly opened TCP flow pins to the wide path. */
 void xqc_test_wlb_asym_p1_pin_to_wide(void);
 

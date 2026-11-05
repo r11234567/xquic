@@ -391,6 +391,124 @@ wlb_test_goodput_of(wlb_test_fixture_t *f, uint64_t path_id)
 
 /* ───────────────────────── tests ───────────────────────── */
 
+/* Loss eviction must move the ordinary pin to an available low-loss path. */
+void
+xqc_test_wlb_loss_eviction_avoids_repin(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+    wlb_test_add_path(&f, 0, 10000, 64 * 1024, 0);
+    wlb_test_add_path(&f, 1, 30000, 16 * 1024, 0);
+
+    uint32_t flow = 0x0A0B0C0D;
+    (void)wlb_test_invoke(&f, flow);
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, flow), 0);
+
+    f.send_ctls[0].ctl_recent_send_count[0] = 100;
+    f.send_ctls[0].ctl_recent_lost_count[0] = 2;
+    wlb_test_clock_advance(1000001);
+    (void)wlb_test_invoke(&f, flow);
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, flow), 1);
+    wlb_test_teardown(&f);
+}
+
+void
+xqc_test_wlb_loss_pin_threshold_and_recovery(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+    wlb_test_add_path(&f, 0, 10000, 64 * 1024, 0);
+    wlb_test_add_path(&f, 1, 30000, 16 * 1024, 0);
+    f.send_ctls[0].ctl_recent_send_count[0] = 100;
+
+    const uint32_t losses[] = {1, 2, 0};
+    for (int phase = 0; phase < 3; phase++) {
+        f.send_ctls[0].ctl_recent_lost_count[0] = losses[phase];
+        int wide_pins = 0;
+        for (int i = 0; i < 32; i++) {
+            uint32_t flow = 0x20000000u + (uint32_t)(phase * 32 + i);
+            (void)wlb_test_invoke(&f, flow);
+            wide_pins += wlb_test_invoke(&f, flow) == 0;
+        }
+        if (phase == 1) {
+            CU_ASSERT_EQUAL(wide_pins, 0);
+        } else {
+            CU_ASSERT_TRUE(wide_pins > 0);
+        }
+    }
+    wlb_test_teardown(&f);
+}
+
+void
+xqc_test_wlb_all_lossy_paths_keep_weighted_pin(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+    wlb_test_add_path(&f, 0, 10000, 64 * 1024, 64 * 1024);
+    wlb_test_add_path(&f, 1, 30000, 16 * 1024, 0);
+    for (int i = 0; i < 2; i++) {
+        f.send_ctls[i].ctl_recent_send_count[0] = 100;
+        f.send_ctls[i].ctl_recent_lost_count[0] = 10;
+    }
+
+    uint32_t flow = 0x0E0F0102;
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, flow), 1);
+    f.send_ctls[0].ctl_bytes_in_flight = 0;
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, flow), 0);
+    wlb_test_teardown(&f);
+}
+
+/* Control packets age both loss windows even without application traffic. */
+void
+xqc_test_wlb_loss_pin_recovers_after_control_sends(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+    wlb_test_add_path(&f, 0, 10000, 64 * 1024, 0);
+    wlb_test_add_path(&f, 1, 30000, 16 * 1024, 0);
+
+    uint32_t active_flow = 0x30000000u;
+    (void)wlb_test_invoke(&f, active_flow);
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, active_flow), 0);
+
+    xqc_send_ctl_t *ctl = &f.send_ctls[0];
+    ctl->ctl_recent_send_count[0] = 100;
+    ctl->ctl_recent_lost_count[0] = 2;
+    wlb_test_clock_advance(1000001);
+    (void)wlb_test_invoke(&f, active_flow);
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, active_flow), 1);
+    ctl->ctl_recent_stats_timestamp = g_fake_now_us;
+
+    xqc_packet_out_t ack;
+    memset(&ack, 0, sizeof(ack));
+    ack.po_pkt.pkt_pns = XQC_PNS_APP_DATA;
+    ack.po_frame_types = XQC_FRAME_BIT_ACK;
+    xqc_pn_ctl_t pn_ctl;
+    memset(&pn_ctl, 0, sizeof(pn_ctl));
+
+    for (int window = 0; window < 2; window++) {
+        wlb_test_clock_advance(5 * ctl->ctl_srtt);
+        xqc_send_ctl_on_packet_sent(ctl, &pn_ctl, &ack, g_fake_now_us);
+        if (window == 0) {
+            CU_ASSERT_EQUAL(ctl->ctl_recent_lost_count[1], 2);
+        }
+    }
+    CU_ASSERT_EQUAL(ctl->ctl_recent_lost_count[0], 0);
+    CU_ASSERT_EQUAL(ctl->ctl_recent_lost_count[1], 0);
+    wlb_test_clock_advance(1000001);
+    (void)wlb_test_invoke(&f, active_flow);
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, active_flow), 0);
+
+    int wide_pins = 0;
+    for (int i = 0; i < 32; i++) {
+        uint32_t flow = 0x30000100u + (uint32_t)i;
+        (void)wlb_test_invoke(&f, flow);
+        wide_pins += wlb_test_invoke(&f, flow) == 0;
+    }
+    CU_ASSERT_TRUE(wide_pins > 0);
+    wlb_test_teardown(&f);
+}
+
 /* I1: asymmetric paths, single TCP flow → pin lands on wide path.
  *     The first scheduler call sends; the second hits the flow table and
  *     returns the pinned path → that's what we assert on. */

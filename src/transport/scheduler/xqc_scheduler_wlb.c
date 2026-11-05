@@ -48,8 +48,10 @@
  *   WLB_PTO_EVICT_THRESH consecutive PTOs (blackholed) is not schedulable:
  *   it leaves the WRR set and pins to it are dropped.  Flows are also moved
  *   off a path whose recent loss reaches WLB_LOSS_EVICT_THRESH
- *   (wlb_flow_expire).  A blackholed path is handed nothing that could be
- *   ACKed, so one DATAGRAM per WLB_EVICTED_PROBE_INTERVAL_US is sent on it
+ *   (wlb_flow_expire). New pins prefer paths below that threshold when
+ *   available; if every path exceeds it, weighted pinning still applies.
+ *   A blackholed path is handed nothing that could be ACKed, so one DATAGRAM
+ *   per WLB_EVICTED_PROBE_INTERVAL_US is sent on it
  *   as a probe (wlb_pick_evicted_probe).  When a path returns after a loss,
  *   every pin is wiped and, for WLB_RECOVERY_UNPIN_GRACE_US, existing pins
  *   are not honoured: each packet re-pins its flow, onto the returned path
@@ -194,6 +196,7 @@ typedef struct {
 
 /* Forward declaration — used by wlb_flow_expire() for loss-triggered eviction */
 static xqc_path_ctx_t *wlb_find_path_ctx(xqc_connection_t *conn, uint64_t path_id);
+static xqc_bool_t wlb_path_has_excess_loss(xqc_path_ctx_t *path);
 
 /* ================================================================
  *  Flow table helpers
@@ -274,6 +277,12 @@ wlb_flow_insert(xqc_wlb_scheduler_t *s, uint32_t hash, uint64_t path_id, uint64_
     slot->last_ts = now_us;
 }
 
+static xqc_bool_t
+wlb_path_has_excess_loss(xqc_path_ctx_t *path)
+{
+    return xqc_path_recent_loss_rate(path) / 100.0 >= WLB_LOSS_EVICT_THRESH;
+}
+
 /**
  * Once-a-second housekeeping for pinned traffic: detect path loss and
  * recovery, then expire idle flow entries and evict flows from lossy or
@@ -322,11 +331,12 @@ wlb_flow_expire(xqc_wlb_scheduler_t *s, uint64_t now_us, xqc_connection_t *conn)
         {
             continue;
         }
-        /* Blackholed paths can stay ACTIVE without socket error. Treat a path
-         * with repeated PTOs as unhealthy for recovery-detection purposes. */
+        /* Loss can leave a path ACTIVE without socket error. Track both
+         * eviction conditions so active pins rebalance when it recovers. */
         if (scan_path->path_send_ctl
-            && xqc_send_ctl_get_effective_pto_count(scan_path->path_send_ctl)
-               >= WLB_PTO_EVICT_THRESH)
+            && (xqc_send_ctl_get_effective_pto_count(scan_path->path_send_ctl)
+                >= WLB_PTO_EVICT_THRESH
+                || wlb_path_has_excess_loss(scan_path)))
         {
             continue;
         }
@@ -466,8 +476,7 @@ wlb_flow_expire(xqc_wlb_scheduler_t *s, uint64_t now_us, xqc_connection_t *conn)
         }
 
         /* Loss-triggered eviction: move flows off paths with high loss */
-        double loss = xqc_path_recent_loss_rate(path) / 100.0;
-        if (loss >= WLB_LOSS_EVICT_THRESH) {
+        if (wlb_path_has_excess_loss(path)) {
             e->hash = WLB_FLOW_TOMBSTONE;
         }
     }
@@ -973,6 +982,15 @@ wlb_start_round(xqc_wlb_scheduler_t *s)
 static uint64_t
 wlb_pick_pin_path(xqc_wlb_scheduler_t *s, xqc_connection_t *conn)
 {
+    xqc_bool_t prefer_low_loss = XQC_FALSE;
+    for (int i = 0; i < s->n_paths; i++) {
+        xqc_path_ctx_t *path = wlb_find_path_ctx(conn, s->paths[i].path_id);
+        if (path != NULL && !wlb_path_has_excess_loss(path)) {
+            prefer_low_loss = XQC_TRUE;
+            break;
+        }
+    }
+
     /* Pick the path with the highest smooth pin deficit for
      * pin assignment, even if it is currently cwnd-blocked. wrr_select
      * (just before) already chose a sendable path for the current packet;
@@ -987,7 +1005,9 @@ wlb_pick_pin_path(xqc_wlb_scheduler_t *s, xqc_connection_t *conn)
     int64_t total_weight = 0;
     for (int i = 0; i < s->n_paths; i++) {
         xqc_path_ctx_t *path = wlb_find_path_ctx(conn, s->paths[i].path_id);
-        if (path == NULL) {
+        if (path == NULL
+            || (prefer_low_loss && wlb_path_has_excess_loss(path)))
+        {
             continue;
         }
         s->paths[i].pin_deficit += (int64_t)s->paths[i].weight;
