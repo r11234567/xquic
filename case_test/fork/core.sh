@@ -488,6 +488,51 @@ fi
 grep_err_log
 }
 
+# A multi-certificate TLS flight forces CRYPTO fragmentation even with TLS
+# implementations whose ClientHello happens to fit in a single small packet.
+# Replace the case-local symlink atomically, preserving the shared fixture.
+case_fork_core_small_mtu_handshake()
+{
+    local id="$1" name="$2" result=fail client_rc=0
+    rm -rf tp_localhost test_session xqc_token
+    cp server.crt small-mtu-leaf.crt
+    cat small-mtu-leaf.crt small-mtu-leaf.crt small-mtu-leaf.crt \
+        small-mtu-leaf.crt > small-mtu-chain.crt
+    mv small-mtu-chain.crt server.crt
+    case_test_start_server stdbuf -oL ${SERVER_BIN} -l d -e \
+        --pmtud 1 -x "$id" > svr_stdlog
+    clear_log
+    timeout 20 stdbuf -oL ${CLIENT_BIN} -T 1 -s 102400 -l d -t 10 -E \
+        --pmtud 1 -x "$id" > stdlog || client_rc=$?
+    # The test client keeps its engine alive after echo completion. A bounded
+    # idle timeout is accepted only with complete handshake and payload proof.
+    if { [ "$client_rc" = 0 ] || [ "$client_rc" = 124 ]; } \
+        && grep -q '>>>>>>>> pass:1' stdlog \
+        && grep -qF '[small-mtu]|handshake_complete|' stdlog \
+        && grep -qF '[small-mtu]|handshake_complete|' svr_stdlog \
+        && grep -q '|pkt_type:HSK|frame:CRYPTO' slog \
+        && { [ "$id" = 747 ] \
+            || grep -qF '[small-mtu]|drop_first_initial|' stdlog; } \
+        && [ -z "$(grep_err_log)" ]; then
+        result=pass
+    fi
+    case_test_stop_server
+    mv small-mtu-leaf.crt server.crt
+    case_print_result "$name" "$result"
+}
+
+case_fork_core_small_mtu_handshake_complete()
+{
+    case_fork_core_small_mtu_handshake 747 small_mtu_handshake_complete
+}
+
+case_fork_core_small_mtu_initial_loss_recovers()
+{
+    case_fork_core_small_mtu_handshake 748 small_mtu_initial_loss_recovers
+}
+
+case_test_case "small_mtu_handshake_complete" --id 747 --mode self-reporting --run case_fork_core_small_mtu_handshake_complete
+case_test_case "small_mtu_initial_loss_recovers" --id 748 --mode self-reporting --run case_fork_core_small_mtu_initial_loss_recovers
 case_test_case "cert_verify_failed_notify_reject" --id 900 --mode self-reporting --run case_fork_core_cert_verify_failed_notify_reject
 case_test_case "cert_verify_failed_notify_accept" --id 901 --mode self-reporting --run case_fork_core_cert_verify_failed_notify_accept
 case_test_case "NAT_rebinding_IP_change_cwnd_reset" --id native --mode self-reporting --run case_fork_core_NAT_rebinding_IP_change_cwnd_reset

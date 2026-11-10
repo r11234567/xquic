@@ -879,6 +879,10 @@ main(int argc, char *argv[])
                         xqc_test_send_ctl_lost_pmtud_probe_no_cc_reaction)
         || !CU_add_test(pSuite, "xqc_test_send_ctl_lost_packet_cc_reaction",
                         xqc_test_send_ctl_lost_packet_cc_reaction)
+        || !CU_add_test(pSuite, "xqc_test_pmtud_handshake_crypto_budget",
+                        xqc_test_pmtud_handshake_crypto_budget)
+        || !CU_add_test(pSuite, "xqc_test_pmtud_recycled_application_budget",
+                        xqc_test_pmtud_recycled_application_budget)
         || !CU_add_test(pSuite, "xqc_test_pmtud_big_losses_make_path_suspect",
                         xqc_test_pmtud_big_losses_make_path_suspect)
         || !CU_add_test(pSuite, "xqc_test_pmtud_small_losses_do_not_make_path_suspect",

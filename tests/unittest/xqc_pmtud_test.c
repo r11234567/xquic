@@ -25,6 +25,74 @@ void xqc_timer_loss_detection_timeout(xqc_timer_type_t type, xqc_usec_t now,
 #define PMTUD_CAP  1436
 #define CURR(conn) ((conn)->conn_initial_path->curr_pkt_out_size)
 
+/* RFC 9000 sections 14.1 and 14.3.1: bootstrap cannot rely on discovery
+ * that starts after TLS. Include the reserved ACK and AEAD space. */
+void
+xqc_test_pmtud_handshake_crypto_budget(void)
+{
+    const size_t caps[] = {1200, PMTUD_BASE, PMTUD_CAP};
+    const xqc_pkt_type_t types[] = {XQC_PTYPE_INIT, XQC_PTYPE_HSK};
+    unsigned char payload[4096];
+    memset(payload, 0x5a, sizeof(payload));
+
+    for (size_t i = 0; i < sizeof(caps) / sizeof(caps[0]); i++) {
+        xqc_connection_t *conn = test_engine_connect();
+        CU_ASSERT_FATAL(conn != NULL);
+        conn->pkt_out_size = caps[i];
+        for (size_t j = 0; j < sizeof(types) / sizeof(types[0]); j++) {
+            size_t offset = 0;
+            while (offset < sizeof(payload)) {
+                xqc_packet_out_t *po = xqc_write_new_packet(conn, types[j]);
+                CU_ASSERT_FATAL(po != NULL);
+                size_t header_size = po->po_used_size;
+                size_t written = 0;
+                ssize_t len = xqc_gen_crypto_frame(po, offset,
+                    payload + offset, sizeof(payload) - offset, &written);
+                CU_ASSERT_FATAL(len > 0 && written > 0);
+                po->po_used_size += len;
+                CU_ASSERT(po->po_used_size + XQC_PACKET_OUT_EXT_SPACE
+                    <= XQC_PACKET_INITIAL_MIN_LENGTH);
+
+                xqc_packet_in_t pi = {0};
+                xqc_stream_frame_t frame = {0};
+                pi.pos = po->po_buf + header_size;
+                pi.last = po->po_buf + po->po_used_size;
+                CU_ASSERT_FATAL(xqc_parse_crypto_frame(&pi, conn, &frame)
+                    == XQC_OK);
+                CU_ASSERT_EQUAL(frame.data_offset, offset);
+                CU_ASSERT_EQUAL(frame.data_length, written);
+                CU_ASSERT(memcmp(frame.data, payload + offset, written) == 0);
+                xqc_free(frame.data);
+                offset += written;
+            }
+        }
+        xqc_engine_destroy(conn->engine);
+    }
+}
+
+void
+xqc_test_pmtud_recycled_application_budget(void)
+{
+    xqc_connection_t *conn = test_engine_connect();
+    CU_ASSERT_FATAL(conn != NULL);
+    conn->pkt_out_size = PMTUD_CAP;
+    xqc_packet_out_t *po = xqc_write_new_packet(conn, XQC_PTYPE_INIT);
+    CU_ASSERT_FATAL(po != NULL);
+    CU_ASSERT(po->po_buf_size + XQC_PACKET_OUT_EXT_SPACE
+        <= XQC_PACKET_INITIAL_MIN_LENGTH);
+    xqc_maybe_recycle_packet_out(po, conn);
+
+    const xqc_pkt_type_t types[] = {XQC_PTYPE_0RTT, XQC_PTYPE_SHORT_HEADER};
+    for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
+        po = xqc_write_new_packet(conn, types[i]);
+        CU_ASSERT_FATAL(po != NULL);
+        CU_ASSERT_EQUAL(po->po_buf_size, PMTUD_CAP);
+        CU_ASSERT_EQUAL(conn->pkt_out_size, PMTUD_CAP);
+        xqc_maybe_recycle_packet_out(po, conn);
+    }
+    xqc_engine_destroy(conn->engine);
+}
+
 /*
  * A connection with PMTUD on, the base size @base, and its only path at
  * @curr, enough loss state for xqc_send_ctl_detect_lost to declare packets

@@ -245,6 +245,14 @@ xqc_packet_out_get_and_insert_send(xqc_send_queue_t *send_queue, enum xqc_pkt_ty
     packet_out->po_pkt.pkt_type = pkt_type;
     packet_out->po_pkt.pkt_pns = xqc_packet_type_to_pns(pkt_type);
 
+    /* RFC 9000 sections 14.1 and 14.3.1: discovery starts after TLS.
+     * Bootstrap CRYPTO must fit the minimum UDP budget, including the
+     * reserved ACK and AEAD space. Keep the application limit intact. */
+    if (pkt_type == XQC_PTYPE_INIT || pkt_type == XQC_PTYPE_HSK) {
+        packet_out->po_buf_size = xqc_min(packet_out->po_buf_size,
+            XQC_PACKET_INITIAL_MIN_LENGTH - XQC_PACKET_OUT_EXT_SPACE);
+    }
+
     /* generate packet number when send */
     packet_out->po_pkt.pkt_num = 0;
 
