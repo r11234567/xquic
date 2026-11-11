@@ -25,6 +25,32 @@
 #include "src/transport/xqc_frame_parser.h"
 #include "src/common/utils/vint/xqc_variable_len_int.h"
 
+/* Bound learned time tolerance by the current path's unbacked-off PTO.
+ * Saturate before multiplying, including for unusual test/config values. */
+static xqc_usec_t
+xqc_send_ctl_reordering_time_cap(xqc_send_ctl_t *send_ctl)
+{
+    xqc_usec_t pto = xqc_send_ctl_calc_pto(send_ctl);
+    return pto > XQC_MAX_UINT64_VALUE / 3 ? XQC_MAX_UINT64_VALUE : 3 * pto;
+}
+
+static xqc_bool_t
+xqc_send_ctl_can_track_lost_dgram(xqc_send_ctl_t *send_ctl,
+    xqc_packet_out_t *po, xqc_usec_t now)
+{
+    xqc_packet_number_t largest =
+        send_ctl->ctl_largest_acked[po->po_pkt.pkt_pns];
+
+    return send_ctl->ctl_conn->conn_settings.spurious_loss_detect_on
+           && po->po_origin == NULL && po->po_origin_ref_cnt == 0
+           && largest != XQC_MAX_UINT64_VALUE
+           && largest >= po->po_pkt.pkt_num
+           && largest - po->po_pkt.pkt_num < XQC_LOST_DGRAM_PN_WINDOW
+           && now >= po->po_sent_time
+           && (now - po->po_sent_time) / 3
+              < xqc_send_ctl_calc_pto(send_ctl);
+}
+
 int 
 xqc_send_ctl_may_remove_unacked_dgram(xqc_connection_t *conn, xqc_packet_out_t *po)
 {
@@ -132,6 +158,7 @@ xqc_send_ctl_create(xqc_path_ctx_t *path)
     send_ctl->ctl_max_bytes_in_flight = 0;
     send_ctl->ctl_reordering_packet_threshold = conn->conn_settings.loss_detection_pkt_thresh;
     send_ctl->ctl_reordering_time_threshold_shift = XQC_kTimeThresholdShift;
+    send_ctl->ctl_reordering_time_floor = 0;
     send_ctl->ctl_first_rtt_sample_time = 0;
 
     for (size_t i = 0; i < XQC_PNS_N; i++) {
@@ -222,6 +249,7 @@ xqc_send_ctl_reset(xqc_send_ctl_t *send_ctl)
     send_ctl->ctl_reordering_packet_threshold = XQC_kPacketThreshold;
     send_ctl->ctl_reordering_time_threshold_shift = XQC_kTimeThresholdShift;
     send_ctl->ctl_ack_sent_cnt = 0;
+    send_ctl->ctl_reordering_time_floor = 0;
     send_ctl->ctl_first_rtt_sample_time = 0;
 
     for (size_t i = 0; i < XQC_PNS_N; i++) {
@@ -928,9 +956,6 @@ xqc_send_ctl_on_ack_received(xqc_send_ctl_t *send_ctl, xqc_pn_ctl_t *pn_ctl, xqc
         need_del_record = 1;
     }
 
-    /* 记录ack info里这条路径发出的最大pn的包 */
-    xqc_packet_number_t path_largest_pkt_num = 0;
-
     xqc_init_sample_before_ack(&send_ctl->sampler);
 
     /* detect and remove acked packets */
@@ -939,6 +964,14 @@ xqc_send_ctl_on_ack_received(xqc_send_ctl_t *send_ctl, xqc_pn_ctl_t *pn_ctl, xqc
 
         // 筛选出当前路径的packet
         if (packet_out->po_path_id != send_ctl->ctl_path->path_id) {
+            continue;
+        }
+
+        if ((packet_out->po_flag & XQC_POF_LOST_DGRAM)
+            && !xqc_send_ctl_can_track_lost_dgram(send_ctl, packet_out,
+                                                 ack_recv_time))
+        {
+            xqc_send_queue_maybe_remove_unacked(packet_out, send_queue, NULL);
             continue;
         }
 
@@ -969,8 +1002,6 @@ xqc_send_ctl_on_ack_received(xqc_send_ctl_t *send_ctl, xqc_pn_ctl_t *pn_ctl, xqc
 
                 has_acked = 1;
             }
-
-            path_largest_pkt_num = packet_out->po_pkt.pkt_num;
 
             if (pns == XQC_PNS_APP_DATA) {
                 xqc_conn_on_key_phase_acked(send_ctl->ctl_path,
@@ -1012,7 +1043,10 @@ xqc_send_ctl_on_ack_received(xqc_send_ctl_t *send_ctl, xqc_pn_ctl_t *pn_ctl, xqc
             xqc_update_sample(&send_ctl->sampler, packet_out, send_ctl, ack_recv_time);
 
             /* Packet previously declared lost gets acked */
-            if (!(packet_out->po_flag & XQC_POF_SPURIOUS_LOSS) && (packet_out->po_flag & XQC_POF_RETRANSED)) {
+            if (!(packet_out->po_flag & XQC_POF_SPURIOUS_LOSS)
+                && (packet_out->po_flag
+                    & (XQC_POF_RETRANSED | XQC_POF_LOST_DGRAM)))
+            {
                 ++send_ctl->ctl_spurious_loss_count;
                 if (!spurious_loss_detected) {
                     spurious_loss_detected = 1;
@@ -1069,7 +1103,8 @@ xqc_send_ctl_on_ack_received(xqc_send_ctl_t *send_ctl, xqc_pn_ctl_t *pn_ctl, xqc
 
     /* spurious loss */
     if (spurious_loss_detected) {
-        xqc_send_ctl_on_spurious_loss_detected(send_ctl, pns, ack_recv_time, path_largest_pkt_num,
+        xqc_send_ctl_on_spurious_loss_detected(send_ctl, pns, ack_recv_time,
+                                               send_ctl->ctl_largest_acked[pns],
                                                spurious_loss_pktnum, spurious_loss_sent_time);
     }
 
@@ -1344,6 +1379,17 @@ xqc_send_ctl_on_spurious_loss_detected(xqc_send_ctl_t *send_ctl,
         return;
     }
     xqc_usec_t reorder_time_interval = ack_recv_time - spurious_loss_sent_time;
+    /* RFC 9002 6.1.2 permits learning from spurious loss. Newly highest
+     * ACKs can repeatedly sample the fast part of a reordered path, so
+     * even 2 * max_rtt can stay below the observed late-ACK interval.
+     * Keep that interval plus 1/8 slack, capped at three current PTOs.
+     * Reapply the cap when using it so a path improvement reduces the
+     * effective tolerance. The normal RTT estimator remains unchanged. */
+    xqc_usec_t cap = xqc_send_ctl_reordering_time_cap(send_ctl);
+    xqc_usec_t interval = xqc_min(reorder_time_interval, cap);
+    xqc_usec_t margin = xqc_min(interval >> 3, cap - interval);
+    send_ctl->ctl_reordering_time_floor = xqc_max(
+        send_ctl->ctl_reordering_time_floor, interval + margin);
     xqc_usec_t max_rtt = xqc_max(send_ctl->ctl_latest_rtt, send_ctl->ctl_srtt);
     while (max_rtt + (max_rtt >> send_ctl->ctl_reordering_time_threshold_shift) < reorder_time_interval
            && send_ctl->ctl_reordering_time_threshold_shift > 0)
@@ -1473,6 +1519,11 @@ xqc_send_ctl_detect_lost(xqc_send_ctl_t *send_ctl, xqc_send_queue_t *send_queue,
     /* loss_delay = 9/8 * max(latest_rtt, smoothed_rtt) */
     xqc_usec_t loss_delay = xqc_max(send_ctl->ctl_latest_rtt, send_ctl->ctl_srtt);
     loss_delay += loss_delay >> send_ctl->ctl_reordering_time_threshold_shift;
+    if (conn->conn_settings.spurious_loss_detect_on) {
+        loss_delay = xqc_max(loss_delay,
+            xqc_min(send_ctl->ctl_reordering_time_floor,
+                    xqc_send_ctl_reordering_time_cap(send_ctl)));
+    }
 
     /* Minimum time of kGranularity before packets are deemed lost. */
     loss_delay = xqc_max(loss_delay, XQC_kGranularity * 1000);
@@ -1501,6 +1552,13 @@ xqc_send_ctl_detect_lost(xqc_send_ctl_t *send_ctl, xqc_send_queue_t *send_queue,
         }
 
         if (po->po_path_id != send_ctl->ctl_path->path_id) {
+            continue;
+        }
+
+        if ((po->po_flag & XQC_POF_LOST_DGRAM)
+            && !xqc_send_ctl_can_track_lost_dgram(send_ctl, po, now))
+        {
+            xqc_send_queue_maybe_remove_unacked(po, send_queue, NULL);
             continue;
         }
 
@@ -1629,8 +1687,21 @@ xqc_send_ctl_detect_lost(xqc_send_ctl_t *send_ctl, xqc_send_queue_t *send_queue,
 
                 } else {
                     if (po->po_frame_types & XQC_FRAME_BIT_DATAGRAM) {
-                        xqc_send_ctl_on_dgram_dropped(conn, po);
-                        xqc_send_queue_maybe_remove_unacked(po, conn->conn_send_queue, NULL);
+                        /* RFC 9002 6.1.1 permits learning from spurious
+                         * loss. Keep recent originals for late ACK samples,
+                         * with a per-path PN window and three-PTO lifetime.
+                         * RFC 9221 5.2 leaves these payloads unretransmitted.
+                         */
+                        if (xqc_send_ctl_can_track_lost_dgram(send_ctl, po,
+                                                            now))
+                        {
+                            po->po_flag |= XQC_POF_LOST_DGRAM;
+
+                        } else {
+                            xqc_send_ctl_on_dgram_dropped(conn, po);
+                            xqc_send_queue_maybe_remove_unacked(po,
+                                conn->conn_send_queue, NULL);
+                        }
 
                     } else {
                         /* remove the packet that does not need retransmission */

@@ -18,6 +18,9 @@
 #define XQC_kTimeThresholdShift             3
 #define XQC_kPersistentCongestionThreshold  3
 
+/* Recent loss records used by the opt-in RFC 9002 6.1.1 adaptation. */
+#define XQC_LOST_DGRAM_PN_WINDOW           128
+
 #define XQC_CONSECUTIVE_PTO_THRESH          2
 /* cap of xqc_send_ctl_get_effective_pto_count(), as the PTO backoff's */
 #define XQC_EFFECTIVE_PTO_COUNT_MAX         16
@@ -188,6 +191,7 @@ typedef struct xqc_send_ctl_s {
 
     xqc_packet_number_t         ctl_reordering_packet_threshold;
     int32_t                     ctl_reordering_time_threshold_shift;
+    xqc_usec_t                  ctl_reordering_time_floor;
 
     xqc_sample_t                sampler;
 

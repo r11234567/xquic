@@ -194,6 +194,25 @@ typedef struct {
     xqc_log_t           *log;
 } xqc_wlb_scheduler_t;
 
+/* A cwnd-sized DATAGRAM queue can wait many pacing intervals while a
+ * later packet spills to another path and overtakes it. Admit only the
+ * credit available now, including bytes already assigned in this pass.
+ * STREAM/control retain their existing cwnd-only MinRTT policy. */
+static xqc_bool_t
+wlb_path_can_send(xqc_path_ctx_t *path, xqc_packet_out_t *po, int check_cwnd)
+{
+    if (!xqc_scheduler_check_path_can_send(path, po, check_cwnd)) {
+        return XQC_FALSE;
+    }
+    if (check_cwnd && (po->po_frame_types & XQC_FRAME_BIT_DATAGRAM)) {
+        xqc_pacing_t *pacing = &path->path_send_ctl->ctl_pacing;
+        return !xqc_pacing_is_on(pacing)
+               || xqc_pacing_can_schedule(pacing, path->path_schedule_bytes,
+                                         po->po_used_size);
+    }
+    return XQC_TRUE;
+}
+
 /* Forward declaration — used by wlb_flow_expire() for loss-triggered eviction */
 static xqc_path_ctx_t *wlb_find_path_ctx(xqc_connection_t *conn, uint64_t path_id);
 static xqc_bool_t wlb_path_has_excess_loss(xqc_path_ctx_t *path);
@@ -1040,7 +1059,7 @@ wlb_wrr_select(xqc_wlb_scheduler_t *s, xqc_connection_t *conn,
         if (path == NULL) {
             continue;
         }
-        if (check_cwnd && !xqc_scheduler_check_path_can_send(path, packet_out, check_cwnd)) {
+        if (check_cwnd && !wlb_path_can_send(path, packet_out, check_cwnd)) {
             continue;
         }
         s->paths[i].deficit += (int64_t)s->paths[i].weight;
@@ -1118,7 +1137,7 @@ wlb_minrtt_fallback(xqc_connection_t *conn, xqc_packet_out_t *packet_out,
             }
         }
 
-        if (!xqc_scheduler_check_path_can_send(path, packet_out, check_cwnd)) {
+        if (!wlb_path_can_send(path, packet_out, check_cwnd)) {
             continue;
         }
 
@@ -1248,7 +1267,7 @@ wlb_pick_evicted_probe(xqc_wlb_scheduler_t *s, xqc_connection_t *conn,
     xqc_path_ctx_t *probe =
         candidates[(size_t)(s->next_evicted_probe_path % (uint64_t)n)];
     if (check_cwnd
-        && !xqc_scheduler_check_path_can_send(probe, packet_out, check_cwnd))
+        && !wlb_path_can_send(probe, packet_out, check_cwnd))
     {
         /* Step the cursor anyway. A blackholed path still has everything it
          * sent in flight, so it is precisely the candidate that stays
@@ -1432,7 +1451,7 @@ xqc_wlb_scheduler_get_path(void *scheduler,
                 entry->hash = WLB_FLOW_TOMBSTONE;
             }
 
-            if (path && xqc_scheduler_check_path_can_send(path, packet_out, check_cwnd)) {
+            if (path && wlb_path_can_send(path, packet_out, check_cwnd)) {
                 entry->last_ts = now_us;
                 xqc_log(conn->log, XQC_LOG_DEBUG,
                         "|wlb|flow_hit|flow:%ui|path:%ui|",
@@ -1457,7 +1476,7 @@ xqc_wlb_scheduler_get_path(void *scheduler,
      * already-hot path. */
     if (pin_flow && in_recovery_grace && s->recovery_prefer_path_id != WLB_NO_PATH_ID) {
         xqc_path_ctx_t *rpath = wlb_find_path_ctx(conn, s->recovery_prefer_path_id);
-        if (rpath && xqc_scheduler_check_path_can_send(rpath, packet_out, check_cwnd)) {
+        if (rpath && wlb_path_can_send(rpath, packet_out, check_cwnd)) {
             wlb_flow_insert(s, packet_out->po_flow_hash, rpath->path_id, now_us);
             xqc_log(conn->log, XQC_LOG_INFO,
                     "|wlb|recovery_prefer|flow:%ui|path:%ui|",
@@ -1474,7 +1493,7 @@ xqc_wlb_scheduler_get_path(void *scheduler,
     /* Single active path — skip WRR overhead */
     if (s->n_paths == 1) {
         xqc_path_ctx_t *path = wlb_find_path_ctx(conn, s->paths[0].path_id);
-        if (path && xqc_scheduler_check_path_can_send(path, packet_out, check_cwnd)) {
+        if (path && wlb_path_can_send(path, packet_out, check_cwnd)) {
             /* Single-path period: do NOT pin. Once the secondary path appears
              * in s->paths, the next packet of this flow misses the flow-table
              * lookup and goes through wlb_pick_pin_path for weighted

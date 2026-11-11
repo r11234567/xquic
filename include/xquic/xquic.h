@@ -1549,6 +1549,13 @@ typedef struct xqc_conn_settings_s {
     /** idle timeout interval, effective after handshake completion */
     xqc_msec_t idle_time_out;
     xqc_usec_t fec_conn_queue_rpr_timeout;
+    /** Learn reordering thresholds from late ACKs (RFC 9002 6.1.1/6.1.2).
+     * Learned time tolerance includes 1/8 margin and is bounded by three
+     * current path PTOs; path reset clears it. RTT sampling is unchanged.
+     * Lost unreliable DATAGRAM originals retain a bounded recent-PN
+     * history below three current path PTOs. ACK/loss processing expires
+     * records, and path/connection teardown releases them. No retransmission
+     * is requested by enabling this setting (RFC 9221 5.2). */
     int32_t spurious_loss_detect_on;
     /** limit of anti-amplification, default 5 */
     uint32_t anti_amplification_limit;

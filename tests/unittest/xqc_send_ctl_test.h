@@ -81,4 +81,16 @@ void xqc_test_send_ctl_lost_packet_cc_reaction(void);
 void xqc_test_effective_pto_count_silent_path(void);
 void xqc_test_effective_pto_count_bounds(void);
 
+/* RFC 9002 6.1.1 / RFC 9221 5.2: bounded late DATAGRAM ACK evidence. */
+void xqc_test_lost_dgram_late_ack(void);
+void xqc_test_lost_dgram_expiry(void);
+void xqc_test_lost_dgram_window(void);
+void xqc_test_lost_dgram_disabled(void);
+void xqc_test_lost_dgram_other_path(void);
+void xqc_test_lost_dgram_retransmission_requested(void);
+void xqc_test_lost_dgram_path_close(void);
+void xqc_test_reordering_time_floor(void);
+void xqc_test_reordering_time_floor_bounds(void);
+void xqc_test_reordering_time_floor_disabled(void);
+
 #endif

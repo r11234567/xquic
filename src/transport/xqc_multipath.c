@@ -776,6 +776,13 @@ xqc_path_move_unack_packets_from_conn(xqc_path_ctx_t *path, xqc_connection_t *co
         }
 
         if (po->po_path_id == closing_path_id) {
+            /* Late-ACK evidence is useful only while its path survives. */
+            if (po->po_flag & XQC_POF_LOST_DGRAM) {
+                xqc_send_ctl_on_dgram_dropped(conn, po);
+                xqc_send_queue_maybe_remove_unacked(po,
+                    conn->conn_send_queue, NULL);
+                continue;
+            }
             if (po->po_flag & XQC_POF_IN_FLIGHT) {
                 xqc_send_ctl_decrease_inflight(conn, po);
 

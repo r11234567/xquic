@@ -2389,3 +2389,122 @@ xqc_test_wlb_prefers_healthy_path_over_pto_blocked(void)
 
     wlb_test_teardown(&f);
 }
+
+
+static void
+wlb_test_enable_pacing(wlb_test_fixture_t *f, int i, uint32_t budget)
+{
+    xqc_send_ctl_t *ctl = &f->send_ctls[i];
+    xqc_timer_init(&ctl->path_timer_manager, &f->log, ctl);
+    xqc_pacing_init(&ctl->ctl_pacing, 1, ctl);
+    ctl->ctl_pacing.bytes_budget = budget;
+    ctl->ctl_pacing.last_sent_time = g_fake_now_us;
+}
+
+
+/* Admission must count previously scheduled bytes without arming a timer
+ * that would prevent those earlier, budgeted packets from being sent. */
+void
+xqc_test_wlb_pacing_credit_bounds(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+    wlb_test_add_path(&f, 0, 10000, 1024 * 1024, 0);
+    wlb_test_enable_pacing(&f, 0, 200);
+    xqc_send_ctl_t *ctl = &f.send_ctls[0];
+    xqc_pacing_t *pacing = &ctl->ctl_pacing;
+    CU_ASSERT_TRUE(xqc_pacing_can_schedule(pacing, 100, 100));
+    CU_ASSERT_FALSE(xqc_pacing_can_schedule(pacing, 101, 100));
+    CU_ASSERT_FALSE(xqc_pacing_can_schedule(pacing, UINT32_MAX, 100));
+    CU_ASSERT_FALSE(xqc_timer_is_set(&ctl->path_timer_manager,
+        XQC_TIMER_PACING));
+    CU_ASSERT_EQUAL(pacing->pending_budget, 0);
+    CU_ASSERT_EQUAL(pacing->bytes_budget, 200);
+
+    /* Refilled credit is available for admission without consuming it. */
+    wlb_test_clock_advance(1000);
+    CU_ASSERT_TRUE(xqc_pacing_can_schedule(pacing, 200, 100));
+    CU_ASSERT_EQUAL(pacing->bytes_budget, 200);
+    CU_ASSERT_FALSE(xqc_timer_is_set(&ctl->path_timer_manager,
+        XQC_TIMER_PACING));
+    wlb_test_teardown(&f);
+}
+
+
+/* A pacing-blocked pin spills only the current packet. It neither builds
+ * a cwnd-sized pacing backlog nor overwrites the flow's preferred path. */
+void
+xqc_test_wlb_pacing_spill_preserves_pin(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+    xqc_path_ctx_t *p0 = wlb_test_add_path(&f, 0, 10000, 192 * 1024, 0);
+    wlb_test_add_path(&f, 1, 10000, 64 * 1024, 0);
+    wlb_test_enable_pacing(&f, 0, 200);
+    uint32_t flow = 0xFACE2301;
+    (void) wlb_test_invoke(&f, flow);
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, flow), 0);
+    p0->path_schedule_bytes = 101;
+    f.send_ctls[0].ctl_pacing.bytes_budget = 200;
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, flow), 1);
+    CU_ASSERT_FALSE(xqc_timer_is_set(&f.send_ctls[0].path_timer_manager,
+        XQC_TIMER_PACING));
+    p0->path_schedule_bytes = 100;
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, flow), 0);
+    wlb_test_teardown(&f);
+}
+
+
+/* If every empty path is out of credit, block and arrange real wakeups.
+ * Expiry replenishes credit and scheduling resumes without a new packet. */
+void
+xqc_test_wlb_pacing_blocked_wakes(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+    for (int i = 0; i < 2; i++) {
+        wlb_test_add_path(&f, i, 10000, 64 * 1024, 0);
+        wlb_test_enable_pacing(&f, i, 0);
+    }
+    xqc_packet_out_t po;
+    wlb_test_make_packet_out(&po, 0xFACE2302);
+    xqc_bool_t blocked = XQC_FALSE;
+    CU_ASSERT_PTR_NULL(xqc_wlb_scheduler_cb.xqc_scheduler_get_path(
+        f.scheduler, &f.conn, &po, 1, 0, &blocked));
+    CU_ASSERT_TRUE(blocked);
+    for (int i = 0; i < 2; i++) {
+        CU_ASSERT_TRUE(xqc_timer_is_set(&f.send_ctls[i].path_timer_manager,
+            XQC_TIMER_PACING));
+    }
+    wlb_test_clock_advance(2000);
+    for (int i = 0; i < 2; i++) {
+        xqc_timer_expire(&f.send_ctls[i].path_timer_manager, g_fake_now_us);
+    }
+    CU_ASSERT_PTR_NOT_NULL(xqc_wlb_scheduler_cb.xqc_scheduler_get_path(
+        f.scheduler, &f.conn, &po, 1, 0, &blocked));
+    CU_ASSERT_FALSE(blocked);
+    wlb_test_teardown(&f);
+}
+
+
+/* Preserve STREAM/control MinRTT placement, disabled pacing, and the
+ * explicitly unconstrained scheduling mode used by urgent traffic. */
+void
+xqc_test_wlb_pacing_control_compatibility(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+    wlb_test_add_path(&f, 0, 10000, 64 * 1024, 0);
+    wlb_test_enable_pacing(&f, 0, 0);
+    CU_ASSERT_EQUAL(wlb_test_invoke_stream(&f), 0);
+    CU_ASSERT_EQUAL(wlb_test_invoke_control(&f), 0);
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, 0xFACE2303), UINT64_MAX);
+    xqc_packet_out_t po;
+    wlb_test_make_packet_out(&po, 0xFACE2303);
+    xqc_bool_t blocked = XQC_FALSE;
+    CU_ASSERT_PTR_NOT_NULL(xqc_wlb_scheduler_cb.xqc_scheduler_get_path(
+        f.scheduler, &f.conn, &po, 0, 0, &blocked));
+    f.send_ctls[0].ctl_pacing.pacing_on = 0;
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, 0xFACE2303), 0);
+    wlb_test_teardown(&f);
+}

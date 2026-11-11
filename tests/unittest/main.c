@@ -976,6 +976,26 @@ main(int argc, char *argv[])
                         xqc_test_effective_pto_count_silent_path)
         || !CU_add_test(pSuite, "xqc_test_effective_pto_count_bounds",
                         xqc_test_effective_pto_count_bounds)
+        || !CU_add_test(pSuite, "xqc_test_lost_dgram_late_ack",
+                        xqc_test_lost_dgram_late_ack)
+        || !CU_add_test(pSuite, "xqc_test_lost_dgram_expiry",
+                        xqc_test_lost_dgram_expiry)
+        || !CU_add_test(pSuite, "xqc_test_lost_dgram_window",
+                        xqc_test_lost_dgram_window)
+        || !CU_add_test(pSuite, "xqc_test_lost_dgram_disabled",
+                        xqc_test_lost_dgram_disabled)
+        || !CU_add_test(pSuite, "xqc_test_lost_dgram_other_path",
+                        xqc_test_lost_dgram_other_path)
+        || !CU_add_test(pSuite, "xqc_test_lost_dgram_retransmission_requested",
+                        xqc_test_lost_dgram_retransmission_requested)
+        || !CU_add_test(pSuite, "xqc_test_lost_dgram_path_close",
+                        xqc_test_lost_dgram_path_close)
+        || !CU_add_test(pSuite, "xqc_test_reordering_time_floor",
+                        xqc_test_reordering_time_floor)
+        || !CU_add_test(pSuite, "xqc_test_reordering_time_floor_bounds",
+                        xqc_test_reordering_time_floor_bounds)
+        || !CU_add_test(pSuite, "xqc_test_reordering_time_floor_disabled",
+                        xqc_test_reordering_time_floor_disabled)
         /* RFC 9000 §6.2 Version Negotiation abort suite */
         || !CU_add_test(pSuite, "xqc_test_vn_abort_on_unsupported_version", xqc_test_vn_abort_on_unsupported_version)
         || !CU_add_test(pSuite, "xqc_test_vn_downgrade_protection_when_version_matches", xqc_test_vn_downgrade_protection_when_version_matches)
@@ -1185,6 +1205,14 @@ main(int argc, char *argv[])
         || !CU_add_test(pSuite, "xqc_test_wlb_reapply_second_path_after_swap", xqc_test_wlb_reapply_second_path_after_swap)
         || !CU_add_test(pSuite, "xqc_test_wlb_last_path_over_pto_still_schedules", xqc_test_wlb_last_path_over_pto_still_schedules)
         || !CU_add_test(pSuite, "xqc_test_wlb_prefers_healthy_path_over_pto_blocked", xqc_test_wlb_prefers_healthy_path_over_pto_blocked)
+        || !CU_add_test(pSuite, "xqc_test_wlb_pacing_credit_bounds",
+                        xqc_test_wlb_pacing_credit_bounds)
+        || !CU_add_test(pSuite, "xqc_test_wlb_pacing_spill_preserves_pin",
+                        xqc_test_wlb_pacing_spill_preserves_pin)
+        || !CU_add_test(pSuite, "xqc_test_wlb_pacing_blocked_wakes",
+                        xqc_test_wlb_pacing_blocked_wakes)
+        || !CU_add_test(pSuite, "xqc_test_wlb_pacing_control_compatibility",
+                        xqc_test_wlb_pacing_control_compatibility)
         || !CU_add_test(pSuite, "xqc_test_wlb_reapply_from_minrtt_schedules", xqc_test_wlb_reapply_from_minrtt_schedules)
         || !CU_add_test(pSuite, "xqc_test_wlb_reapply_to_minrtt_schedules", xqc_test_wlb_reapply_to_minrtt_schedules)
         /* per-path app-limited marking at the end of each engine pass */
