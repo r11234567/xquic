@@ -50,9 +50,9 @@
  *   off a path whose recent loss reaches WLB_LOSS_EVICT_THRESH
  *   (wlb_flow_expire). New pins prefer paths below that threshold when
  *   available; if every path exceeds it, weighted pinning still applies.
- *   A blackholed path is handed nothing that could be ACKed, so one DATAGRAM
- *   per WLB_EVICTED_PROBE_INTERVAL_US is sent on it
- *   as a probe (wlb_pick_evicted_probe).  When a path returns after a loss,
+ *   A blackholed path receives a separate PING at most once per
+ *   WLB_EVICTED_PROBE_INTERVAL_US (wlb_pick_evicted_probe). Application
+ *   DATAGRAMs are never consumed as recovery probes. When a path returns,
  *   every pin is wiped and, for WLB_RECOVERY_UNPIN_GRACE_US, existing pins
  *   are not honoured: each packet re-pins its flow, onto the returned path
  *   when that path can send.  The wipe is gated on ever_lost_path so that a
@@ -116,13 +116,9 @@
 #define WLB_WARMUP_FLOOR_PCT  20
 #define WLB_STEADY_FLOOR_PCT  5
 #define WLB_QUANTUM_TOTAL      100
-/* An evicted (repeated-PTO) path receives no payload, so nothing can ever
- * ACK on it and ctl_pto_count can never reset: eviction would be permanent
- * even after the link heals. Send one real payload packet per interval as a
- * probe; a surviving probe's ACK clears the PTO count and the path re-enters
- * scheduling through a fresh warm-up. One datagram per half-second on a dead
- * path is a negligible loss (inner TCP retransmits; datagrams are best-
- * effort by contract). */
+/* A separate PING lets an evicted path recover without sacrificing an
+ * application's unreliable payload. A small flow can otherwise lose every
+ * packet that arrives just after the probe interval. */
 #define WLB_EVICTED_PROBE_INTERVAL_US (500ULL * 1000)
 /* Minimum wall-clock span for one goodput sample. Sampling faster than this
  * measures the inside of an ACK burst rather than sustained rate. */
@@ -1224,12 +1220,12 @@ xqc_wlb_scheduler_copy_path_stats(void *scheduler, xqc_wlb_path_stats_t *out,
 /* Sentinel: per-packet WRR without flow pinning (UDP/QUIC datagrams) */
 #define WLB_FLOW_HASH_UNPINNED  0xFFFFFFFFU
 
-/* Pick an ACTIVE-but-evicted path for a single probe payload packet, at
+/* Pick an ACTIVE-but-evicted path for a separate PING probe, at
  * most once per WLB_EVICTED_PROBE_INTERVAL_US across the connection.
  * Round-robins across multiple evicted paths so one permanently dead path
  * cannot starve another's recovery probe. Returns NULL when there is
- * nothing to probe, the interval has not elapsed, or the packet does not
- * fit the path's cwnd. */
+ * nothing to probe, the interval has not elapsed, or credit is unavailable.
+ * A queued probe already provides that path's recovery opportunity. */
 static xqc_path_ctx_t *
 wlb_pick_evicted_probe(xqc_wlb_scheduler_t *s, xqc_connection_t *conn,
                        xqc_packet_out_t *packet_out, int check_cwnd,
@@ -1266,8 +1262,24 @@ wlb_pick_evicted_probe(xqc_wlb_scheduler_t *s, xqc_connection_t *conn,
 
     xqc_path_ctx_t *probe =
         candidates[(size_t)(s->next_evicted_probe_path % (uint64_t)n)];
-    if (check_cwnd
-        && !wlb_path_can_send(probe, packet_out, check_cwnd))
+    s->next_evicted_probe_path++;
+    if (!xqc_list_empty(
+            &probe->path_schedule_buf[XQC_SEND_TYPE_PTO_PROBE]))
+    {
+        return NULL;
+    }
+    xqc_list_for_each(pos, &conn->conn_send_queue->sndq_pto_probe_packets) {
+        xqc_packet_out_t *pending = xqc_list_entry(pos, xqc_packet_out_t,
+                                                  po_list);
+        if (pending->po_path_id == probe->path_id) {
+            return NULL;
+        }
+    }
+    xqc_pacing_t *pacing = &probe->path_send_ctl->ctl_pacing;
+    if (!xqc_scheduler_check_path_can_send(probe, packet_out, check_cwnd)
+        || (xqc_pacing_is_on(pacing)
+            && !xqc_pacing_can_schedule(pacing, probe->path_schedule_bytes,
+                                       packet_out->po_used_size)))
     {
         /* Step the cursor anyway. A blackholed path still has everything it
          * sent in flight, so it is precisely the candidate that stays
@@ -1275,14 +1287,9 @@ wlb_pick_evicted_probe(xqc_wlb_scheduler_t *s, xqc_connection_t *conn,
          * rotation forever and starve every other evicted path's probe --
          * the opposite of what the round-robin above promises. The interval
          * is deliberately not consumed: no probe was sent. */
-        s->next_evicted_probe_path++;
         return NULL;
     }
-    s->next_evicted_probe_path++;
     s->last_evicted_probe_us = now_us;
-    xqc_log(s->log, XQC_LOG_INFO,
-            "|wlb|evicted_probe|path:%ui|pto:%ud|",
-            probe->path_id, probe->path_send_ctl->ctl_pto_count);
     return probe;
 }
 
@@ -1350,25 +1357,6 @@ xqc_wlb_scheduler_get_path(void *scheduler,
     xqc_bool_t pin_flow = (packet_out->po_flow_hash != WLB_FLOW_HASH_UNPINNED);
 
     uint64_t now_us = xqc_monotonic_timestamp();
-
-    /* Recovery probe for evicted paths — see wlb_pick_evicted_probe. Only an
-     * unreliable DATAGRAM may be used here. Sending a unique reliable STREAM
-     * packet down a known-blackholed path creates a receive-ordering hole;
-     * the healthy paths can then deliver thousands of later frames behind it
-     * and exhaust the peer's reassembly-node budget.
-     *
-     * As the code stands the test cannot be false: po_flow_hash is set only
-     * by the datagram writer, and a packet without it already returned
-     * through the MinRTT fallback above. It is kept as a statement of the
-     * invariant this depends on, not as a live branch -- whoever gives a
-     * STREAM packet a flow hash needs to see why that is unsafe here. */
-    if (packet_out->po_frame_types & XQC_FRAME_BIT_DATAGRAM) {
-        xqc_path_ctx_t *probe =
-            wlb_pick_evicted_probe(s, conn, packet_out, check_cwnd, now_us);
-        if (probe) {
-            return probe;
-        }
-    }
 
     /* After path recovery, allow a brief per-packet WRR phase so existing TCP
      * flows don't immediately re-pin to the surviving path before the restored
@@ -1566,7 +1554,30 @@ static void
 xqc_wlb_scheduler_handle_conn_event(void *scheduler,
     xqc_connection_t *conn, xqc_scheduler_conn_event_t event, void *event_arg)
 {
-    /* No action needed */
+    if (event != XQC_SCHED_EVENT_CONN_ROUND_START || !conn->enable_multipath
+        || conn->conn_state != XQC_CONN_STATE_ESTABED)
+    {
+        return;
+    }
+
+    /* RFC 9000 19.2: PING elicits an ACK without application data.
+     * Queue before the probe-list scheduling pass, never while selecting
+     * the path of an application packet. Bound admission by cwnd and pacing
+     * (RFC 9002 7), even though the existing probe send pass bypasses them.
+     * Reserve the largest short header, PING byte, and AEAD tag. */
+    xqc_packet_out_t ping = {0};
+    ping.po_frame_types = XQC_FRAME_BIT_PING;
+    ping.po_used_size = XQC_MAX_CID_LEN + 6 + XQC_TLS_AEAD_OVERHEAD_MAX_LEN;
+    xqc_wlb_scheduler_t *s = scheduler;
+    xqc_path_ctx_t *probe = wlb_pick_evicted_probe(s, conn, &ping, 1,
+                                                  xqc_monotonic_timestamp());
+    if (probe && xqc_path_send_ping_to_probe(probe, XQC_PNS_APP_DATA,
+                         XQC_PATH_SPECIFIED_BY_PQP) == XQC_OK)
+    {
+        xqc_log(s->log, XQC_LOG_INFO,
+                "|wlb|evicted_probe|path:%ui|pto:%ud|type:ping|",
+                probe->path_id, probe->path_send_ctl->ctl_pto_count);
+    }
 }
 
 const xqc_scheduler_callback_t xqc_wlb_scheduler_cb = {

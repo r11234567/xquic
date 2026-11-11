@@ -1213,6 +1213,10 @@ main(int argc, char *argv[])
                         xqc_test_wlb_pacing_blocked_wakes)
         || !CU_add_test(pSuite, "xqc_test_wlb_pacing_control_compatibility",
                         xqc_test_wlb_pacing_control_compatibility)
+        || !CU_add_test(pSuite, "xqc_test_wlb_ping_probe_preserves_small_flow",
+                        xqc_test_wlb_ping_probe_preserves_small_flow)
+        || !CU_add_test(pSuite, "xqc_test_wlb_ping_probe_gates",
+                        xqc_test_wlb_ping_probe_gates)
         || !CU_add_test(pSuite, "xqc_test_wlb_reapply_from_minrtt_schedules", xqc_test_wlb_reapply_from_minrtt_schedules)
         || !CU_add_test(pSuite, "xqc_test_wlb_reapply_to_minrtt_schedules", xqc_test_wlb_reapply_to_minrtt_schedules)
         /* per-path app-limited marking at the end of each engine pass */

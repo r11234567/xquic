@@ -119,5 +119,7 @@ void xqc_test_wlb_pacing_credit_bounds(void);
 void xqc_test_wlb_pacing_spill_preserves_pin(void);
 void xqc_test_wlb_pacing_blocked_wakes(void);
 void xqc_test_wlb_pacing_control_compatibility(void);
+void xqc_test_wlb_ping_probe_preserves_small_flow(void);
+void xqc_test_wlb_ping_probe_gates(void);
 
 #endif /* XQC_WLB_TEST_H_INCLUDED */
