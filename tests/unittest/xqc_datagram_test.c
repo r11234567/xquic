@@ -13,10 +13,20 @@
 #include "src/transport/xqc_packet_in.h"
 #include "src/transport/xqc_multipath.h"
 #include "src/transport/xqc_send_queue.h"
+#include "src/transport/xqc_datagram.h"
+#include "src/common/xqc_time.h"
 #include "xqc_common_test.h"
 
 static void xqc_test_init_dgram_packet(xqc_packet_in_t *packet_in,
     xqc_packet_out_t *packet_out, xqc_pkt_type_t pkt_type);
+static xqc_connection_t *xqc_test_dgram_queue_conn(uint32_t room);
+static void xqc_test_dgram_write_ready(xqc_connection_t *conn, void *data);
+static void xqc_test_dgram_queue_drain_one(xqc_connection_t *conn);
+static uint64_t xqc_test_dgram_queue_time(void);
+static void xqc_test_dgram_queue_destroy(xqc_connection_t *conn);
+
+static xqc_timestamp_pt xqc_test_dgram_saved_monotonic;
+static xqc_timestamp_pt xqc_test_dgram_saved_realtime;
 
 static void
 xqc_test_init_dgram_packet(xqc_packet_in_t *packet_in,
@@ -227,4 +237,182 @@ xqc_test_reject_dgram_at_invalid_encryption_level()
 
         xqc_engine_destroy(conn->engine);
     }
+}
+
+
+static xqc_connection_t *
+xqc_test_dgram_queue_conn(uint32_t room)
+{
+    /* Supply correctly typed fixture clocks. The library's default callback
+     * type defect is tracked separately and is not suppressed here. */
+    xqc_test_dgram_saved_monotonic = xqc_monotonic_timestamp;
+    xqc_test_dgram_saved_realtime = xqc_realtime_timestamp;
+    xqc_monotonic_timestamp = xqc_test_dgram_queue_time;
+    xqc_realtime_timestamp = xqc_test_dgram_queue_time;
+    xqc_connection_t *conn = test_engine_connect();
+    CU_ASSERT_PTR_NOT_NULL_FATAL(conn);
+    conn->conn_flag |= XQC_CONN_FLAG_CAN_SEND_1RTT | XQC_CONN_FLAG_TICKING;
+    conn->conn_settings.defer_send_flush = 1;
+    conn->remote_settings.max_datagram_frame_size = 1200;
+    conn->dgram_mss = 1200;
+    conn->conn_settings.max_datagram_unsent_packets = room
+        + xqc_send_queue_get_unsent_packets_num(conn->conn_send_queue);
+    return conn;
+}
+
+
+static uint64_t
+xqc_test_dgram_queue_time(void)
+{
+    return 1000000;
+}
+
+
+static void
+xqc_test_dgram_queue_destroy(xqc_connection_t *conn)
+{
+    xqc_engine_destroy(conn->engine);
+    xqc_monotonic_timestamp = xqc_test_dgram_saved_monotonic;
+    xqc_realtime_timestamp = xqc_test_dgram_saved_realtime;
+}
+
+
+static void
+xqc_test_dgram_write_ready(xqc_connection_t *conn, void *data)
+{
+    (*(unsigned *)data)++;
+}
+
+
+static void
+xqc_test_dgram_queue_drain_one(xqc_connection_t *conn)
+{
+    xqc_send_queue_t *queue = conn->conn_send_queue;
+    xqc_list_head_t *pos;
+    xqc_list_for_each(pos, &queue->sndq_send_packets) {
+        xqc_packet_out_t *po = xqc_list_entry(pos, xqc_packet_out_t, po_list);
+        if (po->po_frame_types & XQC_FRAME_BIT_DATAGRAM) {
+            xqc_send_queue_remove_send(pos);
+            xqc_send_queue_insert_free(po, &queue->sndq_free_packets, queue);
+            return;
+        }
+    }
+    CU_FAIL("no queued DATAGRAM to drain");
+}
+
+
+/* The boundary rejects before taking ownership or consuming a datagram ID.
+ * Draining an unsent record reopens admission without an unrelated ACK. */
+void
+xqc_test_datagram_unsent_limit(void)
+{
+    xqc_connection_t *conn = xqc_test_dgram_queue_conn(2);
+    xqc_send_queue_t *queue = conn->conn_send_queue;
+    const unsigned char data[64] = {0};
+    uint64_t id = UINT64_MAX;
+    for (int i = 0; i < 2; i++) {
+        CU_ASSERT_EQUAL(xqc_datagram_send(conn, (void *)data, sizeof(data),
+            &id, XQC_DATA_QOS_HIGH), XQC_OK);
+    }
+    uint64_t used = queue->sndq_packets_used;
+    uint64_t next_id = conn->next_dgram_id;
+    id = UINT64_MAX;
+    CU_ASSERT_EQUAL(xqc_datagram_send(conn, (void *)data, sizeof(data),
+        &id, XQC_DATA_QOS_HIGH), -XQC_EAGAIN);
+    CU_ASSERT_EQUAL(id, UINT64_MAX);
+    CU_ASSERT_EQUAL(conn->next_dgram_id, next_id);
+    CU_ASSERT_EQUAL(queue->sndq_packets_used, used);
+    CU_ASSERT_TRUE(queue->sndq_dgram_full);
+    CU_ASSERT_FALSE(queue->sndq_full);
+
+    unsigned ready = 0;
+    conn->conn_flag |= XQC_CONN_FLAG_UPPER_CONN_EXIST;
+    conn->dgram_data = &ready;
+    conn->app_proto_cbs.dgram_cbs.datagram_write_notify =
+        xqc_test_dgram_write_ready;
+    xqc_datagram_notify_write(conn);
+    CU_ASSERT_EQUAL(ready, 0);
+    CU_ASSERT_TRUE(queue->sndq_dgram_full);
+    xqc_test_dgram_queue_drain_one(conn);
+    xqc_datagram_notify_write(conn);
+    CU_ASSERT_EQUAL(ready, 1);
+    CU_ASSERT_FALSE(queue->sndq_dgram_full);
+    CU_ASSERT_EQUAL(xqc_datagram_send(conn, (void *)data, sizeof(data),
+        &id, XQC_DATA_QOS_HIGH), XQC_OK);
+    xqc_test_dgram_queue_destroy(conn);
+}
+
+
+/* In-flight ownership must not consume the unsent cap, while the original
+ * total-allocation limit still applies. Zero retains uncapped admission. */
+void
+xqc_test_datagram_unsent_limit_inflight_and_disabled(void)
+{
+    xqc_connection_t *conn = xqc_test_dgram_queue_conn(1);
+    xqc_send_queue_t *queue = conn->conn_send_queue;
+    const unsigned char data[64] = {0};
+    uint64_t id;
+    for (int i = 0; i < 8; i++) {
+        xqc_packet_out_t *po = xqc_write_new_packet(conn,
+            XQC_PTYPE_SHORT_HEADER);
+        CU_ASSERT_PTR_NOT_NULL_FATAL(po);
+        xqc_send_queue_remove_send(&po->po_list);
+        xqc_send_queue_insert_unacked(po,
+            &queue->sndq_unacked_packets[XQC_PNS_APP_DATA], queue);
+    }
+    CU_ASSERT_EQUAL(xqc_datagram_send(conn, (void *)data, sizeof(data),
+        &id, XQC_DATA_QOS_HIGH), XQC_OK);
+    CU_ASSERT_EQUAL(xqc_datagram_send(conn, (void *)data, sizeof(data),
+        &id, XQC_DATA_QOS_HIGH), -XQC_EAGAIN);
+
+    conn->conn_settings.max_datagram_unsent_packets = 0;
+    for (int i = 0; i < 3; i++) {
+        CU_ASSERT_EQUAL(xqc_datagram_send(conn, (void *)data, sizeof(data),
+            &id, XQC_DATA_QOS_HIGH), XQC_OK);
+    }
+    queue->sndq_packets_used_max = queue->sndq_packets_used;
+    CU_ASSERT_EQUAL(xqc_datagram_send(conn, (void *)data, sizeof(data),
+        &id, XQC_DATA_QOS_HIGH), -XQC_EAGAIN);
+    CU_ASSERT_TRUE(queue->sndq_full);
+    xqc_test_dgram_queue_destroy(conn);
+}
+
+
+/* Path-specified and batch writes share admission. Partial batch counters
+ * include only accepted buffers; rejected IDs and bytes remain untouched. */
+void
+xqc_test_datagram_unsent_limit_on_path_and_batch(void)
+{
+    xqc_connection_t *conn = xqc_test_dgram_queue_conn(1);
+    const unsigned char data[64] = {0};
+    uint64_t id = UINT64_MAX;
+    CU_ASSERT_EQUAL(xqc_datagram_send_on_path(conn, (void *)data,
+        sizeof(data), &id, XQC_DATA_QOS_HIGH, 0), XQC_OK);
+    id = UINT64_MAX;
+    CU_ASSERT_EQUAL(xqc_datagram_send_on_path(conn, (void *)data,
+        sizeof(data), &id, XQC_DATA_QOS_HIGH, 0), -XQC_EAGAIN);
+    CU_ASSERT_EQUAL(id, UINT64_MAX);
+    xqc_test_dgram_queue_drain_one(conn);
+
+    struct iovec iov[2] = {
+        {(void *)data, sizeof(data)}, {(void *)data, sizeof(data)}
+    };
+    uint64_t ids[2] = {UINT64_MAX, UINT64_MAX};
+    size_t count = 123, bytes = 123;
+    CU_ASSERT_EQUAL(xqc_datagram_send_multiple(conn, iov, ids, 2,
+        &count, &bytes, XQC_DATA_QOS_HIGH), -XQC_EAGAIN);
+    CU_ASSERT_EQUAL(count, 1);
+    CU_ASSERT_EQUAL(bytes, sizeof(data));
+    CU_ASSERT_NOT_EQUAL(ids[0], UINT64_MAX);
+    CU_ASSERT_EQUAL(ids[1], UINT64_MAX);
+    CU_ASSERT_EQUAL(xqc_datagram_send_multiple(conn, iov, ids, 2,
+        &count, &bytes, XQC_DATA_QOS_HIGH), -XQC_EAGAIN);
+    CU_ASSERT_EQUAL(count, 0);
+    CU_ASSERT_EQUAL(bytes, 0);
+    xqc_test_dgram_queue_drain_one(conn);
+    CU_ASSERT_EQUAL(xqc_datagram_send_multiple(conn, iov, ids, 1,
+        &count, &bytes, XQC_DATA_QOS_HIGH), XQC_OK);
+    CU_ASSERT_EQUAL(count, 1);
+    CU_ASSERT_EQUAL(bytes, sizeof(data));
+    xqc_test_dgram_queue_destroy(conn);
 }

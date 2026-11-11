@@ -10,5 +10,8 @@ void xqc_test_datagram_send_on_path();
 void xqc_test_datagram_frame_path_pinning();
 void xqc_test_receive_dgram_at_valid_encryption_level();
 void xqc_test_reject_dgram_at_invalid_encryption_level();
+void xqc_test_datagram_unsent_limit(void);
+void xqc_test_datagram_unsent_limit_inflight_and_disabled(void);
+void xqc_test_datagram_unsent_limit_on_path_and_batch(void);
 
 #endif /* _XQC_DATAGRAM_TEST_H_INCLUDED_ */

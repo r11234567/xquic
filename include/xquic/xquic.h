@@ -1918,6 +1918,14 @@ typedef struct xqc_conn_settings_s {
     uint8_t                     defer_send_flush;
     /* draft-ietf-quic-reliable-stream-reset-09 Section 3; default off. */
     xqc_bool_t                  enable_reset_stream_at;
+    /* Local DATAGRAM admission limit, counting all framed but unsent packets.
+     * Zero disables it. Sent/unacked records do not consume this budget.
+     * A full queue returns -XQC_EAGAIN before accepting another DATAGRAM;
+     * datagram_write_notify resumes the application after it drains.
+     * RFC 9221 section 5.2 permits local send buffering/backpressure.
+     * Appending enlarges this struct: rebuild library and consumers together,
+     * as for defer_send_flush above; this is not binary-compatible. */
+    uint32_t                    max_datagram_unsent_packets;
 } xqc_conn_settings_t;
 
 

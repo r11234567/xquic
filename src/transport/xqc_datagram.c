@@ -11,6 +11,27 @@
 #include "src/transport/xqc_utils.h"
 #include "src/transport/xqc_engine.h"
 
+static xqc_bool_t xqc_datagram_can_queue(xqc_connection_t *conn);
+
+/* RFC 9221 5.2: refuse locally before accepting a new unreliable payload.
+ * Keep the unsent budget separate from the in-flight allocation budget. */
+static xqc_bool_t
+xqc_datagram_can_queue(xqc_connection_t *conn)
+{
+    xqc_send_queue_t *queue = conn->conn_send_queue;
+    if (!xqc_send_queue_can_write(queue)) {
+        queue->sndq_full = XQC_TRUE;
+        return XQC_FALSE;
+    }
+
+    uint32_t cap = conn->conn_settings.max_datagram_unsent_packets;
+    if (cap && xqc_send_queue_get_unsent_packets_num(queue) >= cap) {
+        queue->sndq_dgram_full = XQC_TRUE;
+        return XQC_FALSE;
+    }
+    return XQC_TRUE;
+}
+
 
 xqc_datagram_0rtt_buffer_t* 
 xqc_datagram_create_0rtt_buffer(void *data, size_t data_len, 
@@ -255,8 +276,7 @@ xqc_int_t xqc_datagram_send(xqc_connection_t *conn, void *data,
         }
     }
 
-    if (!xqc_send_queue_can_write(conn->conn_send_queue)) {
-        conn->conn_send_queue->sndq_full = XQC_TRUE;
+    if (!xqc_datagram_can_queue(conn)) {
         xqc_log(conn->log, XQC_LOG_DEBUG, "|too many packets used|ctl_packets_used:%ud|", conn->conn_send_queue->sndq_packets_used);
         return -XQC_EAGAIN;
     }
@@ -381,8 +401,7 @@ xqc_datagram_send_on_path(xqc_connection_t *conn, void *data,
         return -XQC_EAGAIN;
     }
 
-    if (!xqc_send_queue_can_write(conn->conn_send_queue)) {
-        conn->conn_send_queue->sndq_full = XQC_TRUE;
+    if (!xqc_datagram_can_queue(conn)) {
         xqc_log(conn->log, XQC_LOG_DEBUG,
                 "|too many packets used|ctl_packets_used:%ud|",
                 conn->conn_send_queue->sndq_packets_used);
@@ -533,8 +552,7 @@ xqc_datagram_send_multiple_internal(xqc_connection_t *conn,
             return -XQC_EDGRAM_TOO_LARGE;
         }
 
-        if (!xqc_send_queue_can_write(conn->conn_send_queue)) {
-            conn->conn_send_queue->sndq_full = XQC_TRUE;
+        if (!xqc_datagram_can_queue(conn)) {
             xqc_log(conn->log, XQC_LOG_DEBUG, "|too many packets used|ctl_packets_used:%ud|", conn->conn_send_queue->sndq_packets_used);
             ret =  -XQC_EAGAIN;
             break;
@@ -630,6 +648,10 @@ xqc_datagram_notify_write(xqc_connection_t *conn)
         && (conn->conn_flag & XQC_CONN_FLAG_UPPER_CONN_EXIST))
     {
         if (conn->app_proto_cbs.dgram_cbs.datagram_write_notify) {
+            if (!xqc_datagram_can_queue(conn)) {
+                return;
+            }
+            conn->conn_send_queue->sndq_dgram_full = XQC_FALSE;
             conn->app_proto_cbs.dgram_cbs.datagram_write_notify(conn, conn->dgram_data);
         }
     }

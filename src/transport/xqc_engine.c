@@ -764,6 +764,9 @@ xqc_engine_process_conn(xqc_connection_t *conn, xqc_usec_t now)
         } else {
             xqc_log(conn->log, XQC_LOG_DEBUG, "|xqc_send_queue_can_write false|");
         }
+        if (conn->conn_send_queue->sndq_dgram_full) {
+            xqc_datagram_notify_write(conn);
+        }
     }
     XQC_CHECK_IMMEDIATE_CLOSE();
 

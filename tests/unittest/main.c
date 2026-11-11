@@ -1081,6 +1081,12 @@ main(int argc, char *argv[])
                         xqc_test_alpn_client_handshake_no_alpn)
         || !CU_add_test(pSuite, "xqc_test_masque", xqc_test_masque)
         || !CU_add_test(pSuite, "xqc_test_datagram_send_on_path", xqc_test_datagram_send_on_path)
+        || !CU_add_test(pSuite, "xqc_test_datagram_unsent_limit",
+                        xqc_test_datagram_unsent_limit)
+        || !CU_add_test(pSuite, "xqc_test_datagram_unsent_limit_inflight_and_disabled",
+                        xqc_test_datagram_unsent_limit_inflight_and_disabled)
+        || !CU_add_test(pSuite, "xqc_test_datagram_unsent_limit_on_path_and_batch",
+                        xqc_test_datagram_unsent_limit_on_path_and_batch)
         || !CU_add_test(pSuite, "xqc_test_datagram_frame_path_pinning", xqc_test_datagram_frame_path_pinning)
         || !CU_add_test(pSuite, "xqc_test_mp21_version_enum", xqc_test_mp21_version_enum)
         || !CU_add_test(pSuite, "xqc_test_mp21_frame_type_constants", xqc_test_mp21_frame_type_constants)
