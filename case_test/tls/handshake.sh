@@ -315,7 +315,7 @@ case_tls_handshake_key_update_old_key_retention()
 
     clear_log
     echo -e "key update old key retention ...\c"
-    ${CLIENT_BIN} -s 102400 -l d -t 8 -E -x 904 >> clog
+    ${CLIENT_BIN} -s 102400 -l d -t 8 -E -1 -x 904 >> clog
     held=`grep "hold-old-key-packet" clog`
     cached=`grep "cached-old-key-packet" clog`
     retained=`grep "RESULT|retained" clog`
