@@ -332,6 +332,8 @@ xqc_server_set_conn_settings(xqc_engine_t *engine, const xqc_conn_settings_t *se
      * server that asked for deferral silently keeps flushing on every send.
      * tests/unittest/xqc_set_conn_settings_test.c pins it. */
     engine->default_conn_settings.defer_send_flush = settings->defer_send_flush;
+    engine->default_conn_settings.max_datagram_unsent_packets =
+        settings->max_datagram_unsent_packets;
 
 #ifdef XQC_ENABLE_FEC
     engine->default_conn_settings.enable_encode_fec = settings->enable_encode_fec;

@@ -17,6 +17,33 @@
 #include "src/transport/xqc_packet_out.h"
 #include "src/transport/xqc_frame.h"
 
+typedef struct {
+    unsigned lost;
+    unsigned acked;
+    xqc_int_t repair;
+} xqc_test_dgram_events_t;
+
+
+static xqc_int_t
+xqc_test_lost_dgram_notify(xqc_connection_t *conn, uint64_t id, void *data)
+{
+    xqc_test_dgram_events_t *events = data;
+    (void)conn;
+    (void)id;
+    events->lost++;
+    return events->repair;
+}
+
+
+static void
+xqc_test_acked_dgram_notify(xqc_connection_t *conn, uint64_t id, void *data)
+{
+    xqc_test_dgram_events_t *events = data;
+    (void)conn;
+    (void)id;
+    events->acked++;
+}
+
 
 /*
  * Issue #599 regression test.
@@ -1222,5 +1249,402 @@ xqc_test_send_ctl_key_phase_acked_by_sent_packet_only(void)
                                            2000, XQC_TRUE) == XQC_OK);
     CU_ASSERT(conn->key_update_ctx.current_keys_acked);
 
+    xqc_engine_destroy(conn->engine);
+}
+
+
+static xqc_connection_t *
+xqc_test_lost_dgram_conn(xqc_test_dgram_events_t *events)
+{
+    xqc_connection_t *conn = test_engine_connect();
+    if (conn == NULL) {
+        return NULL;
+    }
+    /* test_engine_connect sends an Initial before this 1-RTT fixture. */
+    xqc_send_queue_drop_initial_packets(conn);
+    xqc_test_effective_pto_setup(conn);
+    conn->conn_settings.spurious_loss_detect_on = 1;
+    conn->conn_settings.disable_pn_skipping = 1;
+    conn->conn_flag |= XQC_CONN_FLAG_UPPER_CONN_EXIST;
+    conn->app_proto_cbs.dgram_cbs.datagram_lost_notify =
+        xqc_test_lost_dgram_notify;
+    conn->app_proto_cbs.dgram_cbs.datagram_acked_notify =
+        xqc_test_acked_dgram_notify;
+    conn->dgram_data = events;
+    return conn;
+}
+
+
+static xqc_packet_out_t *
+xqc_test_lost_dgram_send(xqc_connection_t *conn, xqc_packet_number_t pn,
+    xqc_usec_t sent)
+{
+    xqc_packet_out_t *po = xqc_test_effective_pto_send(conn, pn, sent);
+    if (po != NULL) {
+        po->po_frame_types = XQC_FRAME_BIT_DATAGRAM;
+        po->po_dgram_id = pn;
+        po->po_delivered_time = sent;
+        po->po_first_sent_time = sent;
+    }
+    return po;
+}
+
+
+static int
+xqc_test_lost_dgram_ack(xqc_connection_t *conn, xqc_packet_number_t pn,
+    xqc_usec_t now)
+{
+    xqc_path_ctx_t *path = conn->conn_initial_path;
+    xqc_ack_info_t info = {0};
+    info.pns = XQC_PNS_APP_DATA;
+    info.path_id = path->path_id;
+    info.n_ranges = 1;
+    info.ranges[0].low = pn;
+    info.ranges[0].high = pn;
+    info.largest_acked = pn;
+    return xqc_send_ctl_on_ack_received(path->path_send_ctl,
+        path->path_pn_ctl, conn->conn_send_queue, &info, now, XQC_TRUE);
+}
+
+
+/* RFC 9221 5.2 permits a loss notification followed by an ACK. RFC 9002
+ * 6.1.1 permits increasing the threshold from that spurious-loss evidence.
+ * The late ACK alone has PN 10, while this path already acknowledged 20.
+ */
+void
+xqc_test_lost_dgram_late_ack(void)
+{
+    xqc_test_dgram_events_t events = {0};
+    xqc_connection_t *conn = xqc_test_lost_dgram_conn(&events);
+    CU_ASSERT_FATAL(conn != NULL);
+    xqc_send_ctl_t *ctl = conn->conn_initial_path->path_send_ctl;
+    xqc_send_queue_t *sq = conn->conn_send_queue;
+    xqc_usec_t now = xqc_monotonic_timestamp();
+    xqc_packet_out_t *po = xqc_test_lost_dgram_send(conn, 10, now - 20000);
+    CU_ASSERT_FATAL(po != NULL);
+    ctl->ctl_largest_acked[XQC_PNS_APP_DATA] = 20;
+    conn->conn_initial_path->path_pn_ctl->ctl_largest_sent[
+        XQC_PNS_APP_DATA] = 20;
+    uint32_t inflight = ctl->ctl_bytes_in_flight;
+
+    xqc_send_ctl_detect_lost(ctl, sq, XQC_PNS_APP_DATA, now);
+    CU_ASSERT(po->po_flag & XQC_POF_LOST_DGRAM);
+    CU_ASSERT(!(po->po_flag & XQC_POF_IN_FLIGHT));
+    CU_ASSERT_EQUAL(ctl->ctl_bytes_in_flight, inflight - 100);
+    CU_ASSERT_EQUAL(events.lost, 1);
+    CU_ASSERT_EQUAL(events.acked, 0);
+    CU_ASSERT_EQUAL(ctl->ctl_lost_pkts_number, 1);
+    CU_ASSERT(xqc_list_empty(&sq->sndq_lost_packets));
+
+    xqc_path_send_one_or_two_ack_elicit_pkts(conn->conn_initial_path,
+        XQC_PNS_APP_DATA);
+    xqc_list_head_t *pos;
+    xqc_list_for_each(pos, &sq->sndq_pto_probe_packets) {
+        xqc_packet_out_t *probe = xqc_list_entry(pos, xqc_packet_out_t,
+            po_list);
+        CU_ASSERT(!(probe->po_frame_types & XQC_FRAME_BIT_DATAGRAM));
+    }
+    CU_ASSERT(!(po->po_flag & XQC_POF_RETRANSED));
+
+    xqc_send_ctl_detect_lost(ctl, sq, XQC_PNS_APP_DATA, now + 1000);
+    CU_ASSERT_EQUAL(events.lost, 1);
+    CU_ASSERT_EQUAL(ctl->ctl_lost_pkts_number, 1);
+    CU_ASSERT_EQUAL(xqc_test_lost_dgram_ack(conn, 10, now + 2000), XQC_OK);
+    CU_ASSERT_EQUAL(ctl->ctl_spurious_loss_count, 1);
+    CU_ASSERT_EQUAL(ctl->ctl_reordering_packet_threshold, 11);
+    CU_ASSERT_EQUAL(ctl->ctl_delivered, 100);
+    CU_ASSERT_EQUAL(events.acked, 1);
+    CU_ASSERT_EQUAL(sq->sndq_packets_in_unacked_list, 0);
+    CU_ASSERT_EQUAL(ctl->ctl_bytes_in_flight, inflight - 100);
+
+    CU_ASSERT_EQUAL(xqc_test_lost_dgram_ack(conn, 10, now + 3000), XQC_OK);
+    CU_ASSERT_EQUAL(events.lost, 1);
+    CU_ASSERT_EQUAL(events.acked, 1);
+    CU_ASSERT_EQUAL(ctl->ctl_spurious_loss_count, 1);
+    CU_ASSERT_EQUAL(ctl->ctl_delivered, 100);
+    xqc_engine_destroy(conn->engine);
+}
+
+
+/* True loss expires during ACK/loss processing at exactly three PTOs.
+ * No payload is queued for retransmission and no second callback is made.
+ */
+void
+xqc_test_lost_dgram_expiry(void)
+{
+    for (int ack_expiry = 0; ack_expiry < 2; ack_expiry++) {
+        xqc_test_dgram_events_t events = {0};
+        xqc_connection_t *conn = xqc_test_lost_dgram_conn(&events);
+        CU_ASSERT_FATAL(conn != NULL);
+        xqc_send_ctl_t *ctl = conn->conn_initial_path->path_send_ctl;
+        xqc_send_queue_t *sq = conn->conn_send_queue;
+        xqc_usec_t now = xqc_monotonic_timestamp();
+        xqc_usec_t pto = xqc_send_ctl_calc_pto(ctl);
+        CU_ASSERT_FATAL(xqc_test_lost_dgram_send(conn, 10, now) != NULL);
+        ctl->ctl_largest_acked[XQC_PNS_APP_DATA] = 20;
+        xqc_send_ctl_detect_lost(ctl, sq, XQC_PNS_APP_DATA, now + 20000);
+        xqc_send_ctl_detect_lost(ctl, sq, XQC_PNS_APP_DATA, now + 3 * pto - 1);
+        CU_ASSERT_EQUAL(sq->sndq_packets_in_unacked_list, 1);
+        if (ack_expiry) {
+            CU_ASSERT_EQUAL(xqc_test_lost_dgram_ack(conn, 10,
+                now + 3 * pto), XQC_OK);
+
+        } else {
+            xqc_send_ctl_detect_lost(ctl, sq, XQC_PNS_APP_DATA,
+                now + 3 * pto);
+        }
+        CU_ASSERT_EQUAL(sq->sndq_packets_in_unacked_list, 0);
+        CU_ASSERT_EQUAL(ctl->ctl_spurious_loss_count, 0);
+        CU_ASSERT_EQUAL(ctl->ctl_bytes_in_flight, 0);
+        CU_ASSERT_EQUAL(events.lost, 1);
+        CU_ASSERT_EQUAL(events.acked, 0);
+        CU_ASSERT(xqc_list_empty(&sq->sndq_lost_packets));
+        xqc_engine_destroy(conn->engine);
+    }
+}
+
+
+/* A burst of real losses cannot retain an unbounded packet history. */
+void
+xqc_test_lost_dgram_window(void)
+{
+    xqc_test_dgram_events_t events = {0};
+    xqc_connection_t *conn = xqc_test_lost_dgram_conn(&events);
+    CU_ASSERT_FATAL(conn != NULL);
+    xqc_send_ctl_t *ctl = conn->conn_initial_path->path_send_ctl;
+    xqc_send_queue_t *sq = conn->conn_send_queue;
+    xqc_usec_t now = xqc_monotonic_timestamp();
+    for (unsigned pn = 1; pn <= 512; pn++) {
+        CU_ASSERT_FATAL(xqc_test_lost_dgram_send(conn, pn,
+            now - 20000) != NULL);
+    }
+    ctl->ctl_largest_acked[XQC_PNS_APP_DATA] = 513;
+    xqc_send_ctl_detect_lost(ctl, sq, XQC_PNS_APP_DATA, now);
+    CU_ASSERT_EQUAL(sq->sndq_packets_in_unacked_list,
+        XQC_LOST_DGRAM_PN_WINDOW - 1);
+    CU_ASSERT_EQUAL(events.lost, 512);
+    CU_ASSERT_EQUAL(ctl->ctl_bytes_in_flight, 0);
+    CU_ASSERT_EQUAL(ctl->ctl_lost_pkts_number, 512);
+    CU_ASSERT(xqc_list_empty(&sq->sndq_lost_packets));
+
+    ctl->ctl_largest_acked[XQC_PNS_APP_DATA] += XQC_LOST_DGRAM_PN_WINDOW;
+    xqc_send_ctl_detect_lost(ctl, sq, XQC_PNS_APP_DATA, now + 1);
+    CU_ASSERT_EQUAL(sq->sndq_packets_in_unacked_list, 0);
+    CU_ASSERT_EQUAL(events.lost, 512);
+    CU_ASSERT_EQUAL(ctl->ctl_lost_pkts_number, 512);
+    xqc_engine_destroy(conn->engine);
+}
+
+
+void
+xqc_test_lost_dgram_disabled(void)
+{
+    xqc_test_dgram_events_t events = {0};
+    xqc_connection_t *conn = xqc_test_lost_dgram_conn(&events);
+    CU_ASSERT_FATAL(conn != NULL);
+    conn->conn_settings.spurious_loss_detect_on = 0;
+    xqc_send_ctl_t *ctl = conn->conn_initial_path->path_send_ctl;
+    xqc_usec_t now = xqc_monotonic_timestamp();
+    CU_ASSERT_FATAL(xqc_test_lost_dgram_send(conn, 10, now - 20000) != NULL);
+    ctl->ctl_largest_acked[XQC_PNS_APP_DATA] = 20;
+    xqc_send_ctl_detect_lost(ctl, conn->conn_send_queue,
+        XQC_PNS_APP_DATA, now);
+    CU_ASSERT_EQUAL(conn->conn_send_queue->sndq_packets_in_unacked_list, 0);
+    CU_ASSERT_EQUAL(events.lost, 1);
+    CU_ASSERT_EQUAL(xqc_test_lost_dgram_ack(conn, 10, now + 1000), XQC_OK);
+    CU_ASSERT_EQUAL(events.acked, 0);
+    CU_ASSERT_EQUAL(ctl->ctl_spurious_loss_count, 0);
+    CU_ASSERT_EQUAL(ctl->ctl_reordering_packet_threshold, XQC_kPacketThreshold);
+    xqc_engine_destroy(conn->engine);
+}
+
+
+/* The shared unacked list also holds other paths' independent PN spaces. */
+void
+xqc_test_lost_dgram_other_path(void)
+{
+    xqc_test_dgram_events_t events = {0};
+    xqc_connection_t *conn = xqc_test_lost_dgram_conn(&events);
+    CU_ASSERT_FATAL(conn != NULL);
+    xqc_send_ctl_t *ctl = conn->conn_initial_path->path_send_ctl;
+    xqc_usec_t now = xqc_monotonic_timestamp();
+    xqc_packet_out_t *po = xqc_test_lost_dgram_send(conn, 10, now - 20000);
+    CU_ASSERT_FATAL(po != NULL);
+    xqc_send_ctl_decrease_inflight(conn, po);
+    po->po_path_id = 17;
+    po->po_flag |= XQC_POF_LOST_DGRAM;
+    ctl->ctl_largest_acked[XQC_PNS_APP_DATA] = 1000;
+    CU_ASSERT_EQUAL(xqc_test_lost_dgram_ack(conn, 10, now + 1000000), XQC_OK);
+    xqc_send_ctl_detect_lost(ctl, conn->conn_send_queue,
+        XQC_PNS_APP_DATA, now + 1000000);
+    CU_ASSERT_EQUAL(conn->conn_send_queue->sndq_packets_in_unacked_list, 1);
+    CU_ASSERT_EQUAL(events.lost, 0);
+    CU_ASSERT_EQUAL(events.acked, 0);
+    CU_ASSERT_EQUAL(ctl->ctl_spurious_loss_count, 0);
+    po->po_path_id = conn->conn_initial_path->path_id;
+    xqc_engine_destroy(conn->engine);
+}
+
+
+/* Explicit application repair requests keep the existing reliable path. */
+void
+xqc_test_lost_dgram_retransmission_requested(void)
+{
+    xqc_test_dgram_events_t events = {0};
+    xqc_connection_t *conn = xqc_test_lost_dgram_conn(&events);
+    CU_ASSERT_FATAL(conn != NULL);
+    events.repair = XQC_DGRAM_RETX_ASKED_BY_APP;
+    xqc_send_ctl_t *ctl = conn->conn_initial_path->path_send_ctl;
+    xqc_usec_t now = xqc_monotonic_timestamp();
+    xqc_packet_out_t *po = xqc_test_lost_dgram_send(conn, 10, now - 20000);
+    CU_ASSERT_FATAL(po != NULL);
+    ctl->ctl_largest_acked[XQC_PNS_APP_DATA] = 20;
+    xqc_send_ctl_detect_lost(ctl, conn->conn_send_queue,
+        XQC_PNS_APP_DATA, now);
+    CU_ASSERT_EQUAL(events.lost, 1);
+    CU_ASSERT(!(po->po_flag & XQC_POF_LOST_DGRAM));
+    CU_ASSERT(po->po_flag & XQC_POF_RETRANSED);
+    CU_ASSERT(!xqc_list_empty(&conn->conn_send_queue->sndq_lost_packets));
+    xqc_engine_destroy(conn->engine);
+}
+
+
+/* Dynamic path turnover must not accumulate retired-path loss records. */
+void
+xqc_test_lost_dgram_path_close(void)
+{
+    xqc_test_dgram_events_t events = {0};
+    xqc_connection_t *conn = xqc_test_lost_dgram_conn(&events);
+    CU_ASSERT_FATAL(conn != NULL);
+    xqc_send_ctl_t *ctl = conn->conn_initial_path->path_send_ctl;
+    xqc_usec_t now = xqc_monotonic_timestamp();
+    CU_ASSERT_FATAL(xqc_test_lost_dgram_send(conn, 10, now - 20000) != NULL);
+    ctl->ctl_largest_acked[XQC_PNS_APP_DATA] = 20;
+    xqc_send_ctl_detect_lost(ctl, conn->conn_send_queue,
+        XQC_PNS_APP_DATA, now);
+    CU_ASSERT_EQUAL(conn->conn_send_queue->sndq_packets_in_unacked_list, 1);
+    CU_ASSERT_EQUAL(xqc_path_request_abandon(conn->conn_initial_path, 0),
+        XQC_OK);
+    CU_ASSERT_EQUAL(conn->conn_send_queue->sndq_packets_in_unacked_list, 0);
+    CU_ASSERT_EQUAL(events.lost, 1);
+    CU_ASSERT_EQUAL(events.acked, 0);
+    CU_ASSERT(xqc_list_empty(&conn->conn_send_queue->sndq_lost_packets));
+    xqc_engine_destroy(conn->engine);
+}
+
+
+/* RFC 9002 6.1.2: fast highest-PN samples must not erase observed reorder
+ * delay. A real loss still expires at the exact learned time threshold. */
+void
+xqc_test_reordering_time_floor(void)
+{
+    xqc_test_dgram_events_t events = {0};
+    xqc_connection_t *conn = xqc_test_lost_dgram_conn(&events);
+    CU_ASSERT_FATAL(conn != NULL);
+    xqc_send_ctl_t *ctl = conn->conn_initial_path->path_send_ctl;
+    xqc_usec_t now = xqc_monotonic_timestamp();
+    xqc_send_ctl_on_spurious_loss_detected(ctl, XQC_PNS_APP_DATA,
+        now, 100, 99, now - 80000);
+    CU_ASSERT_EQUAL(ctl->ctl_reordering_time_floor, 90000);
+    CU_ASSERT_EQUAL(ctl->ctl_reordering_time_threshold_shift, 0);
+    CU_ASSERT_EQUAL(ctl->ctl_srtt, 10000);
+    CU_ASSERT_EQUAL(ctl->ctl_latest_rtt, 10000);
+    ctl->ctl_reordering_packet_threshold = 100;
+    ctl->ctl_largest_acked[XQC_PNS_APP_DATA] = 100;
+    xqc_packet_out_t *po = xqc_test_lost_dgram_send(conn, 99,
+        now - 70000);
+    CU_ASSERT_FATAL(po != NULL);
+    xqc_send_ctl_detect_lost(ctl, conn->conn_send_queue,
+        XQC_PNS_APP_DATA, now);
+    CU_ASSERT(po->po_flag & XQC_POF_IN_FLIGHT);
+    CU_ASSERT_EQUAL(events.lost, 0);
+    CU_ASSERT_EQUAL(ctl->ctl_loss_time[XQC_PNS_APP_DATA], now + 20000);
+    xqc_send_ctl_detect_lost(ctl, conn->conn_send_queue,
+        XQC_PNS_APP_DATA, now + 19999);
+    CU_ASSERT_EQUAL(events.lost, 0);
+    xqc_send_ctl_detect_lost(ctl, conn->conn_send_queue,
+        XQC_PNS_APP_DATA, now + 20000);
+    CU_ASSERT_EQUAL(events.lost, 1);
+    CU_ASSERT(!(po->po_flag & XQC_POF_IN_FLIGHT));
+    CU_ASSERT_EQUAL(ctl->ctl_lost_pkts_number, 1);
+    CU_ASSERT(xqc_list_empty(&conn->conn_send_queue->sndq_lost_packets));
+    xqc_engine_destroy(conn->engine);
+}
+
+
+/* A stale observation cannot postpone true loss beyond three current
+ * PTOs; backward time and very large intervals must not wrap arithmetic. */
+void
+xqc_test_reordering_time_floor_bounds(void)
+{
+    xqc_test_dgram_events_t events = {0};
+    xqc_connection_t *conn = xqc_test_lost_dgram_conn(&events);
+    CU_ASSERT_FATAL(conn != NULL);
+    xqc_send_ctl_t *ctl = conn->conn_initial_path->path_send_ctl;
+    xqc_send_ctl_on_spurious_loss_detected(ctl, XQC_PNS_APP_DATA,
+        100, 20, 10, 101);
+    CU_ASSERT_EQUAL(ctl->ctl_reordering_time_floor, 0);
+    xqc_send_ctl_on_spurious_loss_detected(ctl, XQC_PNS_APP_DATA,
+        XQC_MAX_UINT64_VALUE, 20, 10, 0);
+    CU_ASSERT_EQUAL(ctl->ctl_reordering_time_floor,
+        3 * xqc_send_ctl_calc_pto(ctl));
+
+    /* The RTT improves after learning: clamp the previously learned floor
+     * to the new PTO rather than letting an old path hold inflight bytes. */
+    ctl->ctl_srtt = 1000;
+    ctl->ctl_latest_rtt = 1000;
+    ctl->ctl_rttvar = 0;
+    conn->remote_settings.max_ack_delay = 0;
+    xqc_usec_t cap = 3 * xqc_send_ctl_calc_pto(ctl);
+    CU_ASSERT(cap < ctl->ctl_reordering_time_floor);
+    xqc_usec_t now = xqc_monotonic_timestamp();
+    ctl->ctl_largest_acked[XQC_PNS_APP_DATA] = 20;
+    CU_ASSERT_FATAL(xqc_test_lost_dgram_send(conn, 19,
+        now - cap + 1) != NULL);
+    xqc_send_ctl_detect_lost(ctl, conn->conn_send_queue,
+        XQC_PNS_APP_DATA, now);
+    CU_ASSERT_EQUAL(events.lost, 0);
+    xqc_send_ctl_detect_lost(ctl, conn->conn_send_queue,
+        XQC_PNS_APP_DATA, now + 1);
+    CU_ASSERT_EQUAL(events.lost, 1);
+    CU_ASSERT_EQUAL(conn->conn_send_queue->sndq_packets_in_unacked_list, 0);
+    CU_ASSERT_EQUAL(ctl->ctl_bytes_in_flight, 0);
+
+    /* A large valid PTO saturates the cap instead of overflowing it. */
+    ctl->ctl_srtt = XQC_MAX_UINT64_VALUE / 2;
+    ctl->ctl_latest_rtt = ctl->ctl_srtt;
+    xqc_send_ctl_on_spurious_loss_detected(ctl, XQC_PNS_APP_DATA,
+        XQC_MAX_UINT64_VALUE - 1, 20, 10, 0);
+    CU_ASSERT_EQUAL(ctl->ctl_reordering_time_floor, XQC_MAX_UINT64_VALUE);
+    xqc_send_ctl_reset(ctl);
+    CU_ASSERT_EQUAL(ctl->ctl_reordering_time_floor, 0);
+    xqc_engine_destroy(conn->engine);
+}
+
+
+/* Turning learning off preserves the default time-loss decision even if
+ * a previous enabled period left a floor in the path state. */
+void
+xqc_test_reordering_time_floor_disabled(void)
+{
+    xqc_test_dgram_events_t events = {0};
+    xqc_connection_t *conn = xqc_test_lost_dgram_conn(&events);
+    CU_ASSERT_FATAL(conn != NULL);
+    xqc_send_ctl_t *ctl = conn->conn_initial_path->path_send_ctl;
+    conn->conn_settings.spurious_loss_detect_on = 0;
+    ctl->ctl_reordering_time_floor = 100000;
+    xqc_send_ctl_on_spurious_loss_detected(ctl, XQC_PNS_APP_DATA,
+        200000, 20, 19, 0);
+    CU_ASSERT_EQUAL(ctl->ctl_reordering_time_floor, 100000);
+    CU_ASSERT_EQUAL(ctl->ctl_reordering_time_threshold_shift,
+        XQC_kTimeThresholdShift);
+    ctl->ctl_largest_acked[XQC_PNS_APP_DATA] = 20;
+    xqc_usec_t now = xqc_monotonic_timestamp();
+    CU_ASSERT_FATAL(xqc_test_lost_dgram_send(conn, 19,
+        now - 12000) != NULL);
+    xqc_send_ctl_detect_lost(ctl, conn->conn_send_queue,
+        XQC_PNS_APP_DATA, now);
+    CU_ASSERT_EQUAL(events.lost, 1);
+    CU_ASSERT_EQUAL(conn->conn_send_queue->sndq_packets_in_unacked_list, 0);
     xqc_engine_destroy(conn->engine);
 }

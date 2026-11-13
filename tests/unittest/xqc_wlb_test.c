@@ -27,6 +27,7 @@
 #include "src/transport/xqc_multipath.h"
 #include "src/transport/xqc_packet_out.h"
 #include "src/transport/xqc_send_ctl.h"
+#include "src/transport/xqc_send_queue.h"
 #include "src/transport/xqc_utils.h"
 #include "src/common/xqc_memory_pool.h"
 #include "src/transport/xqc_frame.h"
@@ -97,6 +98,7 @@ typedef struct {
 
     /* saved global clock pointer so we can restore on teardown */
     xqc_timestamp_pt      saved_monotonic_ts;
+    xqc_memory_pool_t    *probe_pool;
 } wlb_test_fixture_t;
 
 static void
@@ -128,6 +130,13 @@ wlb_test_setup(wlb_test_fixture_t *f)
 static void
 wlb_test_teardown(wlb_test_fixture_t *f)
 {
+    if (f->probe_pool) {
+        for (int i = 0; i < f->n_paths_owned; i++) {
+            xqc_path_schedule_buf_destroy(&f->paths[i]);
+        }
+        xqc_send_queue_destroy(f->conn.conn_send_queue);
+        xqc_destroy_pool(f->probe_pool);
+    }
     xqc_monotonic_timestamp = f->saved_monotonic_ts;
     if (f->scheduler) {
         free(f->scheduler);
@@ -163,6 +172,10 @@ wlb_test_add_path(wlb_test_fixture_t *f, uint64_t path_id, xqc_usec_t srtt_us,
     p->path_state       = XQC_PATH_STATE_ACTIVE;
     p->app_path_status  = XQC_APP_PATH_STATUS_AVAILABLE;
     p->path_send_ctl    = ctl;
+    p->parent_conn     = &f->conn;
+    for (int type = 0; type < XQC_SEND_TYPE_N; type++) {
+        xqc_init_list_head(&p->path_schedule_buf[type]);
+    }
 
     cs->cwnd_bytes      = cwnd_bytes;
     cs->bandwidth_Bps   = srtt_us > 0
@@ -179,6 +192,51 @@ wlb_test_add_path(wlb_test_fixture_t *f, uint64_t path_id, xqc_usec_t srtt_us,
 
     xqc_list_add_tail(&p->path_list, &f->conn.conn_paths_list);
     return p;
+}
+
+static void
+wlb_test_prepare_probing(wlb_test_fixture_t *f)
+{
+#ifdef XQC_PROTECT_POOL_MEM
+    f->probe_pool = xqc_create_pool(4096, XQC_FALSE);
+#else
+    f->probe_pool = xqc_create_pool(4096);
+#endif
+    CU_ASSERT_PTR_NOT_NULL_FATAL(f->probe_pool);
+    f->conn.conn_pool = f->probe_pool;
+    f->conn.pkt_out_size = XQC_PACKET_OUT_SIZE;
+    f->conn.conn_send_queue = xqc_send_queue_create(&f->conn);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(f->conn.conn_send_queue);
+    f->conn.enable_multipath = 1;
+    f->conn.conn_state = XQC_CONN_STATE_ESTABED;
+}
+
+static void
+wlb_test_probe_round(wlb_test_fixture_t *f)
+{
+    xqc_wlb_scheduler_cb.xqc_scheduler_handle_conn_event(f->scheduler,
+        &f->conn, XQC_SCHED_EVENT_CONN_ROUND_START, NULL);
+}
+
+static uint64_t
+wlb_test_take_ping_probe(wlb_test_fixture_t *f)
+{
+    xqc_list_head_t *head =
+        &f->conn.conn_send_queue->sndq_pto_probe_packets;
+    if (xqc_list_empty(head)) {
+        return UINT64_MAX;
+    }
+    xqc_packet_out_t *po = xqc_list_entry(head->next, xqc_packet_out_t,
+                                         po_list);
+    CU_ASSERT_EQUAL(po->po_frame_types, XQC_FRAME_BIT_PING);
+    CU_ASSERT_EQUAL(po->po_path_flag, XQC_PATH_SPECIFIED_BY_PQP);
+    CU_ASSERT_PTR_NULL(po->po_origin);
+    CU_ASSERT_EQUAL(po->po_dgram_payload_size, 0);
+    uint64_t path_id = po->po_path_id;
+    xqc_send_queue_remove_probe(&po->po_list);
+    xqc_send_queue_insert_free(po,
+        &f->conn.conn_send_queue->sndq_free_packets, f->conn.conn_send_queue);
+    return path_id;
 }
 
 /* Detach a previously-added path (simulates path failover by removing it
@@ -984,29 +1042,31 @@ xqc_test_wlb_evicted_path_gets_recovery_probe(void)
 
     /* Evict the relay: blackholed but still ACTIVE. */
     relay->path_send_ctl->ctl_pto_count = 3;
+    wlb_test_prepare_probing(&f);
 
-    /* Without probing, an evicted path never carries payload, nothing can
-     * ACK on it, and ctl_pto_count can never reset — eviction would be
-     * permanent. One probe per interval breaks that deadlock. */
-    /* First payload packet arms the probe interval; it must never itself
-     * be a probe. */
+    /* RFC 9000 19.2: a separate PING can restore ACK progress without
+     * consuming an unreliable application DATAGRAM. */
+    wlb_test_probe_round(&f);
+    CU_ASSERT_EQUAL(wlb_test_take_ping_probe(&f), UINT64_MAX);
     CU_ASSERT_EQUAL(wlb_test_invoke(&f, UINT32_MAX), 0);
 
     int probes = 0;
     int healthy = 0;
     for (int round = 0; round < 4; round++) {
         wlb_test_clock_advance(600000); /* past the 500ms probe interval */
+        wlb_test_probe_round(&f);
+        if (wlb_test_take_ping_probe(&f) == 1) {
+            probes++;
+        }
         for (int i = 0; i < 8; i++) {
             uint64_t selected = wlb_test_invoke(&f, UINT32_MAX);
-            if (selected == 1) {
-                probes++;
-            } else if (selected == 0) {
+            if (selected == 0) {
                 healthy++;
             }
         }
     }
     CU_ASSERT_EQUAL(probes, 4);      /* exactly one probe per interval */
-    CU_ASSERT_EQUAL(healthy, 28);    /* everything else stays on the live path */
+    CU_ASSERT_EQUAL(healthy, 32);    /* every application packet stays live */
 
     /* The probe got through: the path heals and re-enters scheduling. */
     relay->path_send_ctl->ctl_pto_count = 0;
@@ -1044,17 +1104,19 @@ xqc_test_wlb_evicted_probe_rotates_past_blocked_path(void)
 
     blocked->path_send_ctl->ctl_pto_count = 3;  /* WLB_PTO_EVICT_THRESH */
     sendable->path_send_ctl->ctl_pto_count = 3;  /* WLB_PTO_EVICT_THRESH */
+    wlb_test_prepare_probing(&f);
 
-    /* First payload packet only arms the interval. */
-    (void)wlb_test_invoke(&f, UINT32_MAX);
+    wlb_test_probe_round(&f);
 
     int probed_sendable = 0;
     for (int round = 0; round < 4; round++) {
         wlb_test_clock_advance(600000); /* past the probe interval */
         for (int i = 0; i < 4; i++) {
-            if (wlb_test_invoke(&f, UINT32_MAX) == 2) {
+            wlb_test_probe_round(&f);
+            if (wlb_test_take_ping_probe(&f) == 2) {
                 probed_sendable++;
             }
+            CU_ASSERT_EQUAL(wlb_test_invoke(&f, UINT32_MAX), 0);
         }
     }
     /* The blocked candidate must not be able to starve this one. */
@@ -1297,10 +1359,8 @@ xqc_test_wlb_unacked_path_kept_until_third_hidden_pto(void)
     wlb_test_teardown(&f);
 }
 
-/* Every path silently stops acknowledging. WLB then holds STREAM, control and
- * datagrams off all of them (the PTO probes bypass the scheduler) except for
- * its evicted-path datagram probe, and the first ACK on a path brings every
- * kind of traffic, pinned flows included, back onto it. */
+/* Every path silently stops acknowledging. WLB holds all business traffic
+ * while separate PING probes can restore ACK progress. */
 void
 xqc_test_wlb_all_paths_silent_recover_on_ack(void)
 {
@@ -1311,7 +1371,8 @@ xqc_test_wlb_all_paths_silent_recover_on_ack(void)
     xqc_path_ctx_t *relay = wlb_test_add_path(&f, 1, 25000, 64 * 1024, 0);
     CU_ASSERT_PTR_NOT_NULL_FATAL(direct);
     CU_ASSERT_PTR_NOT_NULL_FATAL(relay);
-    /* the first datagram also arms the evicted-path probe interval */
+    wlb_test_prepare_probing(&f);
+    wlb_test_probe_round(&f);
     (void)wlb_test_invoke(&f, UINT32_MAX);
 
     xqc_usec_t pto = wlb_test_mark_unacked_since(&f, direct, g_fake_now_us);
@@ -1327,9 +1388,10 @@ xqc_test_wlb_all_paths_silent_recover_on_ack(void)
     CU_ASSERT_EQUAL(wlb_test_invoke(&f, UINT32_MAX), UINT64_MAX);
     CU_ASSERT_EQUAL(wlb_test_invoke(&f, 0x1234), UINT64_MAX);
 
-    /* past the 500ms probe interval one datagram probes an evicted path */
+    /* Past the interval a separate PING probes an evicted path. */
     wlb_test_clock_advance(600000);
-    uint64_t probed = wlb_test_invoke(&f, UINT32_MAX);
+    wlb_test_probe_round(&f);
+    uint64_t probed = wlb_test_take_ping_probe(&f);
     CU_ASSERT_TRUE(probed == 0 || probed == 1);
     CU_ASSERT_EQUAL(wlb_test_invoke(&f, UINT32_MAX), UINT64_MAX);
 
@@ -2387,5 +2449,227 @@ xqc_test_wlb_prefers_healthy_path_over_pto_blocked(void)
     CU_ASSERT_EQUAL(wlb_test_invoke(&f, 0), 1);
     CU_ASSERT_EQUAL(wlb_test_invoke(&f, UINT32_MAX), 1);
 
+    wlb_test_teardown(&f);
+}
+
+
+static void
+wlb_test_enable_pacing(wlb_test_fixture_t *f, int i, uint32_t budget)
+{
+    xqc_send_ctl_t *ctl = &f->send_ctls[i];
+    xqc_timer_init(&ctl->path_timer_manager, &f->log, ctl);
+    xqc_pacing_init(&ctl->ctl_pacing, 1, ctl);
+    ctl->ctl_pacing.bytes_budget = budget;
+    ctl->ctl_pacing.last_sent_time = g_fake_now_us;
+}
+
+
+/* Admission must count previously scheduled bytes without arming a timer
+ * that would prevent those earlier, budgeted packets from being sent. */
+void
+xqc_test_wlb_pacing_credit_bounds(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+    wlb_test_add_path(&f, 0, 10000, 1024 * 1024, 0);
+    wlb_test_enable_pacing(&f, 0, 200);
+    xqc_send_ctl_t *ctl = &f.send_ctls[0];
+    xqc_pacing_t *pacing = &ctl->ctl_pacing;
+    CU_ASSERT_TRUE(xqc_pacing_can_schedule(pacing, 100, 100));
+    CU_ASSERT_FALSE(xqc_pacing_can_schedule(pacing, 101, 100));
+    CU_ASSERT_FALSE(xqc_pacing_can_schedule(pacing, UINT32_MAX, 100));
+    CU_ASSERT_FALSE(xqc_timer_is_set(&ctl->path_timer_manager,
+        XQC_TIMER_PACING));
+    CU_ASSERT_EQUAL(pacing->pending_budget, 0);
+    CU_ASSERT_EQUAL(pacing->bytes_budget, 200);
+
+    /* Refilled credit is available for admission without consuming it. */
+    wlb_test_clock_advance(1000);
+    CU_ASSERT_TRUE(xqc_pacing_can_schedule(pacing, 200, 100));
+    CU_ASSERT_EQUAL(pacing->bytes_budget, 200);
+    CU_ASSERT_FALSE(xqc_timer_is_set(&ctl->path_timer_manager,
+        XQC_TIMER_PACING));
+    wlb_test_teardown(&f);
+}
+
+
+/* A pacing-only block waits without queuing beyond credit or spilling.
+ * Timer expiry resumes the established pin without a new application packet.
+ * Genuine cwnd exhaustion retains the temporary spill and pin ownership. */
+void
+xqc_test_wlb_pacing_preserves_flow_path(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+    xqc_path_ctx_t *p0 = wlb_test_add_path(&f, 0, 10000, 192 * 1024, 0);
+    wlb_test_add_path(&f, 1, 10000, 64 * 1024, 0);
+    wlb_test_enable_pacing(&f, 0, 200);
+    uint32_t flow = 0xFACE2301;
+    (void) wlb_test_invoke(&f, flow);
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, flow), 0);
+    p0->path_schedule_bytes = 101;
+    f.send_ctls[0].ctl_pacing.bytes_budget = 200;
+    xqc_packet_out_t po;
+    wlb_test_make_packet_out(&po, flow);
+    xqc_bool_t blocked = XQC_FALSE;
+    CU_ASSERT_PTR_NULL(xqc_wlb_scheduler_cb.xqc_scheduler_get_path(
+        f.scheduler, &f.conn, &po, 1, 0, &blocked));
+    CU_ASSERT_TRUE(blocked);
+    CU_ASSERT_FALSE(xqc_timer_is_set(&f.send_ctls[0].path_timer_manager,
+        XQC_TIMER_PACING));
+    p0->path_schedule_bytes = 100;
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, flow), 0);
+    p0->path_schedule_bytes = 0;
+    f.send_ctls[0].ctl_pacing.bytes_budget = 0;
+    xqc_timer_set(&f.send_ctls[0].path_timer_manager, XQC_TIMER_PACING,
+                  g_fake_now_us, 1000);
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, flow), UINT64_MAX);
+    CU_ASSERT_TRUE(xqc_timer_is_set(&f.send_ctls[0].path_timer_manager,
+        XQC_TIMER_PACING));
+    f.send_ctls[0].ctl_bytes_in_flight = 192 * 1024;
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, flow), 1);
+    f.send_ctls[0].ctl_bytes_in_flight = 0;
+    wlb_test_clock_advance(2000);
+    xqc_timer_expire(&f.send_ctls[0].path_timer_manager, g_fake_now_us);
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, flow), 0);
+    wlb_test_teardown(&f);
+}
+
+
+/* If every empty path is out of credit, block and arrange real wakeups.
+ * Expiry replenishes credit and scheduling resumes without a new packet. */
+void
+xqc_test_wlb_pacing_blocked_wakes(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+    for (int i = 0; i < 2; i++) {
+        wlb_test_add_path(&f, i, 10000, 64 * 1024, 0);
+        wlb_test_enable_pacing(&f, i, 0);
+    }
+    xqc_packet_out_t po;
+    wlb_test_make_packet_out(&po, 0xFACE2302);
+    xqc_bool_t blocked = XQC_FALSE;
+    CU_ASSERT_PTR_NULL(xqc_wlb_scheduler_cb.xqc_scheduler_get_path(
+        f.scheduler, &f.conn, &po, 1, 0, &blocked));
+    CU_ASSERT_TRUE(blocked);
+    for (int i = 0; i < 2; i++) {
+        CU_ASSERT_TRUE(xqc_timer_is_set(&f.send_ctls[i].path_timer_manager,
+            XQC_TIMER_PACING));
+    }
+    wlb_test_clock_advance(2000);
+    for (int i = 0; i < 2; i++) {
+        xqc_timer_expire(&f.send_ctls[i].path_timer_manager, g_fake_now_us);
+    }
+    CU_ASSERT_PTR_NOT_NULL(xqc_wlb_scheduler_cb.xqc_scheduler_get_path(
+        f.scheduler, &f.conn, &po, 1, 0, &blocked));
+    CU_ASSERT_FALSE(blocked);
+    wlb_test_teardown(&f);
+}
+
+
+/* Preserve STREAM/control MinRTT placement, disabled pacing, and the
+ * explicitly unconstrained scheduling mode used by urgent traffic. */
+void
+xqc_test_wlb_pacing_control_compatibility(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+    wlb_test_add_path(&f, 0, 10000, 64 * 1024, 0);
+    wlb_test_enable_pacing(&f, 0, 0);
+    CU_ASSERT_EQUAL(wlb_test_invoke_stream(&f), 0);
+    CU_ASSERT_EQUAL(wlb_test_invoke_control(&f), 0);
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, 0xFACE2303), UINT64_MAX);
+    xqc_packet_out_t po;
+    wlb_test_make_packet_out(&po, 0xFACE2303);
+    xqc_bool_t blocked = XQC_FALSE;
+    CU_ASSERT_PTR_NOT_NULL(xqc_wlb_scheduler_cb.xqc_scheduler_get_path(
+        f.scheduler, &f.conn, &po, 0, 0, &blocked));
+    f.send_ctls[0].ctl_pacing.pacing_on = 0;
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, 0xFACE2303), 0);
+    wlb_test_teardown(&f);
+}
+
+
+/* A 10 Hz flow must not donate every fifth DATAGRAM to a dead path.
+ * Recovery PING ownership is independent of the current application packet. */
+void
+xqc_test_wlb_ping_probe_preserves_small_flow(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+    wlb_test_add_path(&f, 0, 10000, 64 * 1024, 0);
+    xqc_path_ctx_t *dead = wlb_test_add_path(&f, 1, 30000, 64 * 1024, 0);
+    dead->path_send_ctl->ctl_pto_count = 3;
+    wlb_test_prepare_probing(&f);
+    wlb_test_probe_round(&f);
+    int probes = 0;
+    for (int i = 0; i < 100; i++) {
+        wlb_test_clock_advance(100000);
+        wlb_test_probe_round(&f);
+        if (wlb_test_take_ping_probe(&f) == 1) {
+            probes++;
+        }
+        CU_ASSERT_EQUAL(wlb_test_invoke(&f, 0xFACE4901), 0);
+    }
+    CU_ASSERT_EQUAL(probes, 20);
+    CU_ASSERT_EQUAL(f.conn.conn_send_queue->sndq_packets_used, 0);
+    wlb_test_teardown(&f);
+}
+
+
+/* State gates, pacing wakeup, and both pending-probe queues bound work.
+ * A stalled transport must not accumulate another PING every interval. */
+void
+xqc_test_wlb_ping_probe_gates(void)
+{
+    wlb_test_fixture_t f;
+    wlb_test_setup(&f);
+    wlb_test_add_path(&f, 0, 10000, 64 * 1024, 0);
+    xqc_path_ctx_t *dead = wlb_test_add_path(&f, 1, 30000, 64 * 1024, 0);
+    dead->path_send_ctl->ctl_pto_count = 3;
+    wlb_test_prepare_probing(&f);
+    wlb_test_probe_round(&f);
+    wlb_test_clock_advance(600000);
+
+    f.conn.enable_multipath = 0;
+    wlb_test_probe_round(&f);
+    f.conn.enable_multipath = 1;
+    f.conn.conn_state = XQC_CONN_STATE_CLOSING;
+    wlb_test_probe_round(&f);
+    f.conn.conn_state = XQC_CONN_STATE_ESTABED;
+    xqc_wlb_scheduler_cb.xqc_scheduler_handle_conn_event(f.scheduler,
+        &f.conn, XQC_SCHED_EVENT_CONN_ROUND_FIN, NULL);
+    CU_ASSERT_EQUAL(wlb_test_take_ping_probe(&f), UINT64_MAX);
+
+    dead->app_path_status = XQC_APP_PATH_STATUS_FROZEN;
+    wlb_test_probe_round(&f);
+    CU_ASSERT_EQUAL(wlb_test_take_ping_probe(&f), UINT64_MAX);
+    dead->app_path_status = XQC_APP_PATH_STATUS_AVAILABLE;
+    wlb_test_enable_pacing(&f, 1, 0);
+    wlb_test_probe_round(&f);
+    CU_ASSERT_EQUAL(wlb_test_take_ping_probe(&f), UINT64_MAX);
+    CU_ASSERT_TRUE(xqc_timer_is_set(&f.send_ctls[1].path_timer_manager,
+        XQC_TIMER_PACING));
+    wlb_test_clock_advance(2000);
+    xqc_timer_expire(&f.send_ctls[1].path_timer_manager, g_fake_now_us);
+    wlb_test_probe_round(&f);
+    CU_ASSERT_EQUAL(f.conn.conn_send_queue->sndq_packets_used, 1);
+
+    /* Keep the first probe in the connection queue, then in the path's
+     * scheduled probe queue, as a write-blocked socket would. */
+    wlb_test_clock_advance(600000);
+    wlb_test_probe_round(&f);
+    CU_ASSERT_EQUAL(f.conn.conn_send_queue->sndq_packets_used, 1);
+    xqc_list_head_t *head =
+        &f.conn.conn_send_queue->sndq_pto_probe_packets;
+    xqc_list_head_t *node = head->next;
+    xqc_list_del_init(node);
+    xqc_list_add_tail(node,
+        &dead->path_schedule_buf[XQC_SEND_TYPE_PTO_PROBE]);
+    wlb_test_clock_advance(600000);
+    wlb_test_probe_round(&f);
+    CU_ASSERT_TRUE(xqc_list_empty(head));
+    CU_ASSERT_EQUAL(f.conn.conn_send_queue->sndq_packets_used, 1);
     wlb_test_teardown(&f);
 }

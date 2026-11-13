@@ -5290,25 +5290,45 @@ xqc_client_poll_key_update(int fd, short what, void *arg)
 {
     xqc_key_update_retention_test_t *test = &xqc_key_update_retention_test;
     user_conn_t *user_conn = arg;
+    xqc_connection_t *conn;
     struct timeval tv = { 0, 1000 };
 
     if (g_test_case != 904 || test->started || user_conn == NULL) {
         return;
     }
 
-    if (user_conn->quic_conn != NULL
-        && user_conn->quic_conn->key_update_ctx.key_update_cnt > 0)
+    conn = user_conn->quic_conn;
+    if (conn == NULL || conn->conn_state >= XQC_CONN_STATE_CLOSING) {
+        return;
+    }
+
+    if (test->packet_len != 0
+        && (conn->conn_flag & XQC_CONN_FLAG_HANDSHAKE_CONFIRMED))
     {
         /*
-         * Hold the peer's old-phase packet longer than the 3*PTO old-key
-         * retention window so that, if old read keys are discarded before a
-         * new-key packet is unprotected (the RFC 9001 Section 6.1 defect),
-         * the replay below cannot decrypt it. The 2s floor also guarantees
-         * the peer has time to retransmit an old-phase packet while outbound
-         * is suppressed.
+         * RFC 9001 Section 6.1: start only after handshake confirmation and
+         * after an old-phase packet has been withheld. Packet counts and
+         * session resumption do not determine whether the stimulus exists.
+         * The ordinary PING encryption path initiates the first key update.
          */
-        xqc_usec_t delay = 3 * xqc_conn_get_max_pto(user_conn->quic_conn)
-                           + 500000;
+        conn->conn_settings.keyupdate_pkt_threshold = 1;
+        conn->key_update_ctx.enc_pkt_cnt = 1;
+        if (xqc_conn_send_ping(user_conn->ctx->engine, &user_conn->cid, NULL)
+            != XQC_OK)
+        {
+            printf("[key-update-retention]|ping-send-failed|\n");
+            return;
+        }
+        xqc_engine_main_logic(user_conn->ctx->engine);
+        if (conn->key_update_ctx.key_update_cnt != 1
+            || !conn->key_update_ctx.awaiting_peer_key_update)
+        {
+            printf("[key-update-retention]|update-not-started|\n");
+            return;
+        }
+
+        /* Replay after the premature 3*PTO discard deadline would expire. */
+        xqc_usec_t delay = 3 * xqc_conn_get_max_pto(conn) + 500000;
         struct timeval release_tv;
 
         if (delay < 2000000) {
@@ -5339,6 +5359,7 @@ xqc_client_release_key_update_packet(int fd, short what, void *arg)
     xqc_connection_t *conn;
     uint64_t dropped_before;
     uint64_t dropped_after;
+    xqc_int_t ret;
 
     if (user_conn == NULL || test->packet_len == 0) {
         printf("[key-update-retention]|missing-old-key-packet|\n");
@@ -5346,15 +5367,22 @@ xqc_client_release_key_update_packet(int fd, short what, void *arg)
     }
 
     conn = user_conn->quic_conn;
-    dropped_before = (conn != NULL) ? conn->packet_dropped_count : 0;
+    if (conn == NULL || conn->conn_state != XQC_CONN_STATE_ESTABED
+        || conn->key_update_ctx.key_update_cnt != 1
+        || !conn->key_update_ctx.awaiting_peer_key_update)
+    {
+        printf("[key-update-retention]|replay-not-exercised|\n");
+        return;
+    }
+    dropped_before = conn->packet_dropped_count;
 
     test->replayed = XQC_TRUE;
-    xqc_engine_packet_process(user_conn->ctx->engine, test->packet,
+    ret = xqc_engine_packet_process(user_conn->ctx->engine, test->packet,
         test->packet_len, user_conn->local_addr, user_conn->local_addrlen,
         user_conn->peer_addr, user_conn->peer_addrlen, xqc_now(), user_conn);
     xqc_engine_finish_recv(user_conn->ctx->engine);
 
-    dropped_after = (conn != NULL) ? conn->packet_dropped_count : 0;
+    dropped_after = conn->packet_dropped_count;
 
     /*
      * RFC 9001 Section 6.1: an endpoint MUST retain old read keys until it has
@@ -5364,7 +5392,7 @@ xqc_client_release_key_update_packet(int fd, short what, void *arg)
      * replay cannot decrypt it and packet_dropped_count increases; correct
      * retention decrypts it with no drop.
      */
-    if (dropped_after > dropped_before) {
+    if (ret != XQC_OK || dropped_after > dropped_before) {
         printf("[key-update-retention]|RESULT|dropped|delta:%"PRIu64"|\n",
                dropped_after - dropped_before);
     } else {
@@ -5537,8 +5565,11 @@ xqc_client_socket_read_handler(user_conn_t *user_conn, int fd)
             }
         }
 
-        if (g_test_case == 904 && xqc_key_update_retention_test.started
-            && !xqc_key_update_retention_test.replayed)
+        if (g_test_case == 904 && !xqc_key_update_retention_test.replayed
+            && user_conn->quic_conn != NULL
+            && (user_conn->quic_conn->conn_flag
+                & XQC_CONN_FLAG_HANDSHAKE_CONFIRMED)
+            && (packet_buf[0] & 0x80) == 0)
         {
             if (xqc_key_update_retention_test.packet_len == 0) {
                 memcpy(xqc_key_update_retention_test.packet, packet_buf, recv_size);
@@ -7240,16 +7271,6 @@ int main(int argc, char *argv[]) {
         || g_test_case == XQC_TEST_CASE_KEY_UPDATE_STALE_DEADLINE)
     {
         conn_settings.keyupdate_pkt_threshold = 30;
-
-    } else if (g_test_case == 904) {
-        /*
-         * Trigger the key update only after the request body has been fully
-         * sent (so the peer starts echoing) but while the echo is still in
-         * flight. The request is ~87 packets at -s 102400, so a threshold of
-         * 100 fires during the echo, leaving the peer with unacknowledged
-         * old-phase data to retransmit while outbound is suppressed.
-         */
-        conn_settings.keyupdate_pkt_threshold = 100;
     }
 
     if (g_test_case == 42) {

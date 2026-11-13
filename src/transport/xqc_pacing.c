@@ -160,6 +160,29 @@ xqc_pacing_on_app_limit(xqc_pacing_t *pacing) {
 }
 
 int
+xqc_pacing_can_schedule(xqc_pacing_t *pacing, uint32_t queued, uint32_t bytes)
+{
+    xqc_send_ctl_t *send_ctl = pacing->ctl_ctx;
+    if (xqc_timer_is_set(&send_ctl->path_timer_manager, XQC_TIMER_PACING)) {
+        return FALSE;
+    }
+
+    uint32_t budget = xqc_pacing_calc_budget(pacing, xqc_monotonic_timestamp());
+    if (queued <= budget && bytes <= budget - queued) {
+        return TRUE;
+    }
+
+    /* Arming a pacing timer while earlier packets have usable credit
+     * would block those packets too. Let their send pass consume the
+     * credit and arm any required timer. An empty path queue needs its
+     * own wakeup because there is no send pass left to arrange one. */
+    if (queued == 0) {
+        (void) xqc_pacing_can_write(pacing, bytes);
+    }
+    return FALSE;
+}
+
+int
 xqc_pacing_is_on(xqc_pacing_t *pacing) {
     return pacing->pacing_on;
 }

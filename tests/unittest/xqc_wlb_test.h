@@ -115,5 +115,11 @@ void xqc_test_wlb_reapply_second_path_after_swap(void);
 void xqc_test_wlb_asym_pin_follows_weight_ratio(void);
 void xqc_test_wlb_last_path_over_pto_still_schedules(void);
 void xqc_test_wlb_prefers_healthy_path_over_pto_blocked(void);
+void xqc_test_wlb_pacing_credit_bounds(void);
+void xqc_test_wlb_pacing_preserves_flow_path(void);
+void xqc_test_wlb_pacing_blocked_wakes(void);
+void xqc_test_wlb_pacing_control_compatibility(void);
+void xqc_test_wlb_ping_probe_preserves_small_flow(void);
+void xqc_test_wlb_ping_probe_gates(void);
 
 #endif /* XQC_WLB_TEST_H_INCLUDED */

@@ -31,6 +31,7 @@ typedef struct xqc_send_queue_s {
     uint64_t                    sndq_packets_used_max;
 
     xqc_bool_t                  sndq_full;
+    xqc_bool_t                  sndq_dgram_full;
 
 } xqc_send_queue_t;
 
