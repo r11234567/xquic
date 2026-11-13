@@ -1439,13 +1439,7 @@ xqc_wlb_scheduler_get_path(void *scheduler,
                 entry->hash = WLB_FLOW_TOMBSTONE;
             }
 
-            /* An established flow waits in its path's paced send queue.
-             * A transient pacing-credit shortage must not stripe adjacent
-             * packets over paths with different delays. Congestion-window
-             * exhaustion still permits the existing temporary spill. */
-            if (path && xqc_scheduler_check_path_can_send(path, packet_out,
-                                                         check_cwnd))
-            {
+            if (path && wlb_path_can_send(path, packet_out, check_cwnd)) {
                 entry->last_ts = now_us;
                 xqc_log(conn->log, XQC_LOG_DEBUG,
                         "|wlb|flow_hit|flow:%ui|path:%ui|",
@@ -1455,6 +1449,18 @@ xqc_wlb_scheduler_get_path(void *scheduler,
                 return path;
             }
             if (path) {
+                /* Keep both affinity and pacing admission. Queuing beyond
+                 * current credit lets a later cwnd spill overtake the paced
+                 * backlog. A pacing-only block waits for this path's send
+                 * pass/timer instead of queuing or spilling the packet. */
+                if (xqc_scheduler_check_path_can_send(path, packet_out,
+                                                      check_cwnd))
+                {
+                    if (cc_blocked) {
+                        *cc_blocked = XQC_TRUE;
+                    }
+                    return NULL;
+                }
                 /* Pinned path exists but cwnd-blocked — use another path
                  * temporarily WITHOUT re-pinning.  This prevents oscillation
                  * where a flow bounces between a fast and slow path whenever

@@ -2493,8 +2493,8 @@ xqc_test_wlb_pacing_credit_bounds(void)
 }
 
 
-/* Pacing controls transmission timing on an established pin. Keep adjacent
- * flow packets on that path, including while its pacing timer is pending.
+/* A pacing-only block waits without queuing beyond credit or spilling.
+ * Timer expiry resumes the established pin without a new application packet.
  * Genuine cwnd exhaustion retains the temporary spill and pin ownership. */
 void
 xqc_test_wlb_pacing_preserves_flow_path(void)
@@ -2509,7 +2509,12 @@ xqc_test_wlb_pacing_preserves_flow_path(void)
     CU_ASSERT_EQUAL(wlb_test_invoke(&f, flow), 0);
     p0->path_schedule_bytes = 101;
     f.send_ctls[0].ctl_pacing.bytes_budget = 200;
-    CU_ASSERT_EQUAL(wlb_test_invoke(&f, flow), 0);
+    xqc_packet_out_t po;
+    wlb_test_make_packet_out(&po, flow);
+    xqc_bool_t blocked = XQC_FALSE;
+    CU_ASSERT_PTR_NULL(xqc_wlb_scheduler_cb.xqc_scheduler_get_path(
+        f.scheduler, &f.conn, &po, 1, 0, &blocked));
+    CU_ASSERT_TRUE(blocked);
     CU_ASSERT_FALSE(xqc_timer_is_set(&f.send_ctls[0].path_timer_manager,
         XQC_TIMER_PACING));
     p0->path_schedule_bytes = 100;
@@ -2518,12 +2523,14 @@ xqc_test_wlb_pacing_preserves_flow_path(void)
     f.send_ctls[0].ctl_pacing.bytes_budget = 0;
     xqc_timer_set(&f.send_ctls[0].path_timer_manager, XQC_TIMER_PACING,
                   g_fake_now_us, 1000);
-    CU_ASSERT_EQUAL(wlb_test_invoke(&f, flow), 0);
+    CU_ASSERT_EQUAL(wlb_test_invoke(&f, flow), UINT64_MAX);
     CU_ASSERT_TRUE(xqc_timer_is_set(&f.send_ctls[0].path_timer_manager,
         XQC_TIMER_PACING));
     f.send_ctls[0].ctl_bytes_in_flight = 192 * 1024;
     CU_ASSERT_EQUAL(wlb_test_invoke(&f, flow), 1);
     f.send_ctls[0].ctl_bytes_in_flight = 0;
+    wlb_test_clock_advance(2000);
+    xqc_timer_expire(&f.send_ctls[0].path_timer_manager, g_fake_now_us);
     CU_ASSERT_EQUAL(wlb_test_invoke(&f, flow), 0);
     wlb_test_teardown(&f);
 }
