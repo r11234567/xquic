@@ -286,7 +286,6 @@ xqc_maybe_should_ack(xqc_connection_t *conn, xqc_path_ctx_t *path, xqc_pn_ctl_t 
         || (out_of_order && send_ctl->ctl_ack_eliciting_pkt[pns] >= 1))
     {
         path->path_flag |= XQC_PATH_FLAG_SHOULD_ACK_INIT << pns;
-        conn->ack_flag |= (1 << (pns + path->path_id * XQC_PNS_N));
         
         xqc_timer_unset(&send_ctl->path_timer_manager, XQC_TIMER_ACK_INIT + pns);
 
