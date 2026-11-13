@@ -1439,7 +1439,13 @@ xqc_wlb_scheduler_get_path(void *scheduler,
                 entry->hash = WLB_FLOW_TOMBSTONE;
             }
 
-            if (path && wlb_path_can_send(path, packet_out, check_cwnd)) {
+            /* An established flow waits in its path's paced send queue.
+             * A transient pacing-credit shortage must not stripe adjacent
+             * packets over paths with different delays. Congestion-window
+             * exhaustion still permits the existing temporary spill. */
+            if (path && xqc_scheduler_check_path_can_send(path, packet_out,
+                                                         check_cwnd))
+            {
                 entry->last_ts = now_us;
                 xqc_log(conn->log, XQC_LOG_DEBUG,
                         "|wlb|flow_hit|flow:%ui|path:%ui|",

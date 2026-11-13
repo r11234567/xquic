@@ -1213,8 +1213,8 @@ main(int argc, char *argv[])
         || !CU_add_test(pSuite, "xqc_test_wlb_prefers_healthy_path_over_pto_blocked", xqc_test_wlb_prefers_healthy_path_over_pto_blocked)
         || !CU_add_test(pSuite, "xqc_test_wlb_pacing_credit_bounds",
                         xqc_test_wlb_pacing_credit_bounds)
-        || !CU_add_test(pSuite, "xqc_test_wlb_pacing_spill_preserves_pin",
-                        xqc_test_wlb_pacing_spill_preserves_pin)
+        || !CU_add_test(pSuite, "xqc_test_wlb_pacing_preserves_flow_path",
+                        xqc_test_wlb_pacing_preserves_flow_path)
         || !CU_add_test(pSuite, "xqc_test_wlb_pacing_blocked_wakes",
                         xqc_test_wlb_pacing_blocked_wakes)
         || !CU_add_test(pSuite, "xqc_test_wlb_pacing_control_compatibility",
