@@ -930,6 +930,10 @@ xqc_server_conn_handshake_finished(xqc_connection_t *conn, void *user_data,
     DEBUG;
     printf("datagram_mss:%zd\n", xqc_datagram_get_mss(conn));
 
+    if (g_test_case == 747 || g_test_case == 748) {
+        printf("[small-mtu]|handshake_complete|\n");
+    }
+
     if (g_test_case == XQC_TEST_CASE_CRYPTO_PREVIOUS_LEVEL_BOUNDARY
         || g_test_case == XQC_TEST_CASE_CRYPTO_PREVIOUS_LEVEL_EXTENSION)
     {
@@ -2429,6 +2433,11 @@ xqc_server_write_socket(const unsigned char *buf, size_t size,
     memcpy(send_buf, buf, send_buf_size);
     xqc_test_record_udp_payload(size);
 
+    if ((g_test_case == 747 || g_test_case == 748) && size > 1252) {
+        printf("[small-mtu]|drop_oversize|size:%zu|\n", size);
+        return size;
+    }
+
     /* server Initial dcid corruption ... */
     if (g_test_case == 3) {
         /* client initial dcid corruption, bytes [6, 13] is the DCID of xquic's Initial
@@ -3555,7 +3564,7 @@ main(int argc, char *argv[])
         conn_settings.max_pkt_out_size = 1216;
     }
 
-    if (g_test_case == 735) {
+    if (g_test_case == 735 || g_test_case == 747 || g_test_case == 748) {
         conn_settings.max_pkt_out_size = 1436;
     }
 

@@ -630,6 +630,20 @@ xqc_client_mtu_dropped(const unsigned char *buf, size_t size)
     static int full_pkts = 0;
     static int big_pkts = 0;
 
+    if (g_test_case == 747 || g_test_case == 748) {
+        static int initial_dropped = 0;
+        if (size > 1252) {
+            printf("[small-mtu]|drop_oversize|size:%zu|\n", size);
+            return 1;
+        }
+        if (g_test_case == 748 && !initial_dropped && (buf[0] & 0x80)) {
+            initial_dropped = 1;
+            printf("[small-mtu]|drop_first_initial|\n");
+            return 1;
+        }
+        return 0;
+    }
+
     /* case 806: the path shrinks during the transfer, after 300 datagrams
      * above 1300 bytes got through, and drops every one of them from then on */
     if (g_test_case == 806) {
@@ -2618,6 +2632,9 @@ void
 xqc_client_conn_handshake_finished(xqc_connection_t *conn, void *user_data, void *conn_proto_data)
 {
     DEBUG;
+    if (g_test_case == 747 || g_test_case == 748) {
+        printf("[small-mtu]|handshake_complete|\n");
+    }
     user_conn_t *user_conn = (user_conn_t *) user_data;
     if (user_conn == NULL) {
         return;
@@ -7243,7 +7260,7 @@ int main(int argc, char *argv[]) {
         conn_settings.max_pkt_out_size = 1216;
     }
 
-    if (g_test_case == 735) {
+    if (g_test_case == 735 || g_test_case == 747 || g_test_case == 748) {
         conn_settings.max_pkt_out_size = 1436;
     }
 
